@@ -221,18 +221,18 @@ class InputService(private val paths: VmPaths, private val log: (String) -> Unit
             val src = ByteBuffer.wrap(a).order(ByteOrder.LITTLE_ENDIAN); val dst = ByteBuffer.wrap(o).order(ByteOrder.LITTLE_ENDIAN)
             repeat(a.size / EV) { dst.putLong(src.int.toLong()); dst.putLong(src.int.toLong()); dst.putShort(src.short); dst.putShort(src.short); dst.putInt(src.int) }
         }
-        // the recovery FIFO consumer parses the same struct input_event layout as the socket
-        // clients, so it must get the same (possibly widened) bytes: feeding it the raw 16-byte
-        // records desyncs a 64-bit minui on the very first record and touch is dead
+        // A/B (single variable): the sink gets the RAW records exactly as built above, not the
+        // widened copy the socket clients receive — the probe run proved the FIFO is drained
+        // but a 64-bit minui never reacted to the 24-byte stream, so test whether the consumer
+        // actually parses the raw 16-byte layout. Client path below is untouched.
         sink?.let { s ->
-            runCatching { s.write(w); s.flush() }.onSuccess {
-                val evSize = if (wide) 24 else 16
-                sinkBytes += w.size
-                sinkEvents += w.size / evSize
+            runCatching { s.write(a); s.flush() }.onSuccess {
+                sinkBytes += a.size
+                sinkEvents += a.size / EV
                 val nowMs = System.currentTimeMillis()
                 if (sinkLogAt == 0L || nowMs - sinkLogAt >= 1000) {
                     sinkLogAt = nowMs
-                    log("input sink: wrote ${w.size}B (total ${sinkBytes}B, ${sinkEvents} events)")
+                    log("input sink: wrote ${a.size}B (total ${sinkBytes}B, ${sinkEvents} events)")
                 }
             }.onFailure {
                 log("input sink: write failed, sink dropped (${it.message ?: it.javaClass.simpleName})")
