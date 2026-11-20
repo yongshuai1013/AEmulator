@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Process as AProcess
 import android.os.SystemClock
 import android.view.Surface
+import app.aemu.importer.BootImage
 import dev.lk.dhd.BinderSlot
 import dev.lk.dhd.GlSlot
 import dev.lk.dhd.Slot
@@ -190,13 +191,37 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         val pb = ProcessBuilder(cmd)
             .directory(r).redirectErrorStream(true).redirectOutput(File(paths.bin, "recovery.out"))
         pb.environment().clear()
-        pb.environment().putAll(mapOf(
+        val recEnv = mutableMapOf(
             "PATH" to "/sbin:/system/bin", "LD_LIBRARY_PATH" to ".:/sbin", "ANDROID_ROOT" to "/system", "ANDROID_DATA" to "/data",
             "EXTERNAL_STORAGE" to "/sdcard", "TZ" to "UTC",
             "LD_PRELOAD" to "/sbin/librecshim.so:/sbin/libaemushim.so", "AEMU_MOUNTS" to "/sdcard:/data:/system:/cache:/emmc:/external_sd:/usb-otg",
             "DHD_FB_W" to "$w", "DHD_FB_H" to "$h", "DHD_IN_W" to "$w", "DHD_IN_H" to "$h",
             "DHD_INPUT" to paths.inputSock.absolutePath,
-        ))
+        )
+        // A 64-bit recovery runs under the aemu64 launcher (kernel.runner), which dies at once
+        // ("AEMU64_ROOT is not set", exit 127) without the environment GuestRunner.env64 hands it
+        // for a system boot. Give it the same set, with the paths pointed at the recovery tree.
+        if (is64) {
+            recEnv["AEMU64_ROOT"] = r.absolutePath
+            recEnv["AEMU64_PROPS"] = File(r, "dev/__properties__").absolutePath
+            val utsRelease = BootImage.bannerRelease(img.settings.kernelBanner)
+            if (utsRelease.isNotEmpty()) {
+                recEnv["AEMU64_UTS_RELEASE"] = utsRelease
+                val utsVersion = BootImage.bannerVersion(img.settings.kernelBanner)
+                if (utsVersion.isNotEmpty()) recEnv["AEMU64_UTS_VERSION"] = utsVersion
+            }
+            recEnv["AEMU64_BINDER"] = paths.binderSock.absolutePath
+            if (kernel.treble) {
+                recEnv["AEMU64_HWBINDER"] = paths.hwbinderSock.absolutePath
+                recEnv["AEMU64_VNDBINDER"] = paths.vndbinderSock.absolutePath
+            }
+            recEnv["AEMU64_INPUT"] = paths.inputSock.absolutePath
+            paths.nativeBin("libqemu_arm.so").takeIf { it.canExecute() }?.let { recEnv["AEMU64_QEMU"] = it.absolutePath }
+            sd?.let { recEnv["AEMU64_SDCARD"] = it.absolutePath }
+            recEnv["AEMU64_FB"] = "${w}x${h}"
+            if (File(paths.bin, "crash.report").exists()) recEnv["AEMU64_CRASH"] = "1"
+        }
+        pb.environment().putAll(recEnv)
         bootAt = System.currentTimeMillis()
         val p = pb.start()
         synchronized(procs) { procs["recovery"] = p }
