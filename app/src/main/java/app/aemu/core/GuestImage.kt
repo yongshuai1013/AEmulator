@@ -51,6 +51,10 @@ data class VmSettings(
      * feature is off and the guest keeps the host's answers. Takes effect at the next boot.
      */
     val kernelBanner: String = "",
+    /** operator name the fake modem reports; blank = the generic sample name */
+    val operatorName: String = "",
+    /** operator PLMN (MCC+MNC digits) the fake modem reports; blank = the test network 00101 */
+    val operatorNumeric: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -60,6 +64,7 @@ data class VmSettings(
         .put("keepScreenOn", keepScreenOn).put("showLed", showLed).put("mtMode", mtMode).put("legacyEngine", legacyEngine)
         .put("ramMb", ramMb).put("radio", radio).put("native32", native32).put("imei", imei).put("qemuArgs", qemuArgs)
         .put("kernelBanner", kernelBanner)
+        .put("operatorName", operatorName).put("operatorNumeric", operatorNumeric)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -67,6 +72,10 @@ data class VmSettings(
 
         /** Luhn-valid sample IMEI from the standard; the guest has no real modem */
         const val DEFAULT_IMEI = "490154203237518"
+
+        /** operator identity of the generic fake modem, used while the settings leave it blank */
+        const val DEFAULT_OPERATOR_NAME = "AEmulator"
+        const val DEFAULT_OPERATOR_NUMERIC = "00101"
 
         /** Random Luhn-valid IMEI with a test TAC prefix. */
         fun randomImei(): String {
@@ -105,6 +114,8 @@ data class VmSettings(
                 imei = o.optString("imei", ""),
                 qemuArgs = o.optString("qemuArgs", ""),
                 kernelBanner = o.optString("kernelBanner", ""),
+                operatorName = o.optString("operatorName", ""),
+                operatorNumeric = o.optString("operatorNumeric", ""),
             )
         }
     }
