@@ -37,3 +37,20 @@ jobs:
         with:
           name: aemulator-apk
           path: app/build/outputs/apk/*/release/*.apk
+      - name: Sign APKs
+        env:
+          AEMU_KEYSTORE_B64: ${{ secrets.AEMU_KEYSTORE_B64 }}
+          AEMU_KEYSTORE_PASSWORD: ${{ secrets.AEMU_KEYSTORE_PASSWORD }}
+        run: |
+          echo "$AEMU_KEYSTORE_B64" | base64 -d > /tmp/aemulator.p12
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
+          echo "build-tools: $BT"
+          for f in app/build/outputs/apk/*/release/*-unsigned.apk; do
+            out="${f%-unsigned.apk}-signed.apk"
+            "${BT}apksigner" sign --ks /tmp/aemulator.p12 --ks-type PKCS12 --ks-key-alias aemulator --ks-pass pass:"$AEMU_KEYSTORE_PASSWORD" --key-pass pass:"$AEMU_KEYSTORE_PASSWORD" --out "$out" "$f"
+            "${BT}apksigner" verify --print-certs "$out" | head -4
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aemulator-apk-signed
+          path: app/build/outputs/apk/*/release/*-signed.apk
