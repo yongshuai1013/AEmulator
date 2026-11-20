@@ -43,7 +43,7 @@ class TreeFixer(
         val keepClasses = setOf("audio_policy", "local_time", "power", "keystore", "consumerir", "vibrator", "memtrack")
         val parkClasses = setOf(
             "gralloc", "hwcomposer", "copybit", "overlay", "sensors", "camera", "gps", "nfc", "nfc_nci",
-            "lights", "audio", "fm", "bluetooth", "hdmi", "tv", "display", "ir", "wlan", "gpu", "fingerprint",
+            "lights", "audio", "fm", "bluetooth", "hdmi", "tv", "display", "ir", "gpu", "fingerprint",
         )
         for (dir in listOf("system/lib/hw", "vendor/lib/hw", "system/vendor/lib/hw")) {
             File(root, dir).listFiles()?.forEach { f ->
@@ -56,6 +56,9 @@ class TreeFixer(
                     // HIDL passthrough implementations (android.hidl.memory@1.0-impl.so: 32-bit audioserver maps its
                     // effect buffers through it) are not hardware modules
                     name.contains('@') && dir == "system/lib/hw" -> {}
+                    // wifi probe: the wlan HAL is not parked, at any variant — the guest wifi stack gets
+                    // the driver layer its firmware shipped (angler has no such file; other firmware does)
+                    cls == "wlan" -> {}
                     // родной gralloc.default прошивки работает с fb0, который эмулирует qemu, — оставляем
                     cls == "gralloc" && isDefault -> {}
                     // звук даёт движок

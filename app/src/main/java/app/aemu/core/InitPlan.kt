@@ -150,8 +150,11 @@ object InitPlan {
         val extras = rc.services.values.filter { sv ->
             val bin = sv.argv.first()
             val base = bin.substringAfterLast('/')
+            // wifi probe: the wifi framework's own services are disabled+oneshot in .rc by design (init
+            // starts them on ctl.start); they are admitted despite both flags, as on-demand entries
+            val wifiSvc = sv.name in WIFI_ON_DEMAND
             // (a HAL marked oneshot is one its client restarts: the audio service)
-            !sv.disabled && (!sv.oneshot || bin.substringBeforeLast('/').endsWith("/bin/hw")) && sv.name !in known && sv.name !in SKIP && base !in SKIP_BIN &&
+            (wifiSvc || !sv.disabled) && (wifiSvc || !sv.oneshot || bin.substringBeforeLast('/').endsWith("/bin/hw")) && sv.name !in known && sv.name !in SKIP && base !in SKIP_BIN &&
                 // префиксом совпадают только явные «xxx_» и длинные имена: иначе «sh» отсекал бы shelld (MIUI) и т.п.
                 // Samsung's sensorhubservice is a binder service system_server waits for without a timeout (S4/S5 TouchWiz), not a sensor daemon
                 (base == "sensorhubservice" || SKIP_BIN.none { base == it || ((it.endsWith("_") || it.length >= 5) && base.startsWith(it)) }) && !base.endsWith(".sh") &&
@@ -164,8 +167,9 @@ object InitPlan {
             // (the program exists from 7.0 on, and 7.x checks the same way)
             uid = if (sv.name == "cameraserver") 1047 else 0, gid = if (sv.name == "cameraserver") 1047 else 0,
             // 8.0+: a service without a class is in none of the classes init starts (the WebView zygotes, which
-            // system_server starts itself for the ABI of the WebView package)
-            onDemand = api >= 26 && sv.cls == "default") }
+            // system_server starts itself for the ABI of the WebView package); the wifi probe services are
+            // on-demand at every API level: the framework asks for them with ctl.start, like real init
+            onDemand = sv.name in WIFI_ON_DEMAND || (api >= 26 && sv.cls == "default")) }
         // Treble (8.0+): the HALs are programs of their own (/vendor/bin/hw), and surfaceflinger, keystore and
         // system_server wait for the ones the vendor manifest lists: they go up right after the service managers
         val (hals, rest) = extras.partition { it.argv.first().substringBeforeLast('/').endsWith("/bin/hw") }
@@ -185,20 +189,33 @@ object InitPlan {
         // mtkbt: MediaTek's Bluetooth stack daemon; without its chip it fills the log with thousands of lines a second
         "mtkbt",
         "ueventd", "vold", "rild", "ril-daemon", "adbd", "debuggerd", "debuggerd64", "console", "dbus", "bluetoothd",
-        "btld", "wpa_supplicant", "p2p_supplicant", "dhcpcd", "racoon", "mtpd", "qemud", "goldfish-setup", "goldfish-logcat",
+        "btld", "dhcpcd", "racoon", "mtpd", "qemud", "goldfish-setup", "goldfish-logcat",
         "dumpstate", "flash_recovery", "recovery", "redbend_ua", "sreadaheadd", "lpmkey", "playlpm", "charger", "macloader",
         "mfgloader", "wlandutservice", "bt_dut_cmd", "bootanim", "samsungani", "playsound", "sdcard", "fuse_sdcard0",
         "healthd", "logd", "lmkd", "watchdogd", "ril-daemon1", "ril-daemon2", "fota", "gpsd", "sensors", "akmd",
         "rmt_storage", "qmuxd", "netmgrd", "thermald", "mpdecision", "thermal-engine", "time_daemon", "diag",
     )
     private val SKIP_BIN = setOf(
-        "logwrapper", "sh", "rild", "vold", "wpa_supplicant", "dhcpcd", "bluetoothd", "hciattach", "btld", "adbd",
+        "logwrapper", "sh", "rild", "vold", "bluetoothd", "hciattach", "btld", "adbd",
         "sdcard", "gpsd", "gps", "akmd", "orientationd", "geomagneticd", "sensor", "charging", "playlpm", "bootanimation",
         "rmt_storage", "qmuxd", "netmgrd", "thermald", "mpdecision", "thermal-engine", "fm_", "wifi", "wifi_", "gps_", "hostapd", "mediaserver",
         "drexe", "npsmobex", "immvibed", "cbd", "smdexe", "ddexe", "mdm_helper", "rilproxy",
         // Qualcomm: камера, TrustZone, модем — лезут в /dev своего железа и сыплют ошибками
         "mm-qcamera", "qcamerasvr", "qseecomd", "bridgemgrd", "irsc_util", "mm-pp-daemon", "ks", "qcks", "efsks",
         "sensors.qcom", "location-mq", "xtwifi", "quipc", "usf_", "adsprpcd", "subsystem_ramdump",
+    )
+
+    /**
+     * Wi-Fi probe: the services the wifi framework starts with ctl.start when wifi is switched on. In the
+     * firmware's .rc they are all disabled+oneshot, so the extras filter below would never plan them and the
+     * guest's ctl.start would find nothing. They join the plan as on-demand entries instead (never started at
+     * boot, init.svc.<name> reads "stopped"): the real firmware binaries then run and fail wherever they
+     * fail — nothing is faked for them. Their names and their binaries (wpa_supplicant, dhcpcd) are therefore
+     * no longer in SKIP / SKIP_BIN either; dhcpcd is a shared binary (bt-pan/eth0 services use it too), but
+     * those services stay disabled and unplanned, so nothing else changes.
+     */
+    private val WIFI_ON_DEMAND = setOf(
+        "wpa_supplicant", "p2p_supplicant", "dhcpcd_wlan0", "dhcpcd_p2p", "iprenew_wlan0", "iprenew_p2p",
     )
 
     private fun toService(s: RcService, r: Rule): GuestService {
