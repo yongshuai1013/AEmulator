@@ -38,7 +38,7 @@ enum {
     NR_sched_yield = 124, NR_rt_sigaction = 134, NR_rt_sigprocmask = 135, NR_reboot = 142,
     NR_setregid = 143, NR_setgid = 144, NR_setreuid = 145, NR_setuid = 146, NR_setresuid = 147, NR_getresuid = 148,
     NR_setresgid = 149, NR_getresgid = 150, NR_setfsuid = 151, NR_setfsgid = 152, NR_getgroups = 158, NR_setgroups = 159,
-    NR_prctl = 167, NR_getpid = 172, NR_getuid = 174, NR_geteuid = 175, NR_getgid = 176, NR_getegid = 177, NR_gettid = 178,
+    NR_uname = 160, NR_prctl = 167, NR_getpid = 172, NR_getuid = 174, NR_geteuid = 175, NR_getgid = 176, NR_getegid = 177, NR_gettid = 178,
     NR_socket = 198, NR_socketpair = 199, NR_bind = 200, NR_connect = 203, NR_getsockname = 204, NR_sendto = 206, NR_setsockopt = 208, NR_getsockopt = 209,
     NR_shutdown = 210, NR_sendmsg = 211, NR_recvmsg = 212, NR_munmap = 215, NR_execve = 221, NR_mmap = 222, NR_mprotect = 226,
     NR_renameat2 = 276, NR_memfd_create = 279, NR_statx = 291,
@@ -81,6 +81,8 @@ static char g_root[512];        // image root on the host, no trailing slash
 static u64 g_rootlen;
 static char g_self[512];        // this program
 static char g_props[512];       // host file behind /dev/__properties__
+static char g_uts_rel[80];      // the guest kernel's release (AEMU64_UTS_RELEASE from the image's boot.img)
+static char g_uts_ver[288];     // the guest kernel's version (AEMU64_UTS_VERSION)
 static char g_exe[PATH_MAX];    // guest view of the running program
 static int g_selinux;           // this program is shown a (permissive) SELinux: see /sys/fs/selinux/status
 static int g_uid, g_gid;        // the ids the guest believes it has (the effective ones)
@@ -661,6 +663,9 @@ static long do_exec(const char *path, char *const argv[], char *const envp[]) {
     memcpy(e_root, "AEMU64_ROOT=", 12); memcpy(e_root + 12, g_root, g_rootlen + 1);
     *a++ = e_root;
     if (g_props[0]) { memcpy(e_props, "AEMU64_PROPS=", 13); memcpy(e_props + 13, g_props, slen(g_props) + 1); *a++ = e_props; }
+    static char e_utsrel[128], e_utsver[320];
+    if (g_uts_rel[0]) { memcpy(e_utsrel, "AEMU64_UTS_RELEASE=", 19); memcpy(e_utsrel + 19, g_uts_rel, slen(g_uts_rel) + 1); *a++ = e_utsrel; }
+    if (g_uts_ver[0]) { memcpy(e_utsver, "AEMU64_UTS_VERSION=", 19); memcpy(e_utsver + 19, g_uts_ver, slen(g_uts_ver) + 1); *a++ = e_utsver; }
     if (g_bsock[0]) { memcpy(e_binder, "AEMU64_BINDER=", 14); memcpy(e_binder + 14, g_bsock, slen(g_bsock) + 1); *a++ = e_binder; }
     if (g_hwbsock[0]) { memcpy(e_hwbinder, "AEMU64_HWBINDER=", 16); memcpy(e_hwbinder + 16, g_hwbsock, slen(g_hwbsock) + 1); *a++ = e_hwbinder; }
     if (g_vndbsock[0]) { memcpy(e_vndbinder, "AEMU64_VNDBINDER=", 17); memcpy(e_vndbinder + 17, g_vndbsock, slen(g_vndbsock) + 1); *a++ = e_vndbinder; }
@@ -1270,6 +1275,18 @@ static long trap2(long nr, long *a, void *uc, char **pbp) {
     case NR_setregid: case NR_setresgid: if ((int)a[0] != -1) g_rgid = (int)a[0]; if ((int)a[1] != -1) g_gid = (int)a[1]; return 0;
     case NR_setfsuid: return g_uid;
     case NR_setfsgid: return g_gid;
+    case NR_uname: {                            // the firmware kernel's identity, not the host's
+        if (!g_uts_rel[0] || !a[0]) return S1(NR_uname, a[0]);   // unknown for this image: the host answers
+        char *u = (char *)a[0];
+        memset(u, 0, 390);
+        memcpy(u, "Linux", 6);
+        memcpy(u + 65, "localhost", 10);
+        memcpy(u + 130, g_uts_rel, slen(g_uts_rel) + 1);
+        memcpy(u + 195, g_uts_ver, slen(g_uts_ver) + 1);
+        memcpy(u + 260, "aarch64", 8);
+        memcpy(u + 325, "(none)", 7);
+        return 0;
+    }
     case NR_getresuid: for (int i = 0; i < 3; i++) if (a[i]) *(u32 *)a[i] = (u32)(i ? g_uid : g_ruid); return 0;
     case NR_getresgid: for (int i = 0; i < 3; i++) if (a[i]) *(u32 *)a[i] = (u32)(i ? g_gid : g_rgid); return 0;
     case NR_getgroups: return 0;
@@ -1601,6 +1618,7 @@ static void install_filter(void) {
     for (u64 i = 0; i < sizeof trapped; i++) f[n++] = JEQ(trapped[i], L_TRAP, 0);
     f[n++] = JEQ(NR_renameat2, L_TRAP, 0);
     f[n++] = JEQ(NR_statx, L_TRAP, 0);
+    f[n++] = JEQ(NR_uname, L_TRAP, 0);
     f[n++] = JEQ(280 /* bpf */, L_TRAP, 0);
     f[n++] = JEQ(261 /* prlimit64 */, L_TRAP, 0);
     f[n++] = JEQ(164 /* setrlimit */, L_TRAP, 0);
@@ -1713,6 +1731,8 @@ void aemu_main(u64 *sp) {
     if (!r || !r[0] || slen(r) >= sizeof g_root) die("AEMU64_ROOT is not set", "");
     memcpy(g_root, r, slen(r) + 1); g_rootlen = slen(g_root);
     if ((r = env_get(envp, "AEMU64_PROPS")) && slen(r) < sizeof g_props) memcpy(g_props, r, slen(r) + 1);
+    if ((r = env_get(envp, "AEMU64_UTS_RELEASE")) && slen(r) < sizeof g_uts_rel) memcpy(g_uts_rel, r, slen(r) + 1);
+    if ((r = env_get(envp, "AEMU64_UTS_VERSION")) && slen(r) < sizeof g_uts_ver) memcpy(g_uts_ver, r, slen(r) + 1);
     g_crash = env_get(envp, "AEMU64_CRASH") != 0;
     if ((r = env_get(envp, "AEMU64_INPUT")) && slen(r) < sizeof g_input) memcpy(g_input, r, slen(r) + 1);
     if ((r = env_get(envp, "AEMU64_SDCARD")) && slen(r) < sizeof g_sd) { g_sdlen = slen(r); memcpy(g_sd, r, g_sdlen + 1); }
