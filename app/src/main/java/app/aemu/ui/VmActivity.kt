@@ -245,13 +245,13 @@ class VmActivity : ComponentActivity() {
 
         vm.onFrame = { guest.rings++; guest.poke() }
         state = vm.state
-        logLines.addAll(vm.lines().takeLast(200))
+        logLines.addAll(vm.lines().takeLast(3000))
         vm.onState { st -> runOnUiThread { state = st } }
         vm.mic.onPermissionNeeded = { runOnUiThread { askMic.launch(android.Manifest.permission.RECORD_AUDIO) } }
         vm.camera.onPermissionNeeded = { runOnUiThread { askCamera.launch(android.Manifest.permission.CAMERA) } }
         led = vm.lights.current
         vm.lights.onChange { l -> runOnUiThread { led = l } }
-        vm.onLog { line -> runOnUiThread { logLines.add(line); if (logLines.size > 400) logLines.removeRange(0, logLines.size - 400) } }
+        vm.onLog { line -> runOnUiThread { logLines.add(line); if (logLines.size > 3000) logLines.removeRange(0, logLines.size - 3000) } }
         guest.start()
         loadMenuOffset()
 
@@ -978,7 +978,7 @@ class VmActivity : ComponentActivity() {
         val guestLines = remember { mutableStateListOf<String>() }
         LaunchedEffect(guestTab) {
             while (guestTab) {
-                val recs = GuestLog.tail(vm.paths.root, 128 * 1024).takeLast(300)
+                val recs = GuestLog.tail(vm.paths.root, 1024 * 1024).takeLast(3000)
                 guestLines.clear(); guestLines.addAll(recs.map { "${it.prio} ${it.tag}: ${it.msg}" })
                 delay(1500)
             }

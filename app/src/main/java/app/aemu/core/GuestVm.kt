@@ -79,7 +79,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     fun log(s: String) {
         val line = "${stamp()} $s"
         lines.add(line)
-        while (lines.size > 2000) lines.removeAt(0)
+        while (lines.size > 3000) lines.removeAt(0)
         runCatching {
             if (engine == Engine.N64 && kernel.syncLog) FileOutputStream(logFile, true).use { it.write((line + "\n").toByteArray()); it.fd.sync() }
             else logFile.appendText(line + "\n")
