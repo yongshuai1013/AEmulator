@@ -28,6 +28,8 @@ class RilStub(
     private val api: Int = 19,
     /** baseband version from the image's factory package ("" → the generic answer) */
     private val baseband: String = "",
+    /** baseband version typed in the image settings; wins over the factory package's ("" → that one) */
+    private val basebandSetting: String = "",
     /** operator identity from the image settings; blank = the generic test-network identity */
     private val operatorNameSetting: String = "",
     private val operatorNumericSetting: String = "",
@@ -45,8 +47,8 @@ class RilStub(
     private val mnc: String get() = operatorNumeric.drop(3).ifBlank { "01" }
     /** MEID answered in RIL_REQUEST_DEVICE_IDENTITY, derived deterministically from the IMEI */
     private val meid: String by lazy { synthMeid(imei) }
-    /** what RIL_REQUEST_BASEBAND_VERSION answers: the image's own radio version when it is known */
-    private val basebandVersion: String get() = baseband.ifBlank { BASEBAND }
+    /** what RIL_REQUEST_BASEBAND_VERSION answers: the settings value first, then the image's own radio version, then the generic answer */
+    private val basebandVersion: String get() = basebandSetting.ifBlank { baseband.ifBlank { BASEBAND } }
     /** Samsung's 4.3 RIL.java reads a call type (CallDetails) after isVoicePrivacy */
     private val samsung: Boolean by lazy {
         runCatching { File(paths.root, "system/build.prop").readText().lowercase().contains("ro.product.manufacturer=samsung") }

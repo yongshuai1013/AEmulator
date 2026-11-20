@@ -99,7 +99,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     val audio = AudioOut(paths, ::log, if (img.api < 14) 44100 else AudioOut.RATE,
         if (TreeFixer.isMtkAudio(paths.root)) "dev/aemu_pcm" else "dev/eac")
     val ril = RilStub(paths, ::log, img.settings.imei.ifBlank { VmSettings.DEFAULT_IMEI }, img.api, img.baseband,
-        img.settings.operatorName, img.settings.operatorNumeric)
+        img.settings.basebandOverride, img.settings.operatorName, img.settings.operatorNumeric)
     val vold = VoldStub(paths, img.sdcardPath, ::log, others = img.volumes, api = img.api)
     var onFrame: (() -> Unit)? = null
     val frames = FrameBell(paths, ::log) { onFrame?.invoke() }

@@ -145,6 +145,11 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             OutlinedTextField(value = s.kernelBanner, onValueChange = { s = s.copy(kernelBanner = it) },
                 label = { Text(stringResource(R.string.vs_kernel)) }, supportingText = { Text(stringResource(R.string.vs_kernel_sub)) },
                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+            val effBaseband = s.basebandOverride.ifBlank { img.baseband }.ifBlank { VmSettings.DEFAULT_BASEBAND }
+            OutlinedTextField(value = s.basebandOverride, onValueChange = { s = s.copy(basebandOverride = it) },
+                label = { Text(stringResource(R.string.vs_baseband)) }, placeholder = { Text(effBaseband) },
+                supportingText = { Text(stringResource(R.string.vs_baseband_sub, effBaseband)) },
+                singleLine = true, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
 
             Spacer(Modifier.height(8.dp))
             RecoverySection(img)
