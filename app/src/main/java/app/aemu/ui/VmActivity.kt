@@ -990,7 +990,7 @@ class VmActivity : ComponentActivity() {
                     Text(stringResource(R.string.log), style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f),
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
                     IconButton(onClick = { copyLog(list.toList()) }) { Icon(Icons.Rounded.ContentCopy, stringResource(R.string.log_copy)) }
-                    IconButton(onClick = { pendingExport = list.toList(); exportLog.launch("aemu-${vm.img.id}-${if (guestTab) "logcat" else "host"}.log") }) {
+                    IconButton(onClick = { pendingExport = if (guestTab) GuestLog.exportLines(vm.paths.root) else list.toList(); exportLog.launch("aemu-${vm.img.id}-${if (guestTab) "logcat" else "host"}.log") }) {
                         Icon(Icons.Rounded.Download, stringResource(R.string.log_export))
                     }
                     FilledTonalIconButton(onClick = onClose) { Icon(Icons.Rounded.Close, stringResource(R.string.close)) }

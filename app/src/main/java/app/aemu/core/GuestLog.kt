@@ -24,6 +24,26 @@ object GuestLog {
         return parse(data)
     }
 
+    /** Log buffers the guest tree synthesizes (TreeFixer LOGS); "events" is a channel, not a file. */
+    val BUFFERS = listOf("main", "system", "radio")
+
+    /**
+     * Export text for the log panel: every buffer in its own section, each read with the
+     * panel's window (1 MB tail, last 3000 records). The panel itself shows main only —
+     * service-layer lines (SystemServer, WifiServiceImpl) go to system and never reached
+     * an export before, so a silent main proved nothing about the service layer.
+     */
+    fun exportLines(root: File): List<String> {
+        val out = ArrayList<String>()
+        for (b in BUFFERS) {
+            val recs = tail(root, 1024 * 1024, b).takeLast(3000)
+            out.add("===== log buffer: $b (${recs.size} records) =====")
+            recs.mapTo(out) { "${it.prio} ${it.tag}: ${it.msg}" }
+            out.add("")
+        }
+        return out
+    }
+
     fun parse(data: ByteArray): List<Rec> {
         val out = ArrayList<Rec>()
         var i = 0
