@@ -21,8 +21,6 @@ class Analyzer(
     private val paths: VmPaths,
     private val ramdisk: List<BootImage.CpioEntry>?,
     private val kernelBanner: String = "",
-    private val kernelRelease: String = "",
-    private val kernelVersion: String = "",
     private val baseband: String = "",
 ) {
     private val root = paths.root
@@ -126,15 +124,13 @@ class Analyzer(
             services = plan,
             sdcardPath = sdcard,
             volumes = voldVols,
-            settings = settings,
+            // the kernel banner extracted from boot.img pre-fills the (user-editable) setting
+            settings = settings.copy(kernelBanner = kernelBanner),
             createdAt = System.currentTimeMillis(),
             sourceName = sourceName,
             runtime = if (api >= 21) "art" else "dalvik",
             warnings = warnings,
             profileVersion = VERSION,
-            kernelBanner = kernelBanner,
-            kernelRelease = kernelRelease,
-            kernelVersion = kernelVersion,
             baseband = baseband,
         )
     }
@@ -170,9 +166,9 @@ class Analyzer(
             val out = fresh.copy(
                 name = img.name, settings = img.settings, createdAt = img.createdAt, sizeBytes = img.sizeBytes,
                 lastBootMs = img.lastBootMs, bootCount = img.bootCount,
-                // re-analysis has no boot image at hand: the kernel identity and baseband carry over
-                kernelBanner = img.kernelBanner, kernelRelease = img.kernelRelease,
-                kernelVersion = img.kernelVersion, baseband = img.baseband,
+                // re-analysis has no factory package at hand: the baseband carries over
+                // (the kernel banner lives in the settings, preserved with them above)
+                baseband = img.baseband,
             )
             app.aemu.core.ImageStore.save(ctx, out)
             return out

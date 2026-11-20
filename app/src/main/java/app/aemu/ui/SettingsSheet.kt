@@ -137,6 +137,9 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             OutlinedTextField(value = s.qemuArgs, onValueChange = { s = s.copy(qemuArgs = it) },
                 label = { Text(stringResource(R.string.vs_qemu_args)) }, supportingText = { Text(stringResource(R.string.vs_qemu_args_sub)) },
                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+            OutlinedTextField(value = s.kernelBanner, onValueChange = { s = s.copy(kernelBanner = it) },
+                label = { Text(stringResource(R.string.vs_kernel)) }, supportingText = { Text(stringResource(R.string.vs_kernel_sub)) },
+                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
 
             Spacer(Modifier.height(8.dp))
             RecoverySection(img)

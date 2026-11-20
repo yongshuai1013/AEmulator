@@ -45,6 +45,12 @@ data class VmSettings(
     val imei: String = "",
     /** extra qemu options; KEY=VALUE tokens are passed as environment variables */
     val qemuArgs: String = "",
+    /**
+     * The guest kernel's version banner ("Linux version …"): written to /proc/version and
+     * reported by uname. Filled in from the firmware's boot.img at import; blank = the
+     * feature is off and the guest keeps the host's answers. Takes effect at the next boot.
+     */
+    val kernelBanner: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -53,6 +59,7 @@ data class VmSettings(
         .put("showFrame", showFrame).put("showNavBar", showNavBar).put("navKeys", navKeys).put("navSize", navSize)
         .put("keepScreenOn", keepScreenOn).put("showLed", showLed).put("mtMode", mtMode).put("legacyEngine", legacyEngine)
         .put("ramMb", ramMb).put("radio", radio).put("native32", native32).put("imei", imei).put("qemuArgs", qemuArgs)
+        .put("kernelBanner", kernelBanner)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -97,6 +104,7 @@ data class VmSettings(
                 native32 = o.optBoolean("native32", false),
                 imei = o.optString("imei", ""),
                 qemuArgs = o.optString("qemuArgs", ""),
+                kernelBanner = o.optString("kernelBanner", ""),
             )
         }
     }
@@ -181,12 +189,6 @@ data class GuestImage(
     val profileVersion: Int = 0,
     /** container: id of the image whose /system this one shares (its own /data, card and settings) */
     val baseId: String = "",
-    /** the firmware kernel's own version banner, read from boot.img at import ("" when unknown) */
-    val kernelBanner: String = "",
-    /** utsname release parsed from the banner: what the native runner answers uname with */
-    val kernelRelease: String = "",
-    /** utsname version parsed from the banner (the "#1 …" build stamp) */
-    val kernelVersion: String = "",
     /** baseband version implied by the factory package's radio file name ("" → the stub's generic answer) */
     val baseband: String = "",
 ) {
@@ -216,8 +218,7 @@ data class GuestImage(
         .put("lastBootMs", lastBootMs).put("bootCount", bootCount)
         .put("profileVersion", profileVersion)
         .put("baseId", baseId)
-        .put("kernelBanner", kernelBanner).put("kernelRelease", kernelRelease)
-        .put("kernelVersion", kernelVersion).put("baseband", baseband)
+        .put("baseband", baseband)
 
     companion object {
         fun fromJson(o: JSONObject): GuestImage {
@@ -252,9 +253,6 @@ data class GuestImage(
                 bootCount = o.optInt("bootCount", 0),
                 profileVersion = o.optInt("profileVersion", 0),
                 baseId = o.optString("baseId", ""),
-                kernelBanner = o.optString("kernelBanner", ""),
-                kernelRelease = o.optString("kernelRelease", ""),
-                kernelVersion = o.optString("kernelVersion", ""),
                 baseband = o.optString("baseband", ""),
             )
         }

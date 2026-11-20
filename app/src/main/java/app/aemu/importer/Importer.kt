@@ -46,10 +46,8 @@ class Importer(
     private val tmp = File(ctx.cacheDir, "import").apply { mkdirs() }
     private var ramdisk: List<BootImage.CpioEntry>? = null
     private var recovery: ByteArray? = null
-    // the firmware kernel's identity, read from its boot image: /proc/version and uname in the guest
+    // the firmware kernel's banner, read from its boot image: pre-fills the image's kernelBanner setting
     private var kernelBanner = ""
-    private var kernelRelease = ""
-    private var kernelVersion = ""
     // baseband version implied by a radio-<device>-<version>.img file name in the package
     private var baseband = ""
     private val symlinks = ArrayList<Pair<String, String>>() // (цель, путь ссылки в госте)
@@ -83,7 +81,7 @@ class Importer(
             finishTree()
             recovery?.let { runCatching { RecoveryImage.install(paths, it, log) } }
             onProgress("Analyzing firmware", 0.97f)
-            val img = Analyzer(ctx, paths, ramdisk, kernelBanner, kernelRelease, kernelVersion, baseband).analyze(id, name)
+            val img = Analyzer(ctx, paths, ramdisk, kernelBanner, baseband).analyze(id, name)
             TreeFixer(ctx, paths, img, log).sanitize()
             ImageStore.save(ctx, img.copy(sizeBytes = ImageStore.du(paths.dir)))
             onProgress("Done", 1f)
@@ -646,9 +644,7 @@ class Importer(
         if (kernelBanner.isEmpty()) runCatching {
             BootImage.kernelBanner(data)?.let { b ->
                 kernelBanner = b
-                kernelRelease = BootImage.bannerRelease(b)
-                kernelVersion = BootImage.bannerVersion(b)
-                log("boot: kernel $kernelRelease")
+                log("boot: kernel ${BootImage.bannerRelease(b)}")
             }
         }
         if (ramdisk != null) return

@@ -1015,11 +1015,15 @@ class TreeFixer(
                 if (!it.isFile || !it.readBytes().contentEquals(gz)) it.writeBytes(gz)
             } else if (!it.isFile || it.readText() != text) it.writeText(text)
         }
-        // /proc/version: the firmware kernel's own banner, read from its boot.img at import — the line
-        // Settings shows as "Kernel version". Images imported before this existed have no banner: no file.
-        if (engine == Engine.N64 && img.kernelBanner.isNotBlank()) File(root, "proc/version").let {
-            val text = img.kernelBanner + "\n"
-            if (!it.isFile || it.readText() != text) it.writeText(text)
+        // /proc/version: the kernel banner from the image's settings (pre-filled from its boot.img
+        // at import, user-editable) — the line Settings shows as "Kernel version". A blank banner
+        // turns the feature off: no file, and a stale one from an earlier boot does not stay.
+        if (engine == Engine.N64) {
+            val f = File(root, "proc/version")
+            if (img.settings.kernelBanner.isNotBlank()) {
+                val text = img.settings.kernelBanner + "\n"
+                if (!f.isFile || f.readText() != text) f.writeText(text)
+            } else f.delete()
         }
     }
 

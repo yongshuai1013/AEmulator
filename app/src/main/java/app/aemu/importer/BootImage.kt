@@ -102,9 +102,15 @@ object BootImage {
         return null
     }
 
-    /** utsname release: the token right after "Linux version " */
-    fun bannerRelease(banner: String): String =
-        banner.removePrefix("Linux version ").substringBefore(' ').trim()
+    /**
+     * utsname release: the token right after "Linux version ". "" when the text is not a
+     * kernel banner (a user-edited field can hold anything) — callers then leave uname alone.
+     */
+    fun bannerRelease(banner: String): String {
+        if (!banner.startsWith("Linux version ")) return ""
+        val rel = banner.removePrefix("Linux version ").substringBefore(' ').trim()
+        return if (rel.firstOrNull()?.isDigit() == true) rel else ""
+    }
 
     /**
      * utsname version: the "#1 …" build stamp. The banner is built as
@@ -112,6 +118,7 @@ object BootImage {
      * contain parentheses of its own, so the stamp follows the LAST ") " of the line.
      */
     fun bannerVersion(banner: String): String {
+        if (!banner.startsWith("Linux version ")) return ""
         val last = banner.lastIndexOf(") ")
         return if (last < 0) "" else banner.substring(last + 2).trim()
     }

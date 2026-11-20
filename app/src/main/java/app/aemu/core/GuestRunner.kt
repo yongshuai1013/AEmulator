@@ -1,5 +1,6 @@
 package app.aemu.core
 
+import app.aemu.importer.BootImage
 import java.io.File
 import java.util.concurrent.TimeUnit
 
@@ -97,9 +98,15 @@ class GuestRunner(
         e["HOME"] = "/data"; e["TMPDIR"] = "/data/local/tmp"; e["TZ"] = "UTC"
         e["AEMU64_ROOT"] = paths.root.absolutePath
         e["AEMU64_PROPS"] = paths.props.absolutePath
-        // the guest kernel's identity (from the image's boot.img): the runner answers uname with these
-        if (img.kernelRelease.isNotEmpty()) e["AEMU64_UTS_RELEASE"] = img.kernelRelease
-        if (img.kernelVersion.isNotEmpty()) e["AEMU64_UTS_VERSION"] = img.kernelVersion
+        // the guest kernel's identity: release/version parsed out of the settings' kernel banner
+        // (pre-filled from boot.img at import). No parseable release → no variables → the runner
+        // leaves uname to the host kernel, exactly as when the banner is blank.
+        val utsRelease = BootImage.bannerRelease(img.settings.kernelBanner)
+        if (utsRelease.isNotEmpty()) {
+            e["AEMU64_UTS_RELEASE"] = utsRelease
+            val utsVersion = BootImage.bannerVersion(img.settings.kernelBanner)
+            if (utsVersion.isNotEmpty()) e["AEMU64_UTS_VERSION"] = utsVersion
+        }
         e["AEMU64_BINDER"] = paths.binderSock.absolutePath
         if (kernel.treble) {
             e["AEMU64_HWBINDER"] = paths.hwbinderSock.absolutePath
