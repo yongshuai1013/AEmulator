@@ -380,13 +380,14 @@ static void *reader(void *arg) {
 static int c_set_window(struct camera_device *d, struct preview_ops *w) {
     d->window = w;
     d->window_ready = 0;
-    if (!w) return 0;
+    if (!w) { probe(d, "set_window null", -1); return 0; }
     int min = 1;
     if (w->get_min_undequeued_buffer_count) w->get_min_undequeued_buffer_count(w, &min);
     w->set_usage(w, USAGE_SW_WRITE_OFTEN);
     w->set_buffer_count(w, min + 2);
-    if (w->set_buffers_geometry(w, W, H, FORMAT_RGBA_8888) != 0) return 0;
+    if (w->set_buffers_geometry(w, W, H, FORMAT_RGBA_8888) != 0) { probe(d, "set_window fail", -1); return 0; }
     d->window_ready = 1;
+    probe(d, "set_window set", -1);
     return 0;
 }
 static void c_set_callbacks(struct camera_device *d, notify_cb n, data_cb c, data_ts_cb t, request_memory g, void *user) {
