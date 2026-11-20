@@ -152,6 +152,92 @@ EXPORT int init_module(void *img, ulong len, const char *params) { (void)img; (v
 EXPORT int delete_module(const char *name, int flags) { (void)name; (void)flags; return 0; }
 EXPORT int klogctl(int type, char *buf, int len) { (void)type; (void)buf; (void)len; return 0; }
 
+#if defined(__aarch64__)
+/* Android's clang turns __sync_* into calls to the compiler-rt outline atomics on AArch64
+ * (so LSE can be picked at runtime), and a -nostdlib link against bionic provides none of
+ * them. These are the ones the shims use, done with ARMv8.0 LL/SC so the baseline target
+ * needs no LSE. Argument order is the outline-atomics ABI, as clang emits it: cas takes
+ * (expected, desired, ptr), swp/ldadd take (value, ptr); all return the previous contents. */
+unsigned int __aarch64_cas4_acq_rel(unsigned int expected, unsigned int desired, volatile unsigned int *ptr) {
+    unsigned int cur, st;
+    __asm__ volatile(
+        "1: ldaxr %w0, [%2]\n"
+        "   cmp %w0, %w3\n"
+        "   b.ne 3f\n"
+        "   stlxr %w1, %w4, [%2]\n"
+        "   cbnz %w1, 1b\n"
+        "   b 2f\n"
+        "3: clrex\n"
+        "2:"
+        : "=&r"(cur), "=&r"(st)
+        : "r"(ptr), "r"(expected), "r"(desired)
+        : "memory", "cc");
+    return cur;
+}
+unsigned long __aarch64_cas8_acq_rel(unsigned long expected, unsigned long desired, volatile unsigned long *ptr) {
+    unsigned long cur; unsigned int st;
+    __asm__ volatile(
+        "1: ldaxr %0, [%2]\n"
+        "   cmp %0, %3\n"
+        "   b.ne 3f\n"
+        "   stlxr %w1, %4, [%2]\n"
+        "   cbnz %w1, 1b\n"
+        "   b 2f\n"
+        "3: clrex\n"
+        "2:"
+        : "=&r"(cur), "=&r"(st)
+        : "r"(ptr), "r"(expected), "r"(desired)
+        : "memory", "cc");
+    return cur;
+}
+unsigned int __aarch64_swp4_acq_rel(unsigned int value, volatile unsigned int *ptr) {
+    unsigned int cur, st;
+    __asm__ volatile(
+        "1: ldaxr %w0, [%2]\n"
+        "   stlxr %w1, %w3, [%2]\n"
+        "   cbnz %w1, 1b"
+        : "=&r"(cur), "=&r"(st)
+        : "r"(ptr), "r"(value)
+        : "memory");
+    return cur;
+}
+unsigned long __aarch64_swp8_acq_rel(unsigned long value, volatile unsigned long *ptr) {
+    unsigned long cur; unsigned int st;
+    __asm__ volatile(
+        "1: ldaxr %0, [%2]\n"
+        "   stlxr %w1, %3, [%2]\n"
+        "   cbnz %w1, 1b"
+        : "=&r"(cur), "=&r"(st)
+        : "r"(ptr), "r"(value)
+        : "memory");
+    return cur;
+}
+unsigned int __aarch64_ldadd4_acq_rel(unsigned int value, volatile unsigned int *ptr) {
+    unsigned int cur, nv; unsigned int st;
+    __asm__ volatile(
+        "1: ldaxr %w0, [%3]\n"
+        "   add %w2, %w0, %w4\n"
+        "   stlxr %w1, %w2, [%3]\n"
+        "   cbnz %w1, 1b"
+        : "=&r"(cur), "=&r"(st), "=&r"(nv)
+        : "r"(ptr), "r"(value)
+        : "memory");
+    return cur;
+}
+unsigned long __aarch64_ldadd8_acq_rel(unsigned long value, volatile unsigned long *ptr) {
+    unsigned long cur, nv; unsigned int st;
+    __asm__ volatile(
+        "1: ldaxr %0, [%3]\n"
+        "   add %2, %0, %4\n"
+        "   stlxr %w1, %2, [%3]\n"
+        "   cbnz %w1, 1b"
+        : "=&r"(cur), "=&r"(st), "=&r"(nv)
+        : "r"(ptr), "r"(value)
+        : "memory");
+    return cur;
+}
+#endif
+
 /* ------------------------------------------------------------------ запуск скриптов */
 
 extern char **environ;
