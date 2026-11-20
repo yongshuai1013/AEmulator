@@ -106,6 +106,11 @@ class InputService(private val paths: VmPaths, private val log: (String) -> Unit
     /** Extra consumer of the raw input_event stream (recovery mode: a FIFO the guest reads as /dev/input/event0). */
     @Volatile var sink: java.io.OutputStream? = null
 
+    // probe bookkeeping for the sink (recovery touch): totals + last-log time, logging only
+    private var sinkBytes = 0L
+    private var sinkEvents = 0L
+    private var sinkLogAt = 0L
+
     private fun send(now: List<P>) {
         if (clients.isEmpty() && sink == null) return
         val b = ByteBuffer.allocate((now.size * 7 + 3) * EV).order(ByteOrder.LITTLE_ENDIAN)
@@ -219,7 +224,21 @@ class InputService(private val paths: VmPaths, private val log: (String) -> Unit
         // the recovery FIFO consumer parses the same struct input_event layout as the socket
         // clients, so it must get the same (possibly widened) bytes: feeding it the raw 16-byte
         // records desyncs a 64-bit minui on the very first record and touch is dead
-        sink?.let { runCatching { it.write(w); it.flush() }.onFailure { sink = null } }
+        sink?.let { s ->
+            runCatching { s.write(w); s.flush() }.onSuccess {
+                val evSize = if (wide) 24 else 16
+                sinkBytes += w.size
+                sinkEvents += w.size / evSize
+                val nowMs = System.currentTimeMillis()
+                if (sinkLogAt == 0L || nowMs - sinkLogAt >= 1000) {
+                    sinkLogAt = nowMs
+                    log("input sink: wrote ${w.size}B (total ${sinkBytes}B, ${sinkEvents} events)")
+                }
+            }.onFailure {
+                log("input sink: write failed, sink dropped (${it.message ?: it.javaClass.simpleName})")
+                sink = null
+            }
+        }
         for (c in clients) {
             try { c.out.write(w); c.out.flush() } catch (e: Exception) { dead.add(c) }
         }

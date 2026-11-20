@@ -177,6 +177,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             android.system.Os.mkfifo(ev.path, "666".toInt(8))
             val fd = android.system.Os.open(ev.path, android.system.OsConstants.O_RDWR, 0)
             input.sink = java.io.FileOutputStream(fd)
+            log("recovery input: fifo ready")
             for (alt in listOf("event1", "event2", "event3")) {
                 val f = File(RecoveryImage.dir(paths), "dev/input/$alt")
                 f.delete()
@@ -258,6 +259,27 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 if (detected == null) Thread.sleep(250)
             }
             if (detected == null) log("recovery format: not detected, view format left at $recoveryFormat")
+        }.start()
+        // Probe (recovery touch): mirror whatever the recovery itself says about input
+        // devices/events into the host log — minui's evdev scan lands in the same two files
+        // the format watch above reads. Logging only; each distinct line is mirrored once.
+        Thread {
+            val keys = listOf("input", "event", "minui", "evdev", "touch")
+            val seen = HashSet<String>()
+            val sources = listOf(File(r, "tmp/recovery.log"), File(paths.bin, "recovery.out"))
+            fun sweep() {
+                for (f in sources) {
+                    val t = runCatching { f.readText() }.getOrDefault("")
+                    for (raw in t.lineSequence()) {
+                        val line = raw.trim()
+                        if (line.isEmpty()) continue
+                        if (keys.none { line.contains(it, ignoreCase = true) }) continue
+                        if (seen.add(line)) log("recovery log | $line")
+                    }
+                }
+            }
+            while (p.isAlive && !stopping) { sweep(); Thread.sleep(250) }
+            sweep()
         }.start()
         // reboot requests of the recovery (librecshim → /dev/aemu_power)
         val power = File(r, "dev/aemu_power")
