@@ -150,6 +150,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         runCatching { logFile.writeText("") }
         log("image \"${img.name}\": recovery mode")
         if (!RecoveryImage.installed(paths)) error("this firmware has no recovery installed")
+        log("recovery image: ${recoveryKind()}")
         val is64 = RecoveryImage.isElf64(paths)
         val qemu = paths.nativeBin(if (is64) kernel.runner else Engine.KK.qemu)
         if (!is64 && !(img.settings.native32 && CpuInfo.hasAArch32) && !qemu.canExecute()) error("translator ${Engine.KK.qemu} is not executable")
@@ -231,8 +232,26 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             val code = runCatching { p.waitFor() }.getOrDefault(-1)
             if (stopping || powerHandled) return@Thread
             log("recovery exited (code $code), booting the system")
+            // the recovery's own output sits in recovery.out, which the log export cannot reach: mirror its tail here
+            val outLines = runCatching { File(paths.bin, "recovery.out").readLines() }.getOrDefault(emptyList())
+            if (outLines.isEmpty()) log("recovery.out | (missing or empty)")
+            else outLines.takeLast(60).forEach { log("recovery.out | $it") }
             onPower?.invoke(true, "")
         }.start()
+    }
+
+    /** Which recovery is installed, named the way the settings sheet names it. */
+    private fun recoveryKind(): String {
+        val dir = RecoveryImage.dir(paths)
+        val prop = runCatching { File(dir, "default.prop").readText() }.getOrDefault("")
+        val twrp = Regex("""ro\.twrp\.version=(\S+)""").find(prop)?.groupValues?.get(1)
+        return when {
+            twrp != null -> "TWRP $twrp"
+            File(dir, "twres").isDirectory -> "TWRP"
+            File(dir, "sbin/orangefox.sh").exists() || prop.contains("orangefox", true) -> "OrangeFox"
+            prop.contains("cwm", true) || File(dir, "res/images/icon_clockwork.png").exists() -> "ClockworkMod"
+            else -> "stock/other"
+        }
     }
 
     private fun doBoot() {
