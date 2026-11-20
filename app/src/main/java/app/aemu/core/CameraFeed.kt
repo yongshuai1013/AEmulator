@@ -44,6 +44,8 @@ class CameraFeed(private val ctx: Context, private val paths: VmPaths, private v
         private val nv21 = ByteArray(W * H * 3 / 2)
         private val rgba = ByteArray(W * H * 4)
         private var frames = 0
+        private var arrived = 0
+        private var dropped = 0
         private var firstNs = 0L
         private var convNs = 0L
         private var sendNs = 0L
@@ -53,6 +55,7 @@ class CameraFeed(private val ctx: Context, private val paths: VmPaths, private v
                 val r = sock.inputStream.bufferedReader()
                 while (true) {
                     val line = r.readLine() ?: break
+                    log("camera: cmd \"${line.trim()}\"")
                     val p = line.trim().split(' ')
                     when (p[0]) {
                         "open" -> open(p.getOrNull(1) == "1")
@@ -113,7 +116,13 @@ class CameraFeed(private val ctx: Context, private val paths: VmPaths, private v
         }
 
         private fun frame(img: Image) {
-            if (!streaming && !shot) return
+            arrived++
+            if (arrived == 1 || arrived == 30) log("camera: host frames arriving: $arrived so far (streaming=$streaming)")
+            if (!streaming && !shot) {
+                dropped++
+                if (dropped % 30 == 0) log("camera: dropped $dropped frames at the gate (not streaming)")
+                return
+            }
             val t0 = System.nanoTime()
             toNv21(img)
             runCatching {
