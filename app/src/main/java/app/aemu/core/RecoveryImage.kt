@@ -73,11 +73,15 @@ object RecoveryImage {
             }
         }
 
-        // dynamic recoveries (TWRP, OrangeFox) get librecshim.so preloaded: mount points look mounted, evdev ioctls answered
-        runCatching {
-            for (lib in listOf("librecshim.so", "libaemushim.so")) {
-                EngineAssets.open(paths.ctx, "engines/common/$lib").use { i -> File(r, "sbin/$lib").outputStream().use { i.copyTo(it) } }
-                File(r, "sbin/$lib").setReadable(true, false)
+        // dynamic recoveries (TWRP, OrangeFox) get librecshim.so preloaded: mount points look mounted, evdev ioctls answered.
+        // The bundled shims are 32-bit: a 64-bit recovery's linker refuses them outright, so for one of those
+        // keep whatever the image itself ships and stamp nothing over it.
+        if (!isElf64(paths)) {
+            runCatching {
+                for (lib in listOf("librecshim.so", "libaemushim.so")) {
+                    EngineAssets.open(paths.ctx, "engines/common/$lib").use { i -> File(r, "sbin/$lib").outputStream().use { i.copyTo(it) } }
+                    File(r, "sbin/$lib").setReadable(true, false)
+                }
             }
         }
         File(r, "dev/aemu_power").let { if (!it.exists()) it.createNewFile() }

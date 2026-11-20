@@ -160,6 +160,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         TreeFixer(ctx, paths, img, ::log).fixup()   // framebuffer, input node
         val sd = Sdcard.setup(ctx, paths, img, ::log)
         RecoveryImage.prepare(paths, sd, settings)
+        log(if (is64) "recovery shims: skipped (64-bit recovery)" else "recovery shims: preloaded (32-bit)")
         input.rateHz = settings.touchHz
         input.mtMode = settings.mtMode
         input.serve()
@@ -194,10 +195,12 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         val recEnv = mutableMapOf(
             "PATH" to "/sbin:/system/bin", "LD_LIBRARY_PATH" to ".:/sbin", "ANDROID_ROOT" to "/system", "ANDROID_DATA" to "/data",
             "EXTERNAL_STORAGE" to "/sdcard", "TZ" to "UTC",
-            "LD_PRELOAD" to "/sbin/librecshim.so:/sbin/libaemushim.so", "AEMU_MOUNTS" to "/sdcard:/data:/system:/cache:/emmc:/external_sd:/usb-otg",
+            "AEMU_MOUNTS" to "/sdcard:/data:/system:/cache:/emmc:/external_sd:/usb-otg",
             "DHD_FB_W" to "$w", "DHD_FB_H" to "$h", "DHD_IN_W" to "$w", "DHD_IN_H" to "$h",
             "DHD_INPUT" to paths.inputSock.absolutePath,
         )
+        // The bundled shims are 32-bit; preloading them into a 64-bit recovery kills it in the linker.
+        if (!is64) recEnv["LD_PRELOAD"] = "/sbin/librecshim.so:/sbin/libaemushim.so"
         // A 64-bit recovery runs under the aemu64 launcher (kernel.runner), which dies at once
         // ("AEMU64_ROOT is not set", exit 127) without the environment GuestRunner.env64 hands it
         // for a system boot. Give it the same set, with the paths pointed at the recovery tree.
