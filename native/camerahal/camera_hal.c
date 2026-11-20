@@ -217,6 +217,45 @@ static int host_connect(void) {
     return fd;
 }
 static void say(struct camera_device *d, const char *cmd) { if (d->fd >= 0) write(d->fd, cmd, slen(cmd)); }
+
+/* Diagnostic probes (the camera preview investigation): a marker goes to the guest log through liblog —
+ * resolved lazily via dlopen, this library links only libc/libdl — and to the host over the command socket
+ * as a "probe ..." line, which the host logs verbatim and otherwise ignores. Markers only: nothing here
+ * changes what the HAL does. n < 0 prints no number. */
+typedef int (*aemu_log_fn)(int prio, const char *tag, const char *fmt, ...);
+static aemu_log_fn g_log_fn;
+static int g_log_state;   /* 0 = untried, 1 = ready, -1 = no liblog in this guest */
+static void probe(struct camera_device *d, const char *what, long n) {
+    char msg[64];
+    unsigned i = 0;
+    const char *p = what;
+    while (*p && i < sizeof(msg) - 24) msg[i++] = *p++;
+    if (n >= 0) {
+        char num[20];
+        int m = 0;
+        if (n == 0) num[m++] = '0';
+        while (n > 0) { num[m++] = (char)('0' + (int)(n % 10)); n /= 10; }
+        msg[i++] = ' ';
+        while (m > 0) msg[i++] = num[--m];
+    }
+    msg[i] = 0;
+    if (!g_log_state) {
+        g_log_state = -1;
+        void *h = dlopen("liblog.so", 0);
+        void *f = h ? dlsym(h, "__android_log_print") : 0;
+        if (f) { g_log_fn = (aemu_log_fn)f; g_log_state = 1; }
+    }
+    if (g_log_state == 1) g_log_fn(4 /* ANDROID_LOG_INFO */, "aemu-cam", "%s", msg);
+    if (d && d->fd >= 0) {
+        char line[80];
+        unsigned j = 0;
+        const char *q = "probe ";
+        while (*q && j < sizeof(line) - 1) line[j++] = *q++;
+        for (unsigned k = 0; msg[k] && j < sizeof(line) - 1; k++) line[j++] = msg[k];
+        if (j < sizeof(line) - 1) line[j++] = '\n';
+        write(d->fd, line, j);
+    }
+}
 static int read_full(int fd, void *buf, unsigned long n) {
     char *p = buf;
     while (n) { long k = read(fd, p, n); if (k <= 0) return -1; p += k; n -= (unsigned long)k; }
@@ -294,6 +333,7 @@ static void scale_nv21(unsigned char *dst, int dw, int dh, const unsigned char *
 
 static void *reader(void *arg) {
     struct camera_device *d = arg;
+    long got = 0;
     unsigned char *frame = malloc(W * H * 4 + W * H * 3 / 2);
     while (d->running && frame) {
         int32_t hdr[4];
@@ -302,6 +342,8 @@ static void *reader(void *arg) {
         unsigned long len = (unsigned long)hdr[3];
         if (type == 1 && w == W && h == H && len == W * H * 4 + W * H * 3 / 2) {
             if (read_full(d->fd, frame, len) < 0) break;
+            got++;
+            if (got == 1 || got % 30 == 0) probe(d, "frames", got);
             if (!d->previewing) continue;
             show(d, frame, w, h);
             if ((d->msgs & MSG_PREVIEW_FRAME) && d->data && d->get_memory) {
@@ -353,8 +395,8 @@ static void c_set_callbacks(struct camera_device *d, notify_cb n, data_cb c, dat
 static void c_enable(struct camera_device *d, int32_t m) { d->msgs |= m; }
 static void c_disable(struct camera_device *d, int32_t m) { d->msgs &= ~m; }
 static int c_enabled(struct camera_device *d, int32_t m) { return (d->msgs & m) != 0; }
-static int c_start_preview(struct camera_device *d) { d->previewing = 1; say(d, "start\n"); return 0; }
-static void c_stop_preview(struct camera_device *d) { d->previewing = 0; say(d, "stop\n"); }
+static int c_start_preview(struct camera_device *d) { probe(d, "start_preview", -1); d->previewing = 1; say(d, "start\n"); return 0; }
+static void c_stop_preview(struct camera_device *d) { probe(d, "stop_preview", -1); d->previewing = 0; say(d, "stop\n"); }
 static int c_preview_enabled(struct camera_device *d) { return d->previewing; }
 static int c_meta(struct camera_device *d, int e) { (void)d; return e ? -38 : 0; }
 static int c_start_rec(struct camera_device *d) { (void)d; return -38; }   /* video recording is not supported yet */
@@ -363,7 +405,7 @@ static int c_rec_enabled(struct camera_device *d) { (void)d; return 0; }
 static void c_release_frame(struct camera_device *d, const void *p) { (void)d; (void)p; }
 static int c_focus(struct camera_device *d) { if ((d->msgs & MSG_FOCUS) && d->notify) d->notify(MSG_FOCUS, 1, 0, d->user); return 0; }
 static int c_cancel_focus(struct camera_device *d) { (void)d; return 0; }
-static int c_take_picture(struct camera_device *d) { say(d, "shot\n"); return 0; }
+static int c_take_picture(struct camera_device *d) { probe(d, "take_picture", -1); say(d, "shot\n"); return 0; }
 static int c_cancel_picture(struct camera_device *d) { (void)d; return 0; }
 static int c_set_params(struct camera_device *d, const char *p) {
     if (!p) return -22;
