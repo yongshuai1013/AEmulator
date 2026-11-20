@@ -10,9 +10,12 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
       - name: Install SDK packages
-        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "build-tools;35.0.0"
+        run: |
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | sort -V | tail -1)
+          echo "sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0" "build-tools;35.0.0"
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
