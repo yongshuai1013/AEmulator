@@ -15,7 +15,8 @@ import java.util.Collections
  * Telephony sees a ready SIM, a registered UMTS network and one data connection (rmnet0). That is what
  * makes ConnectivityService report "mobile: CONNECTED": the guest's sockets already reach the internet
  * through the phone (qemu user mode), but apps check the active network first and refuse to go online.
- * The operator is taken from the firmware's own apns-conf.xml so the framework finds an APN for it.
+ * The operator identity comes from the image settings (a real carrier preset or a custom value);
+ * while the settings leave it blank the modem reports the generic test network 00101 "AEmulator".
  *
  * Response layouts follow the guest's RIL.java: RIL v6 parcels for 4.x, the string lists of 2.3.
  * Extra trailing fields are harmless — Parcel reads past the end as zero/null.
@@ -27,12 +28,23 @@ class RilStub(
     private val api: Int = 19,
     /** baseband version from the image's factory package ("" → the generic answer) */
     private val baseband: String = "",
+    /** operator identity from the image settings; blank = the generic test-network identity */
+    private val operatorNameSetting: String = "",
+    private val operatorNumericSetting: String = "",
 ) {
     @Volatile var answered = 0L
         private set
 
     private val server = UnixServer(paths.socket("rild"), "rild") { c -> serveOne(c) }
-    private val operator: Pair<String, String> by lazy { pickOperator() }   // mcc to mnc
+    /** operator name the modem reports (RIL_REQUEST_OPERATOR): the settings value or the generic default */
+    private val operatorName: String get() = operatorNameSetting.ifBlank { VmSettings.DEFAULT_OPERATOR_NAME }
+    /** operator PLMN (MCC+MNC) the modem reports: the settings value or the test network 00101 */
+    private val operatorNumeric: String
+        get() = operatorNumericSetting.filter { it.isDigit() }.ifBlank { VmSettings.DEFAULT_OPERATOR_NUMERIC }
+    private val mcc: String get() = operatorNumeric.take(3)
+    private val mnc: String get() = operatorNumeric.drop(3).ifBlank { "01" }
+    /** MEID answered in RIL_REQUEST_DEVICE_IDENTITY, derived deterministically from the IMEI */
+    private val meid: String by lazy { synthMeid(imei) }
     /** what RIL_REQUEST_BASEBAND_VERSION answers: the image's own radio version when it is known */
     private val basebandVersion: String get() = baseband.ifBlank { BASEBAND }
     /** Samsung's 4.3 RIL.java reads a call type (CallDetails) after isVoicePrivacy */
@@ -120,7 +132,7 @@ class RilStub(
         out = o
         if (api >= 14) unsol(o, UNSOL_RIL_CONNECTED, ints(RIL_VERSION))
         unsol(o, UNSOL_RADIO_STATE_CHANGED, le(0))
-        log("radio: telephony connected, operator ${operator.first}${operator.second}")
+        log("radio: telephony connected, operator $operatorNumeric ($operatorName)")
         val din = DataInputStream(c.inputStream)
         while (true) {
             val len = try { din.readInt() } catch (e: Exception) { break }
@@ -168,7 +180,7 @@ class RilStub(
                 RIL_REQUEST_GET_IMEI -> str(imei)
                 RIL_REQUEST_GET_IMEISV -> str(IMEISV)
                 RIL_REQUEST_BASEBAND_VERSION -> str(basebandVersion)
-                RIL_REQUEST_DEVICE_IDENTITY -> strs(imei, IMEISV, "", "")
+                RIL_REQUEST_DEVICE_IDENTITY -> strs(imei, IMEISV, meid, "")
                 else -> null
             }
             val err = if (request == RIL_REQUEST_RADIO_POWER || data != null) 0 else E_RADIO_NOT_AVAILABLE
@@ -182,7 +194,6 @@ class RilStub(
     }
 
     private fun handle(req: Int): Pair<Int, ByteArray> {
-        val (mcc, mnc) = operator
         return when (req) {
             RIL_REQUEST_GET_SIM_STATUS -> 0 to simStatus()
             RIL_REQUEST_GET_CURRENT_CALLS -> 0 to callList()
@@ -193,13 +204,13 @@ class RilStub(
             RIL_REQUEST_SIGNAL_STRENGTH -> 0 to ints(20, 99, -1, -1, -1, -1, -1, 99, -1, -1, -1, -1, -1)
             RIL_REQUEST_VOICE_REGISTRATION_STATE -> 0 to strs("1", "0001", "00000001", "3")
             RIL_REQUEST_DATA_REGISTRATION_STATE -> 0 to strs("1", "0001", "00000001", "3", "0", "1")
-            RIL_REQUEST_OPERATOR -> 0 to strs(OPERATOR_NAME, OPERATOR_NAME, mcc + mnc)
+            RIL_REQUEST_OPERATOR -> 0 to strs(operatorName, operatorName, operatorNumeric)
             RIL_REQUEST_SETUP_DATA_CALL -> 0 to dataCall(single = true)
             RIL_REQUEST_DATA_CALL_LIST -> 0 to dataCall(single = false)
             RIL_REQUEST_GET_IMEI -> 0 to str(imei)
             RIL_REQUEST_GET_IMEISV -> 0 to str(IMEISV)
             RIL_REQUEST_BASEBAND_VERSION -> 0 to str(basebandVersion)
-            RIL_REQUEST_DEVICE_IDENTITY -> 0 to strs(imei, IMEISV, "", "")
+            RIL_REQUEST_DEVICE_IDENTITY -> { log("radio: device identity answered, meid $meid"); 0 to strs(imei, IMEISV, meid, "") }
             RIL_REQUEST_QUERY_NETWORK_SELECTION_MODE -> 0 to ints(0)
             RIL_REQUEST_GET_PREFERRED_NETWORK_TYPE -> 0 to ints(0)
             RIL_REQUEST_GET_NEIGHBORING_CELL_IDS -> 0 to le(0)
@@ -235,8 +246,26 @@ class RilStub(
 
     /** ICCID in the SIM's swapped-BCD form: 89 (telecom) + the operator's MCC + digits from the IMEI */
     private fun iccid(): String {
-        val digits = ("89" + operator.first + imei.filter { it.isDigit() } + "0000000000").take(20)
+        val digits = ("89" + mcc + imei.filter { it.isDigit() } + "0000000000").take(20)
         return digits.chunked(2).joinToString("") { "${it[1]}${it[0]}" }
+    }
+
+    /** 14-hex-digit MEID derived deterministically from the IMEI digits: same IMEI, same MEID, every boot. */
+    private fun synthMeid(imei: String): String {
+        val d = imei.filter { it.isDigit() }.ifEmpty { "0" }
+        val hex = "0123456789ABCDEF"
+        val out = StringBuilder()
+        var acc = 0
+        for (i in 0 until 13) {
+            acc = (acc * 33 + d[i % d.length].digitToInt() * (i + 11) + i * 7) and 0x7fffffff
+            acc = acc xor (acc ushr 16)
+            out.append(hex[(acc ushr 4) and 0xf])
+        }
+        // check nibble: plain sum of the 13 nibbles mod 16 (a fake modem needs stability, not a carrier audit)
+        var sum = 0
+        for (c in out) sum += hex.indexOf(c)
+        out.append(hex[sum % 16])
+        return out.toString()
     }
 
     private fun afterPower(o: OutputStream, args: ByteBuffer) {
@@ -291,21 +320,6 @@ class RilStub(
         return b.toByteArray()
     }
 
-    /** First generic ("default") APN of the firmware; 310/260 as a last resort. */
-    private fun pickOperator(): Pair<String, String> = runCatching {
-        val xml = File(paths.root, "system/etc/apns-conf.xml").readText()
-        for (m in Regex("<apn\\b([^>]*)>", RegexOption.DOT_MATCHES_ALL).findAll(xml)) {
-            val a = m.groupValues[1]
-            fun attr(n: String) = Regex("\\b$n\\s*=\\s*\"([^\"]*)\"").find(a)?.groupValues?.get(1)
-            val mcc = attr("mcc") ?: continue
-            val mnc = attr("mnc") ?: continue
-            val type = attr("type")
-            if (attr("mvno_type") != null) continue
-            if (type == null || type.contains("default") || type == "*") return@runCatching mcc to mnc
-        }
-        null
-    }.getOrNull() ?: ("310" to "260")
-
     private fun unsol(o: OutputStream, code: Int, data: ByteArray) = runCatching { frame(o, le(1) + le(code) + data) }
 
     @Synchronized
@@ -332,7 +346,6 @@ class RilStub(
     companion object {
         private const val RIL_VERSION = 6
         private const val IFACE = "rmnet0"
-        private const val OPERATOR_NAME = "AEmulator"
         private const val UNSOL_RADIO_STATE_CHANGED = 1000
         private const val UNSOL_RESPONSE_CALL_STATE_CHANGED = 1001
         private const val UNSOL_CALL_RING = 1018
