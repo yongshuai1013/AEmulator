@@ -143,8 +143,10 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
 
     /** Boot the firmware's recovery (RecoveryImage) instead of Android. */
     @Volatile var recoveryMode = false
-    /** recovery framebuffer format for the screen view: 0 RGB565, 1 RGBA/RGBX_8888, 2 BGRA_8888 */
-    @Volatile var recoveryFormat = 0
+    /** recovery framebuffer format for the screen view: 0 RGB565, 1 RGBA/RGBX_8888, 2 BGRA_8888.
+     *  Default 1: modern recoveries draw 32bpp, so the geometry is right from the first frame
+     *  (at worst R/B swapped until detection below pins the exact variant). */
+    @Volatile var recoveryFormat = 1
 
     private fun doRecovery() {
         paths.bin.mkdirs()
@@ -230,20 +232,29 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         synchronized(procs) { procs["recovery"] = p }
         setState(State.RUNNING)
         log("recovery started (${w}x$h)")
-        // pixel format the recovery draws in, from its own log ("Pixel format: BGRA_8888", TWRP)
+        // Pixel format the recovery draws in, from its own log ("Pixel format: BGRA_8888", TWRP).
+        // Watch until the recovery exits, not just the first seconds: the line can land in the
+        // log long after the welcome screen is up, and a missed guess leaves the view decoding
+        // 32bpp output with the wrong format (striped, ghosted picture that never heals).
+        // The startup capture (recovery.out) is scraped too — whichever shows the line first wins.
         Thread {
-            val rlog = File(r, "tmp/recovery.log")
-            repeat(40) {
-                if (!p.isAlive || stopping) return@Thread
-                val t = runCatching { rlog.readText() }.getOrDefault("")
-                val fmt = Regex("Pixel format: (BGRA_8888|RGBX_8888|RGBA_8888|RGB_565)").findAll(t).lastOrNull()?.groupValues?.get(1)
-                if (fmt != null) {
+            val fmtRe = Regex("Pixel format: (BGRA_8888|RGBX_8888|RGBA_8888|RGB_565)")
+            val sources = listOf(File(r, "tmp/recovery.log"), File(paths.bin, "recovery.out"))
+            var detected: String? = null
+            while (detected == null && p.isAlive && !stopping) {
+                for (f in sources) {
+                    val t = runCatching { f.readText() }.getOrDefault("")
+                    val line = t.lineSequence().filter { it.contains("Pixel format:") }.lastOrNull() ?: continue
+                    val fmt = fmtRe.find(line)?.groupValues?.get(1) ?: continue
+                    log("recovery log | ${line.trim()}")
                     recoveryFormat = when (fmt) { "BGRA_8888" -> 2; "RGB_565" -> 0; else -> 1 }
                     log("recovery draws $fmt")
-                    return@Thread
+                    detected = fmt
+                    break
                 }
-                Thread.sleep(250)
+                if (detected == null) Thread.sleep(250)
             }
+            if (detected == null) log("recovery format: not detected, view format left at $recoveryFormat")
         }.start()
         // reboot requests of the recovery (librecshim → /dev/aemu_power)
         val power = File(r, "dev/aemu_power")
