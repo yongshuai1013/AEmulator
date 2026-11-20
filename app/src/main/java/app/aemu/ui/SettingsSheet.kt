@@ -1,6 +1,7 @@
 package app.aemu.ui
 
 import app.aemu.R
+import androidx.compose.foundation.clickable
 import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -40,6 +41,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import app.aemu.core.CarrierPresets
 import app.aemu.core.CpuInfo
 import app.aemu.core.Engine
 import app.aemu.core.GuestImage
@@ -125,11 +127,14 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             Spacer(Modifier.height(8.dp))
             Text(stringResource(R.string.vs_radio_title), style = MaterialTheme.typography.titleMedium)
             Toggle(stringResource(R.string.vs_radio), stringResource(R.string.vs_radio_sub), s.radio) { s = s.copy(radio = it) }
-            if (s.radio) Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                OutlinedTextField(value = s.imei, onValueChange = { v -> s = s.copy(imei = v.filter(Char::isDigit).take(15)) },
-                    label = { Text("IMEI") }, placeholder = { Text(VmSettings.DEFAULT_IMEI) }, singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
-                TextButton(onClick = { s = s.copy(imei = VmSettings.randomImei()) }) { Text(stringResource(R.string.vs_random)) }
+            if (s.radio) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    OutlinedTextField(value = s.imei, onValueChange = { v -> s = s.copy(imei = v.filter(Char::isDigit).take(15)) },
+                        label = { Text("IMEI") }, placeholder = { Text(VmSettings.DEFAULT_IMEI) }, singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
+                    TextButton(onClick = { s = s.copy(imei = VmSettings.randomImei()) }) { Text(stringResource(R.string.vs_random)) }
+                }
+                OperatorSection(s) { s = it }
             }
 
             Spacer(Modifier.height(8.dp))
@@ -156,6 +161,49 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             Button(onClick = { onSave(s) }, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text(stringResource(R.string.save)) }
             Spacer(Modifier.height(16.dp))
         }
+    }
+}
+
+/** Operator identity of the fake modem: pick a real carrier preset or type a custom name/code. */
+@Composable
+private fun OperatorSection(s: VmSettings, set: (VmSettings) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    val effName = s.operatorName.ifBlank { VmSettings.DEFAULT_OPERATOR_NAME }
+    val effNumeric = s.operatorNumeric.ifBlank { VmSettings.DEFAULT_OPERATOR_NUMERIC }
+    val preset = CarrierPresets.presets.firstOrNull { it.displayName == s.operatorName && it.plmn == s.operatorNumeric }
+    ListItem(
+        headlineContent = { Text(stringResource(R.string.vs_operator)) },
+        supportingContent = { Text(if (preset != null) "${preset.displayName} · ${preset.region} · ${preset.plmn}" else "$effName · $effNumeric") },
+        trailingContent = {
+            TextButton(onClick = { expanded = !expanded }) {
+                Text(stringResource(if (expanded) R.string.vs_operator_hide else R.string.vs_operator_choose))
+            }
+        },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        modifier = Modifier.fillMaxWidth(),
+    )
+    if (expanded) {
+        CarrierPresets.presets.forEach { p ->
+            ListItem(
+                headlineContent = { Text("${p.displayName} · ${p.region}") },
+                supportingContent = { Text("${p.name} · ${p.plmn}") },
+                trailingContent = if (p == preset) ({ Text("✓") }) else null,
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                modifier = Modifier.fillMaxWidth().clickable {
+                    set(s.copy(operatorName = p.displayName, operatorNumeric = p.plmn)); expanded = false
+                },
+            )
+        }
+    }
+    OutlinedTextField(value = s.operatorName, onValueChange = { set(s.copy(operatorName = it)) },
+        label = { Text(stringResource(R.string.vs_operator_name)) }, singleLine = true,
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+    OutlinedTextField(value = s.operatorNumeric, onValueChange = { v -> set(s.copy(operatorNumeric = v.filter(Char::isDigit).take(6))) },
+        label = { Text(stringResource(R.string.vs_operator_numeric)) }, supportingText = { Text(stringResource(R.string.vs_operator_sub)) },
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        singleLine = true, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+    if (s.operatorName.isNotBlank() || s.operatorNumeric.isNotBlank()) {
+        TextButton(onClick = { set(s.copy(operatorName = "", operatorNumeric = "")) }) { Text(stringResource(R.string.vs_operator_reset)) }
     }
 }
 
