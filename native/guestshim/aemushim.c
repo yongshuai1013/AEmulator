@@ -17,6 +17,88 @@
 
 #define EXPORT __attribute__((visibility("default")))
 
+/* ---- syscall layer: the same sources build the 32-bit ARM variant and an AArch64 one ----
+ * Numbers are ARM EABI vs asm-generic. Where ARM has a syscall AArch64 lacks (open, access,
+ * unlink, rmdir, chmod, rename, readlink) the AArch64 side calls the *at form with AT_FDCWD,
+ * which is the same operation; those call sites go through the K* macros below. */
+static long sys3(long n, long a, long b, long c);
+static long sys4(long n, long a, long b, long c, long d);
+static long sys5(long n, long a, long b, long c, long d, long e);
+#define AT_FDCWD_ (-100)
+#if defined(__aarch64__)
+#define SYS_read 63
+#define SYS_write 64
+#define SYS_close 57
+#define SYS_execve 221
+#define SYS_unlinkat 35
+#define SYS_fcntl 25
+#define SYS_getpid 172
+#define SYS_lseek 62
+#define SYS_nanosleep 101
+#define SYS_sched_yield 124
+#define SYS_getuid 174
+#define SYS_setrlimit 164
+#define SYS_rt_sigprocmask 135
+#define SYS_rt_sigaction 134
+#define SYS_tgkill 131
+#define SYS_ioctl 29
+#define SYS_gettid 178
+#define SYS_pipe2 59
+#define SYS_memfd_create 279
+#define SYS_readlinkat 78
+#define SYS_getsockname 204
+#define SYS_getxattr 8
+#define SYS_lgetxattr 9
+#define SYS_setxattr 5
+#define SYS_lsetxattr 6
+#define SYS_setsockopt 208
+#define SYS_prctl 167
+#define SYS_timerfd_create 85
+#define KOPEN(p, f, m) sys4(56 /* openat */, AT_FDCWD_, (long)(p), (f), (m))
+#define KACCESS(p, m) sys4(48 /* faccessat */, AT_FDCWD_, (long)(p), (m), 0)
+#define KUNLINK(p) sys4(SYS_unlinkat, AT_FDCWD_, (long)(p), 0, 0)
+#define KRMDIR(p) sys4(SYS_unlinkat, AT_FDCWD_, (long)(p), 0x200 /* AT_REMOVEDIR */, 0)
+#define KRENAME(a, b) sys4(38 /* renameat */, AT_FDCWD_, (long)(a), AT_FDCWD_, (long)(b))
+#define KCHMOD(p, m) sys4(53 /* fchmodat */, AT_FDCWD_, (long)(p), (m), 0)
+#define KREADLINK(p, b, s) sys4(SYS_readlinkat, AT_FDCWD_, (long)(p), (long)(b), (long)(s))
+#else
+#define SYS_read 3
+#define SYS_write 4
+#define SYS_close 6
+#define SYS_execve 11
+#define SYS_unlinkat 328
+#define SYS_fcntl 55
+#define SYS_getpid 20
+#define SYS_lseek 19
+#define SYS_nanosleep 162
+#define SYS_sched_yield 158
+#define SYS_getuid 199
+#define SYS_setrlimit 75
+#define SYS_rt_sigprocmask 175
+#define SYS_rt_sigaction 174
+#define SYS_tgkill 268
+#define SYS_ioctl 54
+#define SYS_gettid 224
+#define SYS_pipe2 359
+#define SYS_memfd_create 385
+#define SYS_readlinkat 332
+#define SYS_getsockname 286
+#define SYS_getxattr 229
+#define SYS_lgetxattr 230
+#define SYS_setxattr 226
+#define SYS_lsetxattr 227
+#define SYS_setsockopt 294
+#define SYS_prctl 172
+#define SYS_timerfd_create 350
+#define KOPEN(p, f, m) sys3(5 /* open */, (long)(p), (f), (m))
+#define KACCESS(p, m) sys3(33 /* access */, (long)(p), (m), 0)
+#define KUNLINK(p) sys3(10 /* unlink */, (long)(p), 0, 0)
+#define KRMDIR(p) sys3(40 /* rmdir */, (long)(p), 0, 0)
+#define KRENAME(a, b) sys3(38 /* rename */, (long)(a), (long)(b), 0)
+#define KCHMOD(p, m) sys3(15 /* chmod */, (long)(p), (m), 0)
+#define KREADLINK(p, b, s) sys3(85 /* readlink */, (long)(p), (long)(b), (long)(s))
+#endif
+
 typedef unsigned long ulong;
 struct timeval_s { long tv_sec; long tv_usec; };
 struct timespec_s { long tv_sec; long tv_nsec; };
@@ -46,8 +128,8 @@ static void power_request(const char *what, const char *arg) {
     char buf[96]; int n = 0;
     while (*what && n < 40) buf[n++] = *what++;
     if (arg && *arg) { buf[n++] = ','; while (*arg && n < 90) buf[n++] = *arg++; }
-    long fd = sys3(5 /* open */, (long)"/dev/aemu_power", 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0666);
-    if (fd >= 0) { sys3(4 /* write */, fd, (long)buf, n); sys3(6 /* close */, fd, 0, 0); }
+    long fd = KOPEN("/dev/aemu_power", 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0666);
+    if (fd >= 0) { sys3(SYS_write, fd, (long)buf, n); sys3(SYS_close, fd, 0, 0); }
 }
 EXPORT int reboot(int cmd) {
     power_request(cmd == 0x4321FEDC /* POWER_OFF */ || cmd == (int)0xCDEF0123 /* HALT */ ? "shutdown" : "reboot", 0);
@@ -75,16 +157,16 @@ EXPORT int klogctl(int type, char *buf, int len) { (void)type; (void)buf; (void)
 extern char **environ;
 
 /* системный вызов с тремя аргументами; r7 в Thumb занят под кадр — сохраняем его сами */
+#if defined(__aarch64__)
+__attribute__((naked, noinline)) static long sys3(long n, long a, long b, long c) {
+    __asm__ volatile("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; svc #0; ret");
+}
+#else
 __attribute__((naked, noinline)) static long sys3(long n, long a, long b, long c) {
     __asm__ volatile(
         "push {r7}; mov r7, r0; mov r0, r1; mov r1, r2; mov r2, r3; svc #0; pop {r7}; bx lr");
 }
-#define SYS_read 3
-#define SYS_write 4
-#define SYS_open 5
-#define SYS_close 6
-#define SYS_execve 11
-#define SYS_access 33
+#endif
 #define ENOENT 2
 #define E2BIG 7
 
@@ -100,7 +182,7 @@ static long raw_execve(const char *path, char *const argv[], char *const envp[])
 
 EXPORT int execve(const char *path, char *const argv[], char *const envp[]) {
     char head[256];
-    long fd = sys3(SYS_open, (long)path, 0 /* O_RDONLY */, 0);
+    long fd = KOPEN(path, 0 /* O_RDONLY */, 0);
     if (fd >= 0) {
         long n = sys3(SYS_read, fd, (long)head, sizeof(head) - 1);
         sys3(SYS_close, fd, 0, 0);
@@ -162,7 +244,7 @@ EXPORT int execvp(const char *file, char *const argv[]) {
             for (int i = 0; i < len; i++) buf[i] = path[i];
             buf[len] = '/';
             for (int i = 0; i <= flen; i++) buf[len + 1 + i] = file[i];
-            if (sys3(SYS_access, (long)buf, 1 /* X_OK */, 0) == 0) {
+            if (KACCESS(buf, 1 /* X_OK */) == 0) {
                 execve(buf, argv, environ);
                 last = -*__errno();
             }
@@ -182,7 +264,7 @@ EXPORT int execvp(const char *file, char *const argv[]) {
  * the real mount; recovery does not set the variable, so flashing still works.
  */
 #define EROFS 30
-#define AT_FDCWD (-100)
+#define AT_FDCWD (-100)   /* the guest's own value, tested against dirfd arguments */
 static int g_ro = -1;
 static int ro_enabled(void) {
     if (g_ro < 0) {
@@ -217,22 +299,17 @@ static int ro_path(const char *p) {
     if (!(p[0] == '/' && p[1] == 's' && p[2] == 'y' && p[3] == 's' && p[4] == 't' && p[5] == 'e' && p[6] == 'm' && p[7] == '/')) return 0;
     return has(p, "/oat/") || has(p, "/framework/arm") || ends(p, ".odex") || ends(p, ".oat") || ends(p, ".art") || ends(p, ".vdex");
 }
-#define SYS_unlink 10
-#define SYS_chmod 15
-#define SYS_rename 38
-#define SYS_rmdir 40
-#define SYS_unlinkat 328
 static int ret(long r) { return r < 0 ? fail(r) : (int)r; }
-EXPORT int unlink(const char *p) { return ro_path(p) ? fail(-EROFS) : ret(sys3(SYS_unlink, (long)p, 0, 0)); }
-EXPORT int rmdir(const char *p) { return ro_path(p) ? fail(-EROFS) : ret(sys3(SYS_rmdir, (long)p, 0, 0)); }
+EXPORT int unlink(const char *p) { return ro_path(p) ? fail(-EROFS) : ret(KUNLINK(p)); }
+EXPORT int rmdir(const char *p) { return ro_path(p) ? fail(-EROFS) : ret(KRMDIR(p)); }
 EXPORT int remove(const char *p) {
     if (ro_path(p)) return fail(-EROFS);
-    long r = sys3(SYS_unlink, (long)p, 0, 0);
-    if (r == -21 /* EISDIR */) r = sys3(SYS_rmdir, (long)p, 0, 0);
+    long r = KUNLINK(p);
+    if (r == -21 /* EISDIR */) r = KRMDIR(p);
     return ret(r);
 }
-EXPORT int rename(const char *a, const char *b) { return ro_path(a) || ro_path(b) ? fail(-EROFS) : ret(sys3(SYS_rename, (long)a, (long)b, 0)); }
-EXPORT int chmod(const char *p, unsigned m) { return ro_path(p) ? fail(-EROFS) : ret(sys3(SYS_chmod, (long)p, (long)m, 0)); }
+EXPORT int rename(const char *a, const char *b) { return ro_path(a) || ro_path(b) ? fail(-EROFS) : ret(KRENAME(a, b)); }
+EXPORT int chmod(const char *p, unsigned m) { return ro_path(p) ? fail(-EROFS) : ret(KCHMOD(p, (long)m)); }
 EXPORT int unlinkat(int fd, const char *p, int fl) {
     return (fd == AT_FDCWD || p[0] == '/') && ro_path(p) ? fail(-EROFS) : ret(sys3(SYS_unlinkat, fd, (long)p, fl));
 }
@@ -271,7 +348,7 @@ static const char *qt_redirect(const char *path, char *buf, int n) {
 
 EXPORT int access(const char *path, int mode) {
     char b[128];
-    long r = sys3(SYS_access, (long)qt_redirect(path, b, sizeof(b)), mode, 0);
+    long r = KACCESS(qt_redirect(path, b, sizeof(b)), mode);
     return r < 0 ? fail(r) : 0;
 }
 
@@ -300,8 +377,8 @@ static int oom_open(const char *path) {
     if (!A[ka] && !f[ka]) kind = 'a';
     else if (!S[ks] && !f[ks]) kind = 's';
     else return -1;
-    long fd = sys3(SYS_open, (long)"/dev/aemu_oom", 01 /* O_WRONLY */ | 04000 /* O_NONBLOCK */ | 02000000 /* O_CLOEXEC */, 0);
-    if (fd < 0) fd = sys3(SYS_open, (long)"/dev/null", 01 | 02000000, 0);
+    long fd = KOPEN("/dev/aemu_oom", 01 /* O_WRONLY */ | 04000 /* O_NONBLOCK */ | 02000000 /* O_CLOEXEC */, 0);
+    if (fd < 0) fd = KOPEN("/dev/null", 01 | 02000000, 0);
     if (fd < 0) return -1;
     char h[16];
     int k = 0;
@@ -323,14 +400,14 @@ static int oom_open(const char *path) {
  * was loaded, the EGLImage was refused and a GLSurfaceView never reached the screen. 0..2 are held from the start. */
 __attribute__((constructor)) static void hold_std_fds(void) {
     for (long fd = 0; fd < 3; fd++)
-        if (sys3(55 /* fcntl */, fd, 1 /* F_GETFD */, 0) < 0) sys3(SYS_open, (long)"/dev/null", 2 /* O_RDWR */, 0);
+        if (sys3(SYS_fcntl, fd, 1 /* F_GETFD */, 0) < 0) KOPEN("/dev/null", 2 /* O_RDWR */, 0);
 }
 
 /* ...and stay held: a native handle whose fd slot reads 0 is closed through native_handle_close, the next buffer then
  * took 0 again in 7.1's SurfaceFlinger. A closed 0..2 is reopened on /dev/null at once. */
 EXPORT int close(int fd) {
     long r = sys3(SYS_close, fd, 0, 0);
-    if (r >= 0 && fd >= 0 && fd < 3) sys3(SYS_open, (long)"/dev/null", 2 /* O_RDWR */, 0);
+    if (r >= 0 && fd >= 0 && fd < 3) KOPEN("/dev/null", 2 /* O_RDWR */, 0);
     return r >= 0 ? (int)r : (int)fail(r);
 }
 
@@ -346,8 +423,6 @@ __attribute__((constructor)) static void find_argv(void) {
     while (n < 64 && (unsigned long)a[0] > 4096) { a--; n++; }
     if (n > 0 && (long)a[0] == n) g_argv0 = a[1];
 }
-#define SYS_getpid 20
-#define SYS_pipe2 359
 /* 1 when path is /proc/self<suffix> or /proc/<own pid><suffix> */
 static int proc_is(const char *path, const char *suffix) {
     static const char P[] = "/proc/";
@@ -385,8 +460,6 @@ static int cmdline_open(const char *path) {
  * "Check failed: &stack_variable > stack_end" (zygote and patchoat never start). The file is served again with the
  * tag moved onto the range that holds the main thread's sp; when it is already right the real file is used.
  */
-#define SYS_lseek 19
-#define SYS_memfd_create 385
 static char g_maps_in[1 << 20], g_maps_out[(1 << 20) + 4096];
 static volatile int g_maps_lock;
 static unsigned long hexv(const char **pp) {
@@ -403,7 +476,7 @@ static int maps_open(const char *path) {
     if (!g_main_sp || !proc_is(path, "/maps")) return -1;
     if (__sync_lock_test_and_set(&g_maps_lock, 1)) return -1;
     int res = -1;
-    long fd = sys3(SYS_open, (long)path, 0400000, 0);
+    long fd = KOPEN(path, 0400000, 0);
     if (fd < 0) { __sync_lock_release(&g_maps_lock); return -1; }
     long total = 0;
     for (;;) {
@@ -488,7 +561,7 @@ static int meminfo_open(const char *path) {
     unsigned long guest = env_ulong("AEMU_RAM_KB");
     if (!guest) return -1;
     char in[8192], out[8192 + 512];
-    long fd = sys3(SYS_open, (long)path, 0400000, 0);
+    long fd = KOPEN(path, 0400000, 0);
     if (fd < 0) return -1;
     long total = 0;
     for (;;) {
@@ -561,7 +634,7 @@ EXPORT int open(const char *path, int flags, ...) {
         fd = maps_open(path);
         if (fd >= 0) return fd;
     }
-    long r = sys3(SYS_open, (long)qt_redirect(path, b, sizeof(b)), flags | 0400000 /* O_LARGEFILE */, mode);
+    long r = KOPEN(qt_redirect(path, b, sizeof(b)), flags | 0400000 /* O_LARGEFILE */, mode);
     return r < 0 ? fail(r) : (int)r;
 }
 
@@ -586,12 +659,16 @@ RESERVED(1) RESERVED(2) RESERVED(3) RESERVED(4) RESERVED(5) RESERVED(6) RESERVED
  * pending signals after that syscall), we sleep briefly, restore the mask and report EINTR, which
  * is what a real sigsuspend returns once a handler has run.
  */
+#if defined(__aarch64__)
+__attribute__((naked, noinline)) static long sys4(long n, long a, long b, long c, long d) {
+    __asm__ volatile("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; svc #0; ret");
+}
+#else
 __attribute__((naked, noinline)) static long sys4(long n, long a, long b, long c, long d) {
     __asm__ volatile(
         "push {r7}; mov r7, r0; mov r0, r1; mov r1, r2; mov r2, r3; ldr r3, [sp, #4]; svc #0; pop {r7}; bx lr");
 }
-#define SYS_nanosleep 162
-#define SYS_rt_sigprocmask 175
+#endif
 #define SIG_SETMASK 2
 #define EINTR 4
 
@@ -612,14 +689,13 @@ EXPORT int sigsuspend(const unsigned long *mask) {
  * The fault signals' handlers are wrapped: after the guest's handler returns, an odd pc becomes even with the
  * Thumb bit set in cpsr. Everything else about sigaction stays as the kernel does it.
  */
-#define SYS_rt_sigaction 174
 #define SA_SIGINFO_ 4
 #define SA_RESTORER_ 0x04000000
 struct bionic_sigaction { void *handler; unsigned long mask; int flags; void (*restorer)(void); };
 struct kernel_sigaction { void *handler; unsigned long flags; void (*restorer)(void); unsigned long mask[2]; };
 static struct bionic_sigaction guest_act[32];
 
-static int wrapped(int sig) { return sig == 4 /* ILL */ || sig == 5 /* TRAP */ || sig == 7 /* BUS */ || sig == 8 /* FPE */ || sig == 11 /* SEGV */; }
+__attribute__((unused)) static int wrapped(int sig) { return sig == 4 /* ILL */ || sig == 5 /* TRAP */ || sig == 7 /* BUS */ || sig == 8 /* FPE */ || sig == 11 /* SEGV */; }
 
 static void fault_trampoline(int sig, void *info, void *uc) {
     struct bionic_sigaction *a = &guest_act[sig & 31];
@@ -634,7 +710,13 @@ static void fault_trampoline(int sig, void *info, void *uc) {
 EXPORT int sigaction(int sig, const struct bionic_sigaction *act, struct bionic_sigaction *old) {
     struct kernel_sigaction k, ko;
     struct kernel_sigaction *kp = 0;
+#if defined(__aarch64__)
+    /* the trampoline only fixes up Thumb return addresses under qemu; native AArch64 has
+     * neither, so handlers go to the kernel unwrapped (the struct conversion still applies) */
+    int wrap = 0;
+#else
     int wrap = wrapped(sig) && act && act->handler != (void *)0 && act->handler != (void *)1;
+#endif
     if (act) {
         k.handler = act->handler; k.flags = (unsigned long)act->flags; k.restorer = act->restorer;
         k.mask[0] = act->mask; k.mask[1] = 0;
@@ -657,14 +739,13 @@ EXPORT int sigaction(int sig, const struct bionic_sigaction *act, struct bionic_
  * waiting on a futex for the handler; under qemu every wait runs into its timeout, a dump of system_server
  * takes minutes and the watchdogs kill the system. That request fails at once instead: dumps keep Java stacks.
  */
-#define SYS_tgkill 268
 /*
  * Sony's 2.3 zygote starts system_server with resource limits (--rlimit) above the hard limits of the Android app
  * the guest runs in; the kernel answers EPERM and Dalvik aborts the fork ("cannot setrlimit(): Operation not
  * permitted", "VM aborting"). A limit that cannot be raised is left as it is.
  */
 EXPORT int setrlimit(int resource, const void *rlim) {
-    long r = sys3(75 /* setrlimit */, resource, (long)rlim, 0);
+    long r = sys3(SYS_setrlimit, resource, (long)rlim, 0);
     if (r == -1 /* EPERM */) return 0;
     return r < 0 ? fail(r) : 0;
 }
@@ -683,14 +764,40 @@ EXPORT int tgkill(int tgid, int tid, int sig) {
  * and a lost race kills the app ("Instrumentation.onException on a null object"). A oneway transaction that
  * arrives nested in a pending call is held back briefly so the earlier one is queued first.
  */
+/* binder command words carry the struct size in their ioctl-style encoding, so they differ
+ * between ABIs: binder_write_read is 0x18 bytes on ARM, 0x30 on LP64; binder_transaction_data
+ * is 0x28 vs 0x40. The td field offsets below are the same story. */
+#if defined(__aarch64__)
+#define BINDER_WRITE_READ_ 0xc0306201
+#define BC_TRANSACTION_ 0x40406300
+#define BC_REPLY_ 0x40406301
+#define BC_FREE_BUFFER_ 0x40086303
+#define BR_TRANSACTION_ 0x80407202
+#define BR_REPLY_ 0x80407203
+#define TD_CODE_OFF 16
+#define TD_FLAGS_OFF 20
+#define TD_SIZE_OFF 32
+#define TD_OFFSSIZE_OFF 40
+#define TD_BUF_OFF 48
+#define TD_OFFS_OFF 56
+#define TD_FBO_MIN 24   /* sizeof(flat_binder_object) */
+#else
 #define BINDER_WRITE_READ_ 0xc0186201
 #define BC_TRANSACTION_ 0x40286300
+#define BC_REPLY_ 0x40286301
+#define BC_FREE_BUFFER_ 0x40046303
 #define BR_TRANSACTION_ 0x80287202
 #define BR_REPLY_ 0x80287203
+#define TD_CODE_OFF 8
+#define TD_FLAGS_OFF 12
+#define TD_SIZE_OFF 24
+#define TD_OFFSSIZE_OFF 28
+#define TD_BUF_OFF 32
+#define TD_OFFS_OFF 36
+#define TD_FBO_MIN 16
+#endif
 #define BR_DEAD_BINDER_ 0x8004720f
 #define TF_ONE_WAY_ 1
-#define SYS_ioctl 54
-#define SYS_gettid 224
 struct bwr { long write_size, write_consumed; ulong write_buffer; long read_size, read_consumed; ulong read_buffer; };
 static volatile int waiting_tid[64];
 
@@ -704,14 +811,14 @@ static int wait_slot(int tid, int add) {
  * reads gets them */
 static unsigned char g_held[1024];
 static volatile int g_held_len, g_held_lock;
-static void held_lock(void) { while (!__sync_bool_compare_and_swap(&g_held_lock, 0, 1)) sys3(158 /* sched_yield */, 0, 0, 0); }
+static void held_lock(void) { while (!__sync_bool_compare_and_swap(&g_held_lock, 0, 1)) sys3(SYS_sched_yield, 0, 0, 0); }
 static void held_unlock(void) { __sync_lock_release(&g_held_lock); }
 
 /* binder_transaction_data (32-bit) of a oneway call to android.media.IMediaPlayerClient: the parcel starts with the
  * strict-mode word, then the interface name as String16 */
 static int is_player_notify(const unsigned char *td) {
-    const unsigned char *d = (const unsigned char *)(ulong)*(const unsigned *)(td + 32);
-    unsigned size = *(const unsigned *)(td + 24);
+    const unsigned char *d = (const unsigned char *)(ulong)*(const unsigned long *)(td + TD_BUF_OFF);
+    unsigned size = *(const unsigned *)(td + TD_SIZE_OFF);
     const char *want = "android.media.IMediaPlayerClient";
     if (!d || size < 8 + 64) return 0;
     if (*(const unsigned *)(d + 4) != 32) return 0;
@@ -729,16 +836,16 @@ static int is_player_notify(const unsigned char *td) {
  * The reference is taken here: mStrong and mWeak are the first two words of RefBase::weakref_impl (2.3 - 7.1).
  */
 static void pin_service(const unsigned char *td) {
-    if (*(const unsigned *)td != 0 || *(const unsigned *)(td + 8) != 3 /* ADD_SERVICE_TRANSACTION */) return;
-    const unsigned char *d = (const unsigned char *)(ulong)*(const unsigned *)(td + 32);
-    const unsigned *offs = (const unsigned *)(ulong)*(const unsigned *)(td + 36);
-    unsigned size = *(const unsigned *)(td + 24), n = *(const unsigned *)(td + 28) / 4;
+    if (*(const unsigned *)td != 0 || *(const unsigned *)(td + TD_CODE_OFF) != 3 /* ADD_SERVICE_TRANSACTION */) return;
+    const unsigned char *d = (const unsigned char *)(ulong)*(const unsigned long *)(td + TD_BUF_OFF);
+    const unsigned long *offs = (const unsigned long *)(ulong)*(const unsigned long *)(td + TD_OFFS_OFF);
+    unsigned size = *(const unsigned *)(td + TD_SIZE_OFF), n = *(const unsigned *)(td + TD_OFFSSIZE_OFF) / (unsigned)sizeof(unsigned long);
     if (!d || !offs) return;
     for (unsigned i = 0; i < n; i++) {
-        if (offs[i] + 16 > size) continue;
-        const unsigned *o = (const unsigned *)(d + offs[i]);
-        if (o[0] != 0x73622a85 /* BINDER_TYPE_BINDER */ || !o[2]) continue;
-        volatile int *refs = (volatile int *)(ulong)o[2];
+        if (offs[i] + TD_FBO_MIN > size) continue;
+        const unsigned char *o = d + offs[i];
+        if (*(const unsigned *)o != 0x73622a85 /* BINDER_TYPE_BINDER */ || !*(const unsigned long *)(o + 8)) continue;
+        volatile int *refs = (volatile int *)(ulong)*(const unsigned long *)(o + 8);
         __sync_fetch_and_add(&refs[0], 1);
         __sync_fetch_and_add(&refs[1], 1);
     }
@@ -746,8 +853,8 @@ static void pin_service(const unsigned char *td) {
 
 /* binder_transaction_data whose parcel is addressed to the given interface (strict-mode word, then String16) */
 static int iface_is(const unsigned char *td, const char *want, int n) {
-    const unsigned char *d = (const unsigned char *)(ulong)*(const unsigned *)(td + 32);
-    unsigned size = *(const unsigned *)(td + 24);
+    const unsigned char *d = (const unsigned char *)(ulong)*(const unsigned long *)(td + TD_BUF_OFF);
+    unsigned size = *(const unsigned *)(td + TD_SIZE_OFF);
     if (!d || size < 8 + 2 * (unsigned)n) return 0;
     if (*(const unsigned *)(d + 4) != (unsigned)n) return 0;
     for (int i = 0; i < n; i++) if (d[8 + 2 * i] != (unsigned char)want[i] || d[9 + 2 * i]) return 0;
@@ -763,21 +870,20 @@ static volatile int g_bind_state, g_bind_tid;
  * MIUI 7 (Android 5.0) eleven apps died at every boot with "Instrumentation.onException on a null object".
  * Each oneway transaction takes a ticket of its target object here and waits for the earlier ones to be freed.
  */
-#define BC_FREE_BUFFER_ 0x40046303
 #define OW_MAX 64
-static struct { unsigned node, buf, ticket; int tid; } g_ow[OW_MAX];   /* oneway transactions being handled */
-static struct { unsigned node, issued; } g_own[32];
+static struct { unsigned long node, buf; unsigned ticket; int tid; } g_ow[OW_MAX];   /* oneway transactions being handled; node/buf are pointers, hence word-sized */
+static struct { unsigned long node; unsigned issued; } g_own[32];
 static volatile int g_ow_lock;
-static void ow_lock(void) { while (!__sync_bool_compare_and_swap(&g_ow_lock, 0, 1)) sys3(158 /* sched_yield */, 0, 0, 0); }
+static void ow_lock(void) { while (!__sync_bool_compare_and_swap(&g_ow_lock, 0, 1)) sys3(SYS_sched_yield, 0, 0, 0); }
 static void ow_unlock(void) { __sync_lock_release(&g_ow_lock); }
 
-static void ow_freed(unsigned buf) {
+static void ow_freed(unsigned long buf) {
     ow_lock();
     for (int i = 0; i < OW_MAX; i++) if (g_ow[i].buf == buf) g_ow[i].buf = 0;
     ow_unlock();
 }
 /* registers the transaction; returns its slot or -1 */
-static int ow_take(unsigned node, unsigned buf, int tid) {
+static int ow_take(unsigned long node, unsigned long buf, int tid) {
     int slot = -1, n = -1;
     ow_lock();
     for (int i = 0; i < 32; i++) if (g_own[i].node == node) { n = i; break; }
@@ -821,7 +927,7 @@ static long bwr_raw(int fd, struct bwr *b) {
     long r = sys3(SYS_ioctl, fd, BINDER_WRITE_READ_, (long)b);
     for (int tries = 0; r == -107 /* ENOTCONN */ && tries < 25; tries++) {
         struct timespec_s ts = { 0, 80 * 1000 * 1000 };
-        sys3(162 /* nanosleep */, (long)&ts, 0, 0);
+        sys3(SYS_nanosleep, (long)&ts, 0, 0);
         r = sys3(SYS_ioctl, fd, BINDER_WRITE_READ_, (long)b);
     }
     return r;
@@ -837,7 +943,6 @@ static long bwr_raw(int fd, struct bwr *b) {
  * thread, the reply of the outer call is taken off the stream before the inner call is sent, kept aside and handed
  * back when the thread is waiting for that call again.
  */
-#define BC_REPLY_ 0x40286301
 #define BR_TRANSACTION_COMPLETE_ 0x7206
 #define BT_SEGS 3
 struct bt_seg { int level, len; unsigned char d[192]; };
@@ -888,7 +993,7 @@ static void bt_read(struct bt *t, unsigned char *rb, long from, long *end, int h
         } else if (cmd == BR_TRANSACTION_COMPLETE_) {
             if (t->owed > 0) t->owed--;
         } else if (cmd == BR_TRANSACTION_) {
-            if (!(*(unsigned *)(rb + p + 4 + 12) & TF_ONE_WAY_)) t->hd++;
+            if (!(*(unsigned *)(rb + p + 4 + TD_FLAGS_OFF) & TF_ONE_WAY_)) t->hd++;
             else if (t->np > 0 && p + len < *end && bt_stash(t, t->np, rb + p + len, *end - p - len)) { *end = p + len; return; }
         }
         p += len;
@@ -910,7 +1015,7 @@ static long bwr_ordered(int fd, struct bwr *b, int tid) {
     long w0 = b->write_consumed;
     for (long p = w0; p + 4 <= b->write_size;) {
         unsigned cmd = *(unsigned *)(b->write_buffer + p);
-        if (cmd == BC_TRANSACTION_) { ntx++; if (p + 20 <= b->write_size && !(*(unsigned *)(b->write_buffer + p + 4 + 12) & TF_ONE_WAY_)) sync_tx = 1; }
+        if (cmd == BC_TRANSACTION_) { ntx++; if (p + 20 <= b->write_size && !(*(unsigned *)(b->write_buffer + p + 4 + TD_FLAGS_OFF) & TF_ONE_WAY_)) sync_tx = 1; }
         else if (cmd == BC_REPLY_) nrep++;
         p += 4 + ((cmd >> 16) & 0x3fff);
     }
@@ -951,7 +1056,7 @@ static long bwr_ordered(int fd, struct bwr *b, int tid) {
             unsigned cmd = *(unsigned *)(b->write_buffer + p);
             if (cmd == BC_TRANSACTION_) {
                 t->owed++;
-                t->last_sync = !(*(unsigned *)(b->write_buffer + p + 4 + 12) & TF_ONE_WAY_);
+                t->last_sync = !(*(unsigned *)(b->write_buffer + p + 4 + TD_FLAGS_OFF) & TF_ONE_WAY_);
                 if (t->last_sync) {
                     if (t->np < (int)sizeof t->ph) t->ph[t->np] = (unsigned char)t->hd;
                     t->np++;
@@ -983,10 +1088,10 @@ EXPORT int ioctl(int fd, int req, void *arg) {
     for (long p = b->write_consumed; p + 4 <= b->write_size;) {
         unsigned cmd = *(unsigned *)(b->write_buffer + p);
         unsigned sz = (cmd >> 16) & 0x3fff;
-        if (cmd == BC_TRANSACTION_ && p + 4 + 16 <= b->write_size && !(*(unsigned *)(b->write_buffer + p + 4 + 12) & TF_ONE_WAY_))
+        if (cmd == BC_TRANSACTION_ && p + 4 + 16 <= b->write_size && !(*(unsigned *)(b->write_buffer + p + 4 + TD_FLAGS_OFF) & TF_ONE_WAY_))
             wait_slot(tid, 1);
-        if (cmd == BC_TRANSACTION_ && p + 4 + 40 <= b->write_size) pin_service((const unsigned char *)(b->write_buffer + p + 4));
-        if (cmd == BC_FREE_BUFFER_ && p + 8 <= b->write_size) ow_freed(*(unsigned *)(b->write_buffer + p + 4));
+        if (cmd == BC_TRANSACTION_ && p + 4 + TD_OFFS_OFF + (long)sizeof(unsigned long) <= b->write_size) pin_service((const unsigned char *)(b->write_buffer + p + 4));
+        if (cmd == BC_FREE_BUFFER_ && p + 4 + (long)sizeof(unsigned long) <= b->write_size) ow_freed(*(unsigned long *)(b->write_buffer + p + 4));
         p += 4 + sz;
     }
     long start = b->read_consumed;
@@ -996,14 +1101,14 @@ EXPORT int ioctl(int fd, int req, void *arg) {
     for (long p = start; p + 4 <= b->read_consumed;) {
         unsigned cmd = *(unsigned *)(b->read_buffer + p);
         unsigned sz = (cmd >> 16) & 0x3fff;
-        if (cmd == BR_TRANSACTION_ && p + 4 + 40 <= b->read_consumed
+        if (cmd == BR_TRANSACTION_ && p + 4 + TD_OFFS_OFF + (long)sizeof(unsigned long) <= b->read_consumed
             && iface_is((const unsigned char *)(b->read_buffer + p + 4), "android.app.IApplicationThread", 30)) {
             if (*(unsigned *)(b->read_buffer + p + 4 + 8) == 13 /* BIND_APPLICATION_TRANSACTION, 2.3 - 7.1 */) {
                 if (!g_bind_state) { g_bind_tid = tid; g_bind_state = 1; }
             } else if (g_bind_state != 2 && !(g_bind_state == 1 && g_bind_tid == tid)) before_bind = 1;
         }
         if (cmd == BR_REPLY_ || cmd == 0x7205 /* BR_DEAD_REPLY */ || cmd == 0x7211 /* BR_FAILED_REPLY */) replied = 1;
-        else if (cmd == BR_TRANSACTION_ && p + 4 + 16 <= b->read_consumed && (*(unsigned *)(b->read_buffer + p + 4 + 12) & TF_ONE_WAY_))
+        else if (cmd == BR_TRANSACTION_ && p + 4 + 16 <= b->read_consumed && (*(unsigned *)(b->read_buffer + p + 4 + TD_FLAGS_OFF) & TF_ONE_WAY_))
             nested_oneway = 1;
         p += 4 + sz;
     }
@@ -1038,7 +1143,7 @@ EXPORT int ioctl(int fd, int req, void *arg) {
         for (long p = start; p + 4 <= b->read_consumed;) {
             unsigned cmd = *(unsigned *)(rb + p);
             long len = 4 + ((cmd >> 16) & 0x3fff);
-            if (cmd == BR_TRANSACTION_ && p + len <= b->read_consumed && (*(unsigned *)(rb + p + 4 + 12) & TF_ONE_WAY_)
+            if (cmd == BR_TRANSACTION_ && p + len <= b->read_consumed && (*(unsigned *)(rb + p + 4 + TD_FLAGS_OFF) & TF_ONE_WAY_)
                 && is_player_notify(rb + p + 4) && g_held_len + len <= (long)sizeof g_held) {
                 for (long i = 0; i < len; i++) g_held[g_held_len + i] = rb[p + i];
                 g_held_len += (int)len;
@@ -1054,11 +1159,11 @@ EXPORT int ioctl(int fd, int req, void *arg) {
      * got bindApplication has queued it — a fixed pause is not enough while dex2oat keeps every core busy */
     if (before_bind && waiting) {
         struct timespec_s ts = { 0, 5 * 1000 * 1000 };
-        for (int i = 0; i < 600 && g_bind_state != 2; i++) sys3(162 /* nanosleep */, (long)&ts, 0, 0);
+        for (int i = 0; i < 600 && g_bind_state != 2; i++) sys3(SYS_nanosleep, (long)&ts, 0, 0);
     } else
-    if (nested_oneway && !replied && waiting && sys3(199 /* getuid32 */, 0, 0, 0) >= 10000) {
+    if (nested_oneway && !replied && waiting && sys3(SYS_getuid, 0, 0, 0) >= 10000) {
         struct timespec_s ts = { 0, 30 * 1000 * 1000 };
-        sys3(162 /* nanosleep */, (long)&ts, 0, 0);
+        sys3(SYS_nanosleep, (long)&ts, 0, 0);
     }
     if (!waiting && g_held_len) {
         held_lock();
@@ -1072,12 +1177,13 @@ EXPORT int ioctl(int fd, int req, void *arg) {
     }
     for (long p = start; p + 4 <= b->read_consumed;) {
         unsigned cmd = *(unsigned *)(b->read_buffer + p);
-        const unsigned *td = (const unsigned *)(b->read_buffer + p + 4);
-        if (cmd == BR_TRANSACTION_ && p + 4 + 40 <= b->read_consumed && (td[3] & TF_ONE_WAY_) && td[0] && td[8]) {
-            int slot = ow_take(td[0], td[8], tid);
+        const unsigned char *td = (const unsigned char *)(b->read_buffer + p + 4);
+        if (cmd == BR_TRANSACTION_ && p + 4 + TD_OFFS_OFF + (long)sizeof(unsigned long) <= b->read_consumed
+            && (*(const unsigned *)(td + TD_FLAGS_OFF) & TF_ONE_WAY_) && *(const unsigned *)td && *(const unsigned long *)(td + TD_BUF_OFF)) {
+            int slot = ow_take(*(const unsigned *)td, *(const unsigned long *)(td + TD_BUF_OFF), tid);
             struct timespec_s ts = { 0, 2 * 1000 * 1000 };
             int i = 0;
-            for (; slot >= 0 && i < 2500 && ow_must_wait(slot, tid); i++) sys3(162 /* nanosleep */, (long)&ts, 0, 0);
+            for (; slot >= 0 && i < 2500 && ow_must_wait(slot, tid); i++) sys3(SYS_nanosleep, (long)&ts, 0, 0);
             if (i == 2500) ow_drop_older(slot);   /* their thread is gone or stuck: do not wait for them again */
         }
         p += 4 + ((cmd >> 16) & 0x3fff);
@@ -1110,9 +1216,6 @@ static int strip_root(char *s, int n) {
     return n;
 }
 
-#define SYS_readlink 85
-#define SYS_readlinkat 332
-#define SYS_getsockname 286
 /* qemu's own ownership table stays open in every guest process; zygote (7.0+) only lets through descriptors on
  * whitelisted paths and reopens them by path after fork: it is shown as a framework jar that links to it */
 static long guest_fd_name_(char *buf, long n, unsigned long size);
@@ -1151,7 +1254,7 @@ static long guest_fd_name_(char *buf, long n, unsigned long size) {
     return n;
 }
 EXPORT long readlink(const char *path, char *buf, unsigned long size) {
-    long r = sys3(SYS_readlink, (long)path, (long)buf, (long)size);
+    long r = KREADLINK(path, buf, size);
     if (r < 0) return fail(r);
     return guest_fd_name(buf, r, size);
 }
@@ -1192,11 +1295,11 @@ EXPORT long getxattr(const char *p, const char *n, void *v, unsigned long s) {
     k = 0;
     while (n && ser[k] && n[k] == ser[k]) k++;
     if (n && !ser[k] && !n[k]) return fail(-61 /* ENODATA */);
-    long r = sys4(229, (long)p, (long)n, (long)v, (long)s);
+    long r = sys4(SYS_getxattr, (long)p, (long)n, (long)v, (long)s);
     return r >= 0 ? r : fail(r);
 }
 EXPORT long lgetxattr(const char *p, const char *n, void *v, unsigned long s) {
-    long r = sys4(230, (long)p, (long)n, (long)v, (long)s);
+    long r = sys4(SYS_lgetxattr, (long)p, (long)n, (long)v, (long)s);
     if (r >= 0 || (r != -38 /* ENOSYS */ && r != -95 /* EOPNOTSUPP */)) return r >= 0 ? r : fail(r);
     /* restorecon needs some current label to compare with; any mismatch is then "fixed" by lsetxattr below */
     const char *sel = "security.selinux", *ctx = "u:object_r:system_data_file:s0";
@@ -1212,11 +1315,11 @@ EXPORT long lgetxattr(const char *p, const char *n, void *v, unsigned long s) {
 /* installd tags app dirs (user.default, user.inode_cache); libc may reach this through fsetxattr, so no errno
  * is touched on the ENOSYS path */
 EXPORT int setxattr(const char *p, const char *n, const void *v, unsigned long s, int fl) {
-    long r = sys5(226, (long)p, (long)n, (long)v, (long)s, fl);
+    long r = sys5(SYS_setxattr, (long)p, (long)n, (long)v, (long)s, fl);
     return r >= 0 || r == -38 || r == -95 ? 0 : fail(r);
 }
 EXPORT int lsetxattr(const char *p, const char *n, const void *v, unsigned long s, int fl) {
-    long r = sys5(227, (long)p, (long)n, (long)v, (long)s, fl);
+    long r = sys5(SYS_lsetxattr, (long)p, (long)n, (long)v, (long)s, fl);
     return r >= 0 || r == -38 || r == -95 ? 0 : fail(r);
 }
 /* 5.0+ marks every socket with its network id through fwmarkd (netd), which sets SO_MARK. An app has no
@@ -1225,7 +1328,7 @@ EXPORT int lsetxattr(const char *p, const char *n, const void *v, unsigned long 
  * is accepted and dropped. */
 EXPORT int setsockopt(int fd, int level, int name, const void *val, unsigned int len) {
     if (level == 1 /* SOL_SOCKET */ && name == 36 /* SO_MARK */) return 0;
-    long r = sys5(294 /* setsockopt */, fd, level, name, (long)val, len);
+    long r = sys5(SYS_setsockopt, fd, level, name, (long)val, len);
     return r >= 0 ? (int)r : fail(r);
 }
 /* 7.0+ media services (mediacodec, mediaextractor) put themselves under a seccomp filter through minijail and abort
@@ -1233,19 +1336,25 @@ EXPORT int setsockopt(int fd, int level, int name, const void *val, unsigned int
  * filter, so the guest's is accepted and dropped, like mount() above. */
 EXPORT int prctl(int option, unsigned long a2, unsigned long a3, unsigned long a4, unsigned long a5) {
     if (option == 22 /* PR_SET_SECCOMP */) return 0;
-    long r = sys5(172 /* prctl */, option, (long)a2, (long)a3, (long)a4, (long)a5);
+    long r = sys5(SYS_prctl, option, (long)a2, (long)a3, (long)a4, (long)a5);
     return r >= 0 ? (int)r : fail(r);
 }
+#if defined(__aarch64__)
+__attribute__((naked, noinline)) static long sys5(long n, long a, long b, long c, long d, long e) {
+    __asm__ volatile("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; mov x4, x5; svc #0; ret");
+}
+#else
 __attribute__((naked, noinline)) static long sys5(long n, long a, long b, long c, long d, long e) {
     __asm__ volatile(
         "push {r4, r7}; mov r7, r0; mov r0, r1; mov r1, r2; mov r2, r3; ldr r3, [sp, #8]; ldr r4, [sp, #12]; svc #0; pop {r4, r7}; bx lr");
 }
+#endif
 
 /* The *_ALARM clocks need CAP_WAKE_ALARM, which an app never has: 7.0+ AlarmManagerService then falls back to a
  * handler that throws on listener alarms and kills system_server. The plain clocks behave the same without wakeups. */
 EXPORT int timerfd_create(int clock, int flags) {
     if (clock == 8 /* REALTIME_ALARM */) clock = 0 /* REALTIME */;
     else if (clock == 9 /* BOOTTIME_ALARM */) clock = 7 /* BOOTTIME */;
-    long r = sys3(350 /* timerfd_create */, clock, flags, 0);
+    long r = sys3(SYS_timerfd_create, clock, flags, 0);
     return r < 0 ? fail(r) : (int)r;
 }

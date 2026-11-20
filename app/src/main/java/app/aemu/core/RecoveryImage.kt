@@ -74,14 +74,13 @@ object RecoveryImage {
         }
 
         // dynamic recoveries (TWRP, OrangeFox) get librecshim.so preloaded: mount points look mounted, evdev ioctls answered.
-        // The bundled shims are 32-bit: a 64-bit recovery's linker refuses them outright, so for one of those
-        // keep whatever the image itself ships and stamp nothing over it.
-        if (!isElf64(paths)) {
-            runCatching {
-                for (lib in listOf("librecshim.so", "libaemushim.so")) {
-                    EngineAssets.open(paths.ctx, "engines/common/$lib").use { i -> File(r, "sbin/$lib").outputStream().use { i.copyTo(it) } }
-                    File(r, "sbin/$lib").setReadable(true, false)
-                }
+        // The shims are bundled per bitness (engines/common for 32-bit, engines/common64 for 64-bit):
+        // a recovery's linker refuses a preload of the wrong word size outright, so stamp the set that matches it.
+        runCatching {
+            val shimDir = if (isElf64(paths)) "engines/common64" else "engines/common"
+            for (lib in listOf("librecshim.so", "libaemushim.so")) {
+                EngineAssets.open(paths.ctx, "$shimDir/$lib").use { i -> File(r, "sbin/$lib").outputStream().use { i.copyTo(it) } }
+                File(r, "sbin/$lib").setReadable(true, false)
             }
         }
         File(r, "dev/aemu_power").let { if (!it.exists()) it.createNewFile() }

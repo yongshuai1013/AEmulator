@@ -65,6 +65,23 @@ def main():
          "-Wl,--build-id=none", "-o", out_rec, "recshim.c", "-lc"], cwd=shim_dir)
     subprocess.run([strip, out_rec])
 
+    # guestshim, 64-bit: the same sources built for aarch64, for 64-bit recoveries (engines/common64)
+    common64_dir = os.path.join(assets, "common64")
+    os.makedirs(common64_dir, exist_ok=True)
+    out_shim64 = os.path.join(common64_dir, "libaemushim.so")
+    run([clang, "--target=aarch64-linux-android21", "-Os", "-fPIC", "-shared",
+         "-nostdlib", "-fvisibility=hidden", "-fno-stack-protector", "-ffreestanding", "-fno-builtin",
+         "-Wl,--hash-style=sysv", "-Wl,-z,norelro", "-Wl,--no-undefined", "-Wl,-soname,libaemushim.so",
+         "-Wl,--build-id=none", "-o", out_shim64, "aemushim.c", "crash.c", "-lc"], cwd=shim_dir)
+    subprocess.run([strip, out_shim64])
+
+    out_rec64 = os.path.join(common64_dir, "librecshim.so")
+    run([clang, "--target=aarch64-linux-android21", "-Os", "-fPIC", "-shared",
+         "-nostdlib", "-fvisibility=hidden", "-fno-stack-protector", "-ffreestanding", "-fno-builtin",
+         "-Wl,--hash-style=sysv", "-Wl,-z,norelro", "-Wl,--no-undefined", "-Wl,-soname,librecshim.so",
+         "-Wl,--build-id=none", "-o", out_rec64, "recshim.c", "-lc"], cwd=shim_dir)
+    subprocess.run([strip, out_rec64])
+
     # ashmem: libashmemshim.so for GB and KK
     gb_dir = os.path.join(assets, "gb")
     kk_dir = os.path.join(assets, "kk")

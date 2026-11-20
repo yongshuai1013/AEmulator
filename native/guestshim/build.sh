@@ -19,3 +19,14 @@ BIN="$(dirname "$CC")"
   -fvisibility=hidden -fno-stack-protector -ffreestanding -fno-builtin -Wl,--hash-style=sysv -Wl,-z,norelro -Wl,--no-undefined \
   -Wl,-soname,librecshim.so -Wl,--build-id=none -o "$(dirname "$OUT")/librecshim.so" recshim.c -lc
 "$BIN/llvm-strip" "$(dirname "$OUT")/librecshim.so" 2>/dev/null || true
+# 64-разрядные варианты тех же исходников для 64-разрядных recovery: assets/engines/common64/
+OUT64="$(dirname "$OUT")/../common64"
+mkdir -p "$OUT64"
+"$CC" --target=aarch64-linux-android21 -Os -fPIC -shared -nostdlib \
+  -fvisibility=hidden -fno-stack-protector -ffreestanding -fno-builtin -Wl,--hash-style=sysv -Wl,-z,norelro -Wl,--no-undefined \
+  -Wl,-soname,libaemushim.so -Wl,--build-id=none -o "$OUT64/libaemushim.so" aemushim.c crash.c -lc
+"$BIN/llvm-strip" "$OUT64/libaemushim.so" 2>/dev/null || true
+"$CC" --target=aarch64-linux-android21 -Os -fPIC -shared -nostdlib \
+  -fvisibility=hidden -fno-stack-protector -ffreestanding -fno-builtin -Wl,--hash-style=sysv -Wl,-z,norelro -Wl,--no-undefined \
+  -Wl,-soname,librecshim.so -Wl,--build-id=none -o "$OUT64/librecshim.so" recshim.c -lc
+"$BIN/llvm-strip" "$OUT64/librecshim.so" 2>/dev/null || true

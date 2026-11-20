@@ -18,6 +18,25 @@
 extern char **environ;
 extern int *__errno(void);
 
+#if defined(__aarch64__)
+/* AArch64 (asm-generic) build of the same shim: syscall number in x8, args in x0.., svc #0.
+ * There is no open/stat64/lstat64 there: open goes through openat(AT_FDCWD), the stat family
+ * through fstatat (AT_SYMLINK_NOFOLLOW for lstat). Everything above the syscall layer — the
+ * evdev answers, the st_dev trick, the mounts redirect — is ABI-neutral and shared. */
+__attribute__((naked, noinline)) static long sys3(long n, long a, long b, long c) {
+    __asm__ volatile("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; svc #0; ret");
+}
+__attribute__((naked, noinline)) static long sys4(long n, long a, long b, long c, long d) {
+    __asm__ volatile("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; svc #0; ret");
+}
+#define SYS_write 64
+#define SYS_close 57
+#define SYS_ioctl 29
+static long k_stat(const char *p, void *st) { return sys4(79 /* fstatat */, -100, (long)p, (long)st, 0); }
+static long k_lstat(const char *p, void *st) { return sys4(79 /* fstatat */, -100, (long)p, (long)st, 0x100 /* AT_SYMLINK_NOFOLLOW */); }
+static long k_fstatat(int fd, const char *p, void *st, int fl) { return sys4(79 /* fstatat */, fd, (long)p, (long)st, fl); }
+static long k_openat(int fd, const char *p, long fl, long m) { return sys4(56 /* openat */, fd, (long)p, fl, m); }
+#else
 __attribute__((naked, noinline)) static long sys3(long n, long a, long b, long c) {
     __asm__ volatile("push {r7}; mov r7, r0; mov r0, r1; mov r1, r2; mov r2, r3; svc #0; pop {r7}; bx lr");
 }
@@ -35,6 +54,15 @@ __attribute__((naked, noinline)) static long sys4(long n, long a, long b, long c
         "bx lr\n"
     );
 }
+#define SYS_write 4
+#define SYS_close 6
+#define SYS_ioctl 54
+static long k_stat(const char *p, void *st) { return sys3(195 /* stat64 */, (long)p, (long)st, 0); }
+static long k_lstat(const char *p, void *st) { return sys3(196 /* lstat64 */, (long)p, (long)st, 0); }
+static long k_fstatat(int fd, const char *p, void *st, int fl) { return sys4(327 /* fstatat64 */, fd, (long)p, (long)st, fl); }
+static long k_openat(int fd, const char *p, long fl, long m) { return sys4(322 /* openat */, fd, (long)p, fl, m); }
+#endif
+static long k_open(const char *p, long fl, long m) { return k_openat(-100 /* AT_FDCWD */, p, fl, m); }
 
 static int fail(long r) { *__errno() = (int)-r; return -1; }
 
@@ -81,7 +109,7 @@ static int mount_dot(const char *p) {
 }
 
 EXPORT int stat(const char *path, void *st) {
-    long r = sys3(195 /* stat64 */, (long)path, (long)st, 0);
+    long r = k_stat(path, st);
     if (r < 0) return fail(r);
     if (mount_dot(path)) *(unsigned long long *)st ^= 0x5a5aULL;   /* st_dev: "another filesystem" */
     return 0;
@@ -89,7 +117,7 @@ EXPORT int stat(const char *path, void *st) {
 EXPORT int stat64(const char *path, void *st) { return stat(path, st); }
 
 EXPORT int lstat(const char *path, void *st) {
-    long r = sys3(196 /* lstat64 */, (long)path, (long)st, 0);
+    long r = k_lstat(path, st);
     if (r < 0) return fail(r);
     if (mount_dot(path)) *(unsigned long long *)st ^= 0x5a5aULL;
     return 0;
@@ -97,7 +125,7 @@ EXPORT int lstat(const char *path, void *st) {
 EXPORT int lstat64(const char *path, void *st) { return lstat(path, st); }
 
 EXPORT int fstatat(int dirfd, const char *path, void *st, int flags) {
-    long r = sys4(327 /* fstatat64 */, dirfd, (long)path, (long)st, flags);
+    long r = k_fstatat(dirfd, path, st, flags);
     if (r < 0) return fail(r);
     if (mount_dot(path)) *(unsigned long long *)st ^= 0x5a5aULL;
     return 0;
@@ -125,14 +153,14 @@ static const char *redirect_path(const char *path) {
 }
 
 EXPORT int open(const char *path, int flags, int mode) {
-    long r = sys3(5 /* open */, (long)redirect_path(path), flags, mode);
+    long r = k_open(redirect_path(path), flags, mode);
     if (r < 0) return fail(r);
     return (int)r;
 }
 EXPORT int open64(const char *path, int flags, int mode) { return open(path, flags, mode); }
 
 EXPORT int openat(int dirfd, const char *path, int flags, int mode) {
-    long r = sys4(322 /* openat */, dirfd, (long)redirect_path(path), flags, mode);
+    long r = k_openat(dirfd, redirect_path(path), flags, mode);
     if (r < 0) return fail(r);
     return (int)r;
 }
@@ -158,6 +186,7 @@ struct aemu_input_absinfo {
 };
 
 EXPORT int ioctl(int fd, unsigned long req, void *arg) {
+    req &= 0xFFFFFFFFUL;   /* the request word is 32 bits on both ABIs; LP64 callers may leave junk above */
     unsigned int type = (req >> 8) & 0xFF;
     if (type == 'E') { // Evdev 'E' ioctl family
         unsigned int nr = req & 0xFF;
@@ -260,7 +289,7 @@ EXPORT int ioctl(int fd, unsigned long req, void *arg) {
         }
         return 0;
     }
-    long r = sys3(54 /* ioctl */, fd, req, (long)arg);
+    long r = sys3(SYS_ioctl, fd, req, (long)arg);
     if (r < 0) return fail(r);
     return (int)r;
 }
@@ -269,8 +298,8 @@ static void power_request(const char *what, const char *arg) {
     char buf[96]; int n = 0;
     while (*what && n < 40) buf[n++] = *what++;
     if (arg && *arg) { buf[n++] = ','; while (*arg && n < 90) buf[n++] = *arg++; }
-    long fd = sys3(5 /* open */, (long)"/dev/aemu_power", 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0666);
-    if (fd >= 0) { sys3(4 /* write */, fd, (long)buf, n); sys3(6 /* close */, fd, 0, 0); }
+    long fd = k_open("/dev/aemu_power", 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0666);
+    if (fd >= 0) { sys3(SYS_write, fd, (long)buf, n); sys3(SYS_close, fd, 0, 0); }
 }
 EXPORT int reboot(int cmd) {
     power_request(cmd == 0x4321FEDC || cmd == (int)0xCDEF0123 ? "shutdown" : "reboot", 0);

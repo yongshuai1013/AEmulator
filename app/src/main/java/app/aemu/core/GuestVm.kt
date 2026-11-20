@@ -160,7 +160,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         TreeFixer(ctx, paths, img, ::log).fixup()   // framebuffer, input node
         val sd = Sdcard.setup(ctx, paths, img, ::log)
         RecoveryImage.prepare(paths, sd, settings)
-        log(if (is64) "recovery shims: skipped (64-bit recovery)" else "recovery shims: preloaded (32-bit)")
+        log(if (is64) "recovery shims: preloaded (64-bit)" else "recovery shims: preloaded (32-bit)")
         input.rateHz = settings.touchHz
         input.mtMode = settings.mtMode
         input.serve()
@@ -199,8 +199,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             "DHD_FB_W" to "$w", "DHD_FB_H" to "$h", "DHD_IN_W" to "$w", "DHD_IN_H" to "$h",
             "DHD_INPUT" to paths.inputSock.absolutePath,
         )
-        // The bundled shims are 32-bit; preloading them into a 64-bit recovery kills it in the linker.
-        if (!is64) recEnv["LD_PRELOAD"] = "/sbin/librecshim.so:/sbin/libaemushim.so"
+        // prepare() has stamped the shim set matching this recovery's bitness into sbin/; preload it either way.
+        recEnv["LD_PRELOAD"] = "/sbin/librecshim.so:/sbin/libaemushim.so"
         // A 64-bit recovery runs under the aemu64 launcher (kernel.runner), which dies at once
         // ("AEMU64_ROOT is not set", exit 127) without the environment GuestRunner.env64 hands it
         // for a system boot. Give it the same set, with the paths pointed at the recovery tree.
