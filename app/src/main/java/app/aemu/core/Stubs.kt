@@ -25,12 +25,16 @@ class RilStub(
     private val log: (String) -> Unit,
     private val imei: String = VmSettings.DEFAULT_IMEI,
     private val api: Int = 19,
+    /** baseband version from the image's factory package ("" → the generic answer) */
+    private val baseband: String = "",
 ) {
     @Volatile var answered = 0L
         private set
 
     private val server = UnixServer(paths.socket("rild"), "rild") { c -> serveOne(c) }
     private val operator: Pair<String, String> by lazy { pickOperator() }   // mcc to mnc
+    /** what RIL_REQUEST_BASEBAND_VERSION answers: the image's own radio version when it is known */
+    private val basebandVersion: String get() = baseband.ifBlank { BASEBAND }
     /** Samsung's 4.3 RIL.java reads a call type (CallDetails) after isVoicePrivacy */
     private val samsung: Boolean by lazy {
         runCatching { File(paths.root, "system/build.prop").readText().lowercase().contains("ro.product.manufacturer=samsung") }
@@ -163,7 +167,7 @@ class RilStub(
             val data = when (request) {
                 RIL_REQUEST_GET_IMEI -> str(imei)
                 RIL_REQUEST_GET_IMEISV -> str(IMEISV)
-                RIL_REQUEST_BASEBAND_VERSION -> str(BASEBAND)
+                RIL_REQUEST_BASEBAND_VERSION -> str(basebandVersion)
                 RIL_REQUEST_DEVICE_IDENTITY -> strs(imei, IMEISV, "", "")
                 else -> null
             }
@@ -194,7 +198,7 @@ class RilStub(
             RIL_REQUEST_DATA_CALL_LIST -> 0 to dataCall(single = false)
             RIL_REQUEST_GET_IMEI -> 0 to str(imei)
             RIL_REQUEST_GET_IMEISV -> 0 to str(IMEISV)
-            RIL_REQUEST_BASEBAND_VERSION -> 0 to str(BASEBAND)
+            RIL_REQUEST_BASEBAND_VERSION -> 0 to str(basebandVersion)
             RIL_REQUEST_DEVICE_IDENTITY -> 0 to strs(imei, IMEISV, "", "")
             RIL_REQUEST_QUERY_NETWORK_SELECTION_MODE -> 0 to ints(0)
             RIL_REQUEST_GET_PREFERRED_NETWORK_TYPE -> 0 to ints(0)

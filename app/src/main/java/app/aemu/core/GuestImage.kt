@@ -181,6 +181,14 @@ data class GuestImage(
     val profileVersion: Int = 0,
     /** container: id of the image whose /system this one shares (its own /data, card and settings) */
     val baseId: String = "",
+    /** the firmware kernel's own version banner, read from boot.img at import ("" when unknown) */
+    val kernelBanner: String = "",
+    /** utsname release parsed from the banner: what the native runner answers uname with */
+    val kernelRelease: String = "",
+    /** utsname version parsed from the banner (the "#1 …" build stamp) */
+    val kernelVersion: String = "",
+    /** baseband version implied by the factory package's radio file name ("" → the stub's generic answer) */
+    val baseband: String = "",
 ) {
     val displayVersion: String get() = "Android $release (API $api)"
 
@@ -208,6 +216,8 @@ data class GuestImage(
         .put("lastBootMs", lastBootMs).put("bootCount", bootCount)
         .put("profileVersion", profileVersion)
         .put("baseId", baseId)
+        .put("kernelBanner", kernelBanner).put("kernelRelease", kernelRelease)
+        .put("kernelVersion", kernelVersion).put("baseband", baseband)
 
     companion object {
         fun fromJson(o: JSONObject): GuestImage {
@@ -242,6 +252,10 @@ data class GuestImage(
                 bootCount = o.optInt("bootCount", 0),
                 profileVersion = o.optInt("profileVersion", 0),
                 baseId = o.optString("baseId", ""),
+                kernelBanner = o.optString("kernelBanner", ""),
+                kernelRelease = o.optString("kernelRelease", ""),
+                kernelVersion = o.optString("kernelVersion", ""),
+                baseband = o.optString("baseband", ""),
             )
         }
     }

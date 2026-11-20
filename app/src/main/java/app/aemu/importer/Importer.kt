@@ -46,6 +46,12 @@ class Importer(
     private val tmp = File(ctx.cacheDir, "import").apply { mkdirs() }
     private var ramdisk: List<BootImage.CpioEntry>? = null
     private var recovery: ByteArray? = null
+    // the firmware kernel's identity, read from its boot image: /proc/version and uname in the guest
+    private var kernelBanner = ""
+    private var kernelRelease = ""
+    private var kernelVersion = ""
+    // baseband version implied by a radio-<device>-<version>.img file name in the package
+    private var baseband = ""
     private val symlinks = ArrayList<Pair<String, String>>() // (цель, путь ссылки в госте)
     private val perms = ArrayList<Triple<String, Int, Boolean>>() // (путь, режим, рекурсивно-файлы)
     private var files = 0
@@ -77,7 +83,7 @@ class Importer(
             finishTree()
             recovery?.let { runCatching { RecoveryImage.install(paths, it, log) } }
             onProgress("Analyzing firmware", 0.97f)
-            val img = Analyzer(ctx, paths, ramdisk).analyze(id, name)
+            val img = Analyzer(ctx, paths, ramdisk, kernelBanner, kernelRelease, kernelVersion, baseband).analyze(id, name)
             TreeFixer(ctx, paths, img, log).sanitize()
             ImageStore.save(ctx, img.copy(sizeBytes = ImageStore.du(paths.dir)))
             onProgress("Done", 1f)
@@ -228,6 +234,7 @@ class Importer(
             if (cancelled) throw IOException("cancelled")
             val n = e.name.replace('\\', '/').removePrefix(wrap)
             val base = n.substringAfterLast('/')
+            noteRadioFile(base)
             when {
                 e.isDirectory -> {}
                 n.contains("__MACOSX/") || base.startsWith("._") -> {}
@@ -388,6 +395,7 @@ class Importer(
             var n = e.name.removePrefix("./").trimStart('/')
             if (n.isEmpty()) continue
             val base = n.substringAfterLast('/')
+            noteRadioFile(base)
             // дерево rootfs целиком (system/, data/, dev/, …)
             if (fullRoot == null && (n == "system" || n.startsWith("system/") || n.startsWith("init.rc") || n.startsWith("default.prop"))) fullRoot = true
             when {
@@ -619,7 +627,30 @@ class Importer(
         log("system-as-root image: the tree is taken as the root directory")
     }
 
+    /**
+     * Factory packages ship the modem as radio-<device>-<version>.img (Google doubles the device:
+     * radio-angler-angler-02.15.img). The version the real modem reports is "<device>-<version>";
+     * the fake modem answers with it instead of a generic string. First match wins.
+     */
+    private fun noteRadioFile(base: String) {
+        if (baseband.isNotEmpty() || !base.startsWith("radio-", true)) return
+        val rest = base.substringBeforeLast('.').substring(6)
+        val ver = Regex("""\d+(\.\d+)+[0-9A-Za-z.]*$""").find(rest)?.value ?: return
+        var dev = rest.substring(0, rest.length - ver.length).trimEnd('-', '_')
+        val half = dev.length / 2
+        if (dev.length % 2 == 1 && dev[half] == '-' && dev.substring(0, half) == dev.substring(half + 1)) dev = dev.substring(0, half)
+        if (dev.isNotEmpty()) { baseband = "$dev-$ver"; log("radio: baseband $baseband (from $base)") }
+    }
+
     private fun takeBoot(data: ByteArray) {
+        if (kernelBanner.isEmpty()) runCatching {
+            BootImage.kernelBanner(data)?.let { b ->
+                kernelBanner = b
+                kernelRelease = BootImage.bannerRelease(b)
+                kernelVersion = BootImage.bannerVersion(b)
+                log("boot: kernel $kernelRelease")
+            }
+        }
         if (ramdisk != null) return
         val rd = runCatching { BootImage.ramdisk(data) }.getOrNull()
         if (rd.isNullOrEmpty()) { log("boot: ramdisk not recognized"); return }

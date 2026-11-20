@@ -1015,6 +1015,12 @@ class TreeFixer(
                 if (!it.isFile || !it.readBytes().contentEquals(gz)) it.writeBytes(gz)
             } else if (!it.isFile || it.readText() != text) it.writeText(text)
         }
+        // /proc/version: the firmware kernel's own banner, read from its boot.img at import — the line
+        // Settings shows as "Kernel version". Images imported before this existed have no banner: no file.
+        if (engine == Engine.N64 && img.kernelBanner.isNotBlank()) File(root, "proc/version").let {
+            val text = img.kernelBanner + "\n"
+            if (!it.isFile || it.readText() != text) it.writeText(text)
+        }
     }
 
     private fun assetSize(a: String): Long = runCatching { EngineAssets.size(ctx, a) }.getOrDefault(-1L)

@@ -16,7 +16,15 @@ import java.nio.ByteOrder
  * версию, производителя и оболочку, движок, BOOTCLASSPATH, переменные и каталоги init,
  * план загрузки служб, путь карты памяти, разрешение экрана. Пишет шаблон области свойств.
  */
-class Analyzer(private val ctx: Context, private val paths: VmPaths, private val ramdisk: List<BootImage.CpioEntry>?) {
+class Analyzer(
+    private val ctx: Context,
+    private val paths: VmPaths,
+    private val ramdisk: List<BootImage.CpioEntry>?,
+    private val kernelBanner: String = "",
+    private val kernelRelease: String = "",
+    private val kernelVersion: String = "",
+    private val baseband: String = "",
+) {
     private val root = paths.root
 
     fun analyze(id: String, sourceName: String): GuestImage {
@@ -124,6 +132,10 @@ class Analyzer(private val ctx: Context, private val paths: VmPaths, private val
             runtime = if (api >= 21) "art" else "dalvik",
             warnings = warnings,
             profileVersion = VERSION,
+            kernelBanner = kernelBanner,
+            kernelRelease = kernelRelease,
+            kernelVersion = kernelVersion,
+            baseband = baseband,
         )
     }
 
@@ -158,6 +170,9 @@ class Analyzer(private val ctx: Context, private val paths: VmPaths, private val
             val out = fresh.copy(
                 name = img.name, settings = img.settings, createdAt = img.createdAt, sizeBytes = img.sizeBytes,
                 lastBootMs = img.lastBootMs, bootCount = img.bootCount,
+                // re-analysis has no boot image at hand: the kernel identity and baseband carry over
+                kernelBanner = img.kernelBanner, kernelRelease = img.kernelRelease,
+                kernelVersion = img.kernelVersion, baseband = img.baseband,
             )
             app.aemu.core.ImageStore.save(ctx, out)
             return out

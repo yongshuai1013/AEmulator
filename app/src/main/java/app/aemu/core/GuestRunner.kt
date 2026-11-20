@@ -97,6 +97,9 @@ class GuestRunner(
         e["HOME"] = "/data"; e["TMPDIR"] = "/data/local/tmp"; e["TZ"] = "UTC"
         e["AEMU64_ROOT"] = paths.root.absolutePath
         e["AEMU64_PROPS"] = paths.props.absolutePath
+        // the guest kernel's identity (from the image's boot.img): the runner answers uname with these
+        if (img.kernelRelease.isNotEmpty()) e["AEMU64_UTS_RELEASE"] = img.kernelRelease
+        if (img.kernelVersion.isNotEmpty()) e["AEMU64_UTS_VERSION"] = img.kernelVersion
         e["AEMU64_BINDER"] = paths.binderSock.absolutePath
         if (kernel.treble) {
             e["AEMU64_HWBINDER"] = paths.hwbinderSock.absolutePath

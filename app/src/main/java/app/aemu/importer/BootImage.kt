@@ -48,6 +48,74 @@ object BootImage {
         return fromZImage(img)
     }
 
+    /**
+     * The kernel's own version line ("Linux version …") from a boot image: the text a real device
+     * serves as /proc/version. The kernel blob of an ANDROID! image starts after the first page;
+     * for a bare zImage the compressed kernel is searched for the way the ramdisk search does.
+     * Null when nothing readable is found — the caller then simply keeps no banner.
+     */
+    fun kernelBanner(img: ByteArray): String? {
+        val bb = ByteBuffer.wrap(img).order(ByteOrder.LITTLE_ENDIAN)
+        if (img.size > 64 && String(img, 0, 8, Charsets.ISO_8859_1) == "ANDROID!") {
+            val kernelSize = bb.getInt(8).toLong() and 0xffffffffL
+            val pageSize = bb.getInt(36).let { if (it in 2048..131072) it else 2048 }
+            if (pageSize + kernelSize <= img.size) {
+                val blob = img.copyOfRange(pageSize, (pageSize + kernelSize).toInt())
+                bannerIn(decompress(blob) ?: blob)?.let { return it }
+            }
+        }
+        bannerIn(img)?.let { return it }
+        for (i in 0 until img.size - 6) {
+            val gz = img[i] == 0x1f.toByte() && img[i + 1] == 0x8b.toByte() && img[i + 2] == 0x08.toByte()
+            val lz = img[i] == 0x5d.toByte() && img[i + 1] == 0x00.toByte() && img[i + 2] == 0x00.toByte()
+            val xz = img[i] == 0xfd.toByte() && img[i + 1] == '7'.code.toByte() && img[i + 2] == 'z'.code.toByte() &&
+                img[i + 3] == 'X'.code.toByte() && img[i + 4] == 'Z'.code.toByte()
+            if (!gz && !lz && !xz) continue
+            val kernel = runCatching {
+                val tail = img.copyOfRange(i, img.size)
+                when {
+                    gz -> gunzipLenient(tail)
+                    lz -> lzmaLenient(tail)
+                    else -> XZInputStream(ByteArrayInputStream(tail)).readBytes()
+                }
+            }.getOrNull() ?: continue
+            if (kernel.size < 1_000_000) continue
+            bannerIn(kernel)?.let { return it }
+        }
+        return null
+    }
+
+    /** the banner inside a (decompressed) kernel image: the first "Linux version x.y…" line */
+    private fun bannerIn(k: ByteArray): String? {
+        val tag = "Linux version ".toByteArray(Charsets.ISO_8859_1)
+        var i = 0
+        while (i + tag.size < k.size) {
+            if (tag.indices.all { k[i + it] == tag[it] }) {
+                var end = i
+                while (end < k.size && end - i < 512 && k[end] != 0.toByte() && k[end] != '\n'.code.toByte()) end++
+                val line = String(k, i, end - i, Charsets.ISO_8859_1).trim()
+                // the banner's version starts with a digit; lookalike strings elsewhere do not count
+                if (line.length > 20 && line.removePrefix("Linux version ").firstOrNull()?.isDigit() == true) return line
+            }
+            i++
+        }
+        return null
+    }
+
+    /** utsname release: the token right after "Linux version " */
+    fun bannerRelease(banner: String): String =
+        banner.removePrefix("Linux version ").substringBefore(' ').trim()
+
+    /**
+     * utsname version: the "#1 …" build stamp. The banner is built as
+     * "Linux version <release> (<builder>) (<compiler>) <version>" and the compiler part may
+     * contain parentheses of its own, so the stamp follows the LAST ") " of the line.
+     */
+    fun bannerVersion(banner: String): String {
+        val last = banner.lastIndexOf(") ")
+        return if (last < 0) "" else banner.substring(last + 2).trim()
+    }
+
     private fun fromZImage(img: ByteArray): List<CpioEntry>? {
         // ищем сжатое ядро внутри zImage: gzip (большинство), LZMA/XZ (i9100 и др. кастомные ядра)
         for (i in 0 until img.size - 6) {
