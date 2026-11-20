@@ -210,13 +210,16 @@ class InputService(private val paths: VmPaths, private val log: (String) -> Unit
         if (b.position() == 0) return
         val a = ByteArray(b.position())
         b.flip(); b.get(a); b.clear()
-        sink?.let { runCatching { it.write(a); it.flush() }.onFailure { sink = null } }
         val dead = ArrayList<Client>()
         // a 64-bit guest reads struct input_event with a 16-byte timeval
         val w = if (!wide) a else ByteArray(a.size / EV * 24).also { o ->
             val src = ByteBuffer.wrap(a).order(ByteOrder.LITTLE_ENDIAN); val dst = ByteBuffer.wrap(o).order(ByteOrder.LITTLE_ENDIAN)
             repeat(a.size / EV) { dst.putLong(src.int.toLong()); dst.putLong(src.int.toLong()); dst.putShort(src.short); dst.putShort(src.short); dst.putInt(src.int) }
         }
+        // the recovery FIFO consumer parses the same struct input_event layout as the socket
+        // clients, so it must get the same (possibly widened) bytes: feeding it the raw 16-byte
+        // records desyncs a 64-bit minui on the very first record and touch is dead
+        sink?.let { runCatching { it.write(w); it.flush() }.onFailure { sink = null } }
         for (c in clients) {
             try { c.out.write(w); c.out.flush() } catch (e: Exception) { dead.add(c) }
         }

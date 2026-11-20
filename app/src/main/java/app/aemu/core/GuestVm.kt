@@ -165,6 +165,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         log(if (is64) "recovery shims: preloaded (64-bit)" else "recovery shims: preloaded (32-bit)")
         input.rateHz = settings.touchHz
         input.mtMode = settings.mtMode
+        // doBoot sets wide from the engine; recovery has no socket client to infer it from,
+        // so pin it to this recovery's own bitness or the FIFO stream keeps the wrong width
+        input.wide = is64
         input.serve()
         // recovery's minui opens /dev/input/event* through openat():
         // a FIFO there gets the raw input_event stream straight from InputService
