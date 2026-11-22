@@ -191,6 +191,28 @@ EXPORT int ioctl(int fd, unsigned long req, void *arg) {
     if (type == 'E') { // Evdev 'E' ioctl family
         unsigned int nr = req & 0xFF;
         unsigned int size = (req >> 16) & 0x3FFF;
+        { /* observation only (no behaviour change): record the first evdev
+           * ioctls a consumer asks, so the host log shows who queries input */
+            static int evdev_log_left = 64;
+            if (evdev_log_left > 0) {
+                evdev_log_left--;
+                char lb[64]; int ln = 0;
+                const char *p = "recshim: evdev input ioctl nr=0x";
+                while (*p) lb[ln++] = *p++;
+                for (int s = 4; s >= 0; s -= 4) {
+                    unsigned int d = (nr >> s) & 0xF;
+                    lb[ln++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+                }
+                p = " fd=";
+                while (*p) lb[ln++] = *p++;
+                char tmp[12]; int tn = 0; unsigned int v = (unsigned int)fd;
+                if (!v) tmp[tn++] = '0';
+                while (v) { tmp[tn++] = (char)('0' + v % 10); v /= 10; }
+                while (tn) lb[ln++] = tmp[--tn];
+                lb[ln++] = '\n';
+                sys3(SYS_write, 2, (long)lb, ln);
+            }
+        }
 
         if (nr == 0x01) { // EVIOCGVERSION
             if (arg && size >= 4) { *(int *)arg = 0x010001; return 0; }
@@ -248,14 +270,14 @@ EXPORT int ioctl(int fd, unsigned long req, void *arg) {
                 } else if (ev == 3) { // EV_ABS
                     // ABS_X = 0, ABS_Y = 1: byte 0, bits 0, 1
                     // ABS_PRESSURE = 24: byte 3, bit 0
-                    // ABS_MT_SLOT = 47: byte 5, bit 7
+                    // ABS_MT_SLOT = 47: NOT declared — the host stream is
+                    // Protocol A (SYN_MT_REPORT), it never addresses slots
                     // ABS_MT_TOUCH_MAJOR = 48: byte 6, bit 0
                     // ABS_MT_POSITION_X = 53: byte 6, bit 5
                     // ABS_MT_POSITION_Y = 54: byte 6, bit 6
                     // ABS_MT_TRACKING_ID = 57: byte 7, bit 1
                     b[0] |= (1 << 0) | (1 << 1);
                     if (size > 3) b[3] |= (1 << 0);
-                    if (size > 5) b[5] |= (1 << 7);
                     if (size > 6) b[6] |= (1 << 0) | (1 << 5) | (1 << 6);
                     if (size > 7) b[7] |= (1 << 1);
                 }
