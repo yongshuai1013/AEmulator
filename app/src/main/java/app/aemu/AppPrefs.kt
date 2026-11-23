@@ -62,6 +62,10 @@ object AppPrefs {
         HostUiOptions(json.optBoolean("holoNavbar", false), json.optBoolean("sunsetNavbar", false))
     }.getOrDefault(HostUiOptions())
 
+    /** The user's arrangement of the library (order + folders, AEmulator-Plus #33): a JSON sidecar, never part of the image data. */
+    fun libraryLayout(ctx: Context): String? = sp(ctx).getString("library_layout", null)
+    fun setLibraryLayout(ctx: Context, v: String) = sp(ctx).edit().putString("library_layout", v).apply()
+
     fun autoCheckUpdates(ctx: Context): Boolean = sp(ctx).getBoolean("auto_check_updates", true)
     fun setAutoCheckUpdates(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean("auto_check_updates", v).apply()
 

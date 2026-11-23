@@ -346,4 +346,18 @@
     <string name="nav_left">Left</string>
     <string name="nav_right">Right</string>
     <string name="nav_center">Center</string>
+    <string name="folder_close">Close folder</string>
+    <string name="folder_default_name">Folder</string>
+    <string name="folder_delete">Delete folder (keeps the ROMs)</string>
+    <string name="folder_empty">Empty — drop ROMs here</string>
+    <string name="folder_move">Move to folder</string>
+    <string name="folder_new">New folder</string>
+    <string name="folder_new_dots">New folder…</string>
+    <string name="folder_none">Not in a folder</string>
+    <string name="folder_open">Open folder</string>
+    <string name="folder_rename">Rename folder</string>
+    <plurals name="folder_roms">
+        <item quantity="one">%1$d ROM</item>
+        <item quantity="other">%1$d ROMs</item>
+    </plurals>
 </resources>
