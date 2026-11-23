@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.DropdownMenu
@@ -176,6 +177,13 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
 
             Spacer(Modifier.height(8.dp))
             RecoverySection(img)
+
+            Spacer(Modifier.height(8.dp))
+            Text(stringResource(R.string.vs_archive), style = MaterialTheme.typography.titleMedium)
+            var archiveBusy by remember { mutableStateOf(false) }
+            VmExportSection(img, s, archiveBusy) { archiveBusy = it }
+            VmImportSection(img, archiveBusy, { archiveBusy = it }) { s = it }
+            EraseDataSection(img)
 
             Spacer(Modifier.height(8.dp))
             Text(stringResource(R.string.vs_controls), style = MaterialTheme.typography.titleMedium)
@@ -407,4 +415,46 @@ private fun recoveryStatus(paths: app.aemu.core.VmPaths): String? {
         prop.contains("cwm", true) || java.io.File(dir, "res/images/icon_clockwork.png").exists() -> "ClockworkMod"
         else -> "Stock recovery"
     }
+}
+
+/**
+ * Full erase of this machine's data (AEmulator-Plus VmDataReset): the whole /data and /cache go,
+ * including the dalvik-cache the library's factory reset keeps; the owners table is pruned of the
+ * erased inodes so recycled ones do not inherit stale UIDs. No backup is made.
+ */
+@Composable
+private fun EraseDataSection(img: GuestImage) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    var confirm by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+    TextButton(enabled = !busy, modifier = Modifier.fillMaxWidth(), onClick = { confirm = true }) {
+        Text(stringResource(R.string.vs_erase))
+    }
+    message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+    if (confirm) AlertDialog(
+        onDismissRequest = { confirm = false },
+        title = { Text(stringResource(R.string.vs_erase)) },
+        text = { Text(stringResource(R.string.vs_erase_info)) },
+        dismissButton = { TextButton(onClick = { confirm = false }) { Text(stringResource(R.string.cancel)) } },
+        confirmButton = { TextButton(onClick = {
+            confirm = false
+            if (vmIsRunning(ctx)) { message = ctx.getString(R.string.vs_archive_running); return@TextButton }
+            busy = true
+            Thread {
+                val ok = runCatching {
+                    val paths = app.aemu.core.VmPaths(ctx, img.id)
+                    app.aemu.core.VmDataReset.reset(paths.dir.parentFile!!, img.id) { f ->
+                        val st = android.system.Os.lstat(f.path)
+                        String.format(java.util.Locale.ROOT, "%016x %016x", st.st_dev, st.st_ino)
+                    }
+                    app.aemu.core.ImageStore.update(ctx, img.id) { it.copy(sizeBytes = app.aemu.core.ImageStore.du(paths.dir)) }
+                }.isSuccess
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    busy = false
+                    message = ctx.getString(if (ok) R.string.vs_erase_done else R.string.vs_erase_failed)
+                }
+            }.start()
+        }) { Text(stringResource(R.string.vs_erase)) } },
+    )
 }

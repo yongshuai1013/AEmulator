@@ -243,4 +243,26 @@
     <string name="m_vnc_started">VNC: %1$s, password %2$s</string>
     <string name="as_led">Notification light</string>
     <string name="as_led_sub">Show the guest phone’s LED above its screen</string>
+    <string name="vs_archive">VM archive</string>
+    <string name="vs_archive_running">Stop the VM first</string>
+    <string name="vm_export">Export VM</string>
+    <string name="vm_export_info">Writes this machine (system, settings, optionally data) to a single .aessvm file that can be restored here or in AEmulator-Plus.</string>
+    <string name="vm_export_system">System</string>
+    <string name="vm_export_system_info">The firmware tree; required for a restorable archive.</string>
+    <string name="vm_export_config">Settings</string>
+    <string name="vm_export_config_info">This machine’s settings; can also be imported alone into another machine.</string>
+    <string name="vm_export_data">Data</string>
+    <string name="vm_export_data_info">Apps and user data. Makes the archive much bigger.</string>
+    <string name="vm_export_working">Exporting…</string>
+    <string name="vm_export_done">Export done</string>
+    <string name="vm_export_failed">Export failed</string>
+    <string name="vm_import_settings">Import settings</string>
+    <string name="vm_import_settings_done">Settings imported</string>
+    <string name="vm_import_settings_warning_title">Different machine</string>
+    <string name="vm_import_settings_warning">These settings come from %1$s; this machine is %2$s. Apply anyway?</string>
+    <string name="vm_import_failed">Import failed: %1$s</string>
+    <string name="vs_erase">Erase all data</string>
+    <string name="vs_erase_info">Deletes the whole data and cache of this machine, including the dalvik-cache the factory reset keeps. There is no backup and no undo.</string>
+    <string name="vs_erase_done">Data erased</string>
+    <string name="vs_erase_failed">Erase failed</string>
 </resources>
