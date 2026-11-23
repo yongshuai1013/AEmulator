@@ -31,6 +31,13 @@
 //   gives /dev/null etc. for the usual numbers and ENXIO for the rest. A 0:0 character device is an overlay whiteout,
 //   which is how Magisk modules delete stock files (MagiskCore.Overlay understands the same marker on the host side).
 //
+// PER-APP VIEWS (view layer)
+//   With <root>/dev/.aemu-hideuids present (the host's hide list, resolved to guest uids), a process whose
+//   uid is listed reads the guest as if Magisk were not in it: Magisk's own places and the module
+//   overlay's files answer ENOENT, files the overlay replaced read as their stock backups, and
+//   /proc/mounts lists only the image's own table. See the "per-app views" section below. No file, no
+//   listed uid: nothing changes for anyone.
+//
 // Needs from run64.c (all defined above the include point): types, S*() and NR_*, slen/seq/pre/mem*, norm, xl_x, unxl,
 // struct kstat, fake_owner, fake_memfile, utoa, g_root/g_rootlen, PB(), P(), trap2_base.
 
@@ -526,7 +533,199 @@ static long vm_sys_getdents(long *a) {
         }
         o += rl;
     }
+    // our own bookkeeping files (.aemu-*: the mount table, the tmpfs store, the per-pid maps, the hide
+    // list itself) are not the guest's business in a listing; they stay reachable by their exact path,
+    // which is all our own guest services ever use
+    {
+        long w = 0, lastOff = 0, lastKept = -1;
+        for (long o = 0; o + 19 <= n;) {
+            u16 rl = *(u16 *)(b + o + 16);
+            if (!rl) break;
+            lastOff = *(i64 *)(b + o + 8);
+            const char *nm = b + o + 19;
+            int ours = nm[0] == '.' && nm[1] == 'a' && nm[2] == 'e' && nm[3] == 'm' && nm[4] == 'u' && nm[5] == '-';
+            if (!ours) { if (w != o) memmove(b + w, b + o, rl); lastKept = w; w += rl; }
+            o += rl;
+        }
+        if (w != n) {
+            if (lastKept >= 0) *(i64 *)(b + lastKept + 8) = lastOff;   // the end-of-directory cookie of the unfiltered read
+            return w;
+        }
+    }
     return n;
+}
+
+// ---- per-app views: hiding the root traces from listed apps ------------------------------------------------------
+// The host's hide list (VmSettings.hiddenApps) reaches this layer as a set of guest uids in
+// <root>/dev/.aemu-hideuids — resolved from package names by the guest agent (its PackageManager is the
+// authority), or by the host out of the image's packages.xml before the agent is up. A process whose
+// g_uid is in the set reads a guest without Magisk in it:
+//   - the fixed places MagiskCore puts things (its links in /system/bin and /system/xbin, /data/adb,
+//     /debug_ramdisk, the manager's own data, the Zygisk bridge in /system/lib64) answer ENOENT;
+//   - what the module overlay copied in (MagiskCore.Overlay's journal) answers ENOENT where the overlay
+//     created a file, and the journal's backup where the overlay replaced one — the un-mounted view,
+//     as a denylist means it, not a hole where a stock file should be;
+//   - /proc/mounts and mountinfo list only the image's own table, without this layer's mounts.
+// No file (an empty list, the agent off, Magisk off) means no reader is hidden and nothing here ever
+// engages: the checks below all sit behind vm_hidden(), which is then always false. Directory listings
+// are the one gap: getdents64 has no path to match the journal against, so module file NAMES still
+// show in a listing (their open/stat answer ENOENT); names of our own bookkeeping (.aemu-*) are
+// dropped from listings for every reader while this layer is on.
+#define VM_HIDE_MAXUID 128
+#define VM_HIDE_MAXENT 1024
+#define VM_HIDE_PATH 560
+
+static int g_hide_uids[VM_HIDE_MAXUID];
+static int g_hide_nuid;
+static char g_hide_host[VM_HIDE_MAXENT][VM_HIDE_PATH];   // journal entry, as a host path
+static char g_hide_orig[VM_HIDE_MAXENT][VM_HIDE_PATH];   // its backup host path; "" = created by the overlay (ENOENT)
+static int g_hide_pfx[VM_HIDE_MAXENT];                   // a whole directory was replaced: prefix match
+static int g_hide_nent;
+static int g_hide_calls = 1 << 28;                       // the first check always loads
+struct vm_fver { i64 mt, mtn, size; int ok; };
+static struct vm_fver g_hide_uv, g_hide_jv;
+
+static void vm_fver_get(const char *p, struct vm_fver *v) {
+    struct kstat st;
+    v->ok = S4(NR_newfstatat, AT_FDCWD, p, &st, 0) == 0;
+    if (v->ok) { v->mt = st.mt; v->mtn = st.mtn; v->size = st.st_size; }
+}
+static int vm_fver_same(const struct vm_fver *a, const struct vm_fver *b) {
+    return a->ok == b->ok && (!a->ok || (a->mt == b->mt && a->mtn == b->mtn && a->size == b->size));
+}
+
+// reads a whole small file; returns its length (content NUL-terminated), or -1
+static long vm_read_file(const char *p, char *buf, u64 cap) {
+    long fd = S4(NR_openat, AT_FDCWD, p, 02000000, 0);
+    if (fd < 0) return -1;
+    u64 o = 0;
+    while (o + 1 < cap) { long n = S3(NR_read, fd, buf + o, cap - 1 - o); if (n <= 0) break; o += (u64)n; }
+    S1(NR_close, fd);
+    buf[o] = 0;
+    return (long)o;
+}
+
+static void vm_hide_reload(const char *up, const char *jp) {
+    static char buf[600000];
+    g_hide_nuid = 0;
+    long n = vm_read_file(up, buf, sizeof buf);
+    if (n > 0) {
+        char *p = buf;
+        while (*p && g_hide_nuid < VM_HIDE_MAXUID) {
+            while (*p == '\n' || *p == '\r' || *p == ' ' || *p == '\t') p++;
+            if (*p < '0' || *p > '9') break;
+            int v = 0; while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+            g_hide_uids[g_hide_nuid++] = v;
+        }
+    }
+    g_hide_nent = 0;
+    n = vm_read_file(jp, buf, sizeof buf);
+    if (n <= 0) return;
+    char *p = buf;
+    while (*p && g_hide_nent < VM_HIDE_MAXENT) {
+        char *e = p; while (*e && *e != '\n') e++;
+        char save = *e; *e = 0;
+        // kind \t tree-relative path [\t backup number]
+        char *t1 = 0, *t2 = 0;
+        for (char *q = p; *q; q++) if (*q == '\t') { if (!t1) t1 = q; else { t2 = q; break; } }
+        if (t1 && (p[0] == 'F' || p[0] == 'D' || p[0] == 'R' || p[0] == 'P')) {
+            *t1 = 0; if (t2) *t2 = 0;
+            const char *rel = t1 + 1;
+            u64 rl = slen(g_root) + 1 + slen(rel);
+            if (rl < VM_HIDE_PATH) {
+                char *h = g_hide_host[g_hide_nent];
+                memcpy(h, g_root, g_rootlen); h[g_rootlen] = '/'; memcpy(h + g_rootlen + 1, rel, slen(rel) + 1);
+                g_hide_orig[g_hide_nent][0] = 0;
+                g_hide_pfx[g_hide_nent] = p[0] == 'P';
+                if ((p[0] == 'R' || p[0] == 'P') && t2) {
+                    const char *bk = t2 + 1;
+                    static const char mid[] = "/data/adb/aemu-overlay/orig/";
+                    u64 ol = g_rootlen + sizeof(mid) - 1 + slen(bk);
+                    if (ol < VM_HIDE_PATH) {
+                        char *o = g_hide_orig[g_hide_nent];
+                        memcpy(o, g_root, g_rootlen); memcpy(o + g_rootlen, mid, sizeof(mid) - 1);
+                        memcpy(o + g_rootlen + sizeof(mid) - 1, bk, slen(bk) + 1);
+                    }
+                }
+                g_hide_nent++;
+            }
+        }
+        *e = save;
+        p = save ? e + 1 : e;
+    }
+}
+
+static void vm_hide_refresh(void) {
+    if (++g_hide_calls < 128) return;
+    g_hide_calls = 0;
+    if (g_rootlen > 400) return;
+    char up[512], jp[512];
+    memcpy(up, g_root, g_rootlen); memcpy(up + g_rootlen, "/dev/.aemu-hideuids", 20);
+    memcpy(jp, g_root, g_rootlen); memcpy(jp + g_rootlen, "/data/adb/aemu-overlay/journal", 31);
+    struct vm_fver uv, jv;
+    vm_fver_get(up, &uv); vm_fver_get(jp, &jv);
+    if (vm_fver_same(&uv, &g_hide_uv) && vm_fver_same(&jv, &g_hide_jv)) return;
+    g_hide_uv = uv; g_hide_jv = jv;
+    vm_hide_reload(up, jp);
+}
+
+// this process reads the un-rooted view (see the section header)
+static int vm_hidden(void) {
+    if (!g_vm) return 0;
+    vm_hide_refresh();
+    for (int i = 0; i < g_hide_nuid; i++) if (g_hide_uids[i] == g_uid) return 1;
+    return 0;
+}
+
+// the places of Magisk itself, by guest path (see the section header)
+static int vm_hide_fixed(const char *p) {
+    if (!p || p[0] != '/') return 0;
+    if (vm_under(p, "/data/adb") || vm_under(p, "/debug_ramdisk")) return 1;
+    if (vm_under(p, "/data/data/com.topjohnwu.magisk") || vm_under(p, "/data/user/0/com.topjohnwu.magisk")) return 1;
+    if (pre(p, "/system/lib64/libzygisk.so")) return 1;
+    static const char *const dirs[2] = { "/system/bin/", "/system/xbin/" };
+    static const char *const names[4] = { "su", "magisk", "resetprop", "magiskpolicy" };
+    for (int d = 0; d < 2; d++) {
+        if (!pre(p, dirs[d])) continue;
+        const char *q = p + slen(dirs[d]);
+        for (int i = 0; i < 4; i++) {
+            if (seq(q, names[i])) return 1;
+            u64 l = slen(names[i]);
+            if (pre(q, names[i]) && seq(q + l, ".aemu-orig")) return 1;
+        }
+    }
+    return 0;
+}
+
+// 0 = not an overlay path, 1 = created by the overlay (ENOENT), 2 = replaced (read the backup in out)
+static int vm_hide_journal(const char *host, char *out, u64 cap) {
+    if (!host) return 0;
+    for (int i = 0; i < g_hide_nent; i++) {
+        const char *h = g_hide_host[i];
+        if (g_hide_pfx[i]) {
+            u64 l = slen(h);
+            if (pre(host, h) && (host[l] == '/' || !host[l])) {
+                if (!g_hide_orig[i][0]) return 1;
+                u64 ol = slen(g_hide_orig[i]), rl = slen(host + l);
+                if (ol + rl + 1 > cap) return 0;
+                memcpy(out, g_hide_orig[i], ol); memcpy(out + ol, host + l, rl + 1);
+                return 2;
+            }
+        } else if (seq(host, h)) {
+            if (!g_hide_orig[i][0]) return 1;
+            u64 ol = slen(g_hide_orig[i]);
+            if (ol + 1 > cap) return 0;
+            memcpy(out, g_hide_orig[i], ol + 1);
+            return 2;
+        }
+    }
+    return 0;
+}
+
+static int vm_contains(const char *hay, const char *needle) {
+    u64 nl = slen(needle);
+    for (const char *p = hay; *p; p++) { u64 i = 0; while (i < nl && p[i] == needle[i]) i++; if (i == nl) return 1; }
+    return 0;
 }
 
 // ------------------------------------------------------------------------------------------------ /proc/mounts
@@ -553,6 +752,7 @@ static long vm_mounts_open(int info) {
     if ((u64)m > (u64)-4096) return -1;
     char *b = (char *)m, *base = b + 32768;
     u64 o = 0, bl = 0;
+    int hide = vm_hidden();   // a listed app reads the un-mounted view: the image's own table only
     // the image's own table if it has one, else the plain minimum
     if (g_rootlen + 16 < 560) {
         char p[560];
@@ -565,12 +765,22 @@ static long vm_mounts_open(int info) {
         "sysfs /sys sysfs rw,relatime 0 0\n/dev/block/dm-0 /system ext4 ro,seclabel,relatime 0 0\n/dev/block/dm-1 /data ext4 rw,seclabel,nosuid,nodev,noatime 0 0\n");
     base[bl] = 0;
     if (!info) {
-        o = vm_put(b, o, 32000, base);
+        if (!hide) {
+            o = vm_put(b, o, 32000, base);
+        } else {
+            for (char *l = base; *l;) {
+                char *e = l; while (*e && *e != '\n') e++;
+                char c = *e; *e = 0;
+                if (!vm_contains(l, "debug_ramdisk") && !vm_contains(l, ".magisk")) { o = vm_put(b, o, 32000, l); o = vm_put(b, o, 32000, "\n"); }
+                *e = c; l = c ? e + 1 : e;
+            }
+        }
     } else {                                                 // "dev point type opts 0 0"  ->  "id parent maj:min / point opts - type dev opts"
         u64 id = 20;
         for (char *l = base; *l;) {
             char *e = l; while (*e && *e != '\n') e++;
             char c = *e; *e = 0;
+            if (hide && (vm_contains(l, "debug_ramdisk") || vm_contains(l, ".magisk"))) { *e = c; l = c ? e + 1 : e; continue; }
             char *f[5] = { 0, 0, 0, 0, 0 }; int nf = 0;
             for (char *q = l; *q && nf < 4;) { f[nf++] = q; while (*q && *q != ' ') q++; if (*q) *q++ = 0; }
             if (nf == 4) {
@@ -581,7 +791,7 @@ static long vm_mounts_open(int info) {
             *e = c; l = c ? e + 1 : e;
         }
     }
-    if (g_vmt) {
+    if (g_vmt && !hide) {
         for (int i = 0; i < VM_MAXREC; i++) {
             struct vm_rec *r = &g_vmt->r[i];
             if (!r->used || r->alias) continue;
@@ -614,6 +824,21 @@ static const char *vm_host(long *a, int i, int slot, char **pbp, int *err) {
     return xl((const char *)a[i], b, err);
 }
 
+// the per-app view applied to one path argument of a call: 0 = let the call through,
+// 1 = answer ENOENT, 2 = the call belongs on the journal backup path in [out] instead
+static int vm_hide_path(long *a, int idx, char **pbp, char *out, u64 cap) {
+    if (!vm_hidden()) return 0;
+    const char *raw = (const char *)a[idx];
+    if (!raw || raw[0] != '/') return 0;
+    char np[1104];
+    if (slen(raw) >= sizeof np || norm(raw, np, sizeof np)) return 0;
+    if (vm_hide_fixed(np)) return 1;
+    int err = 0;
+    const char *h = vm_host(a, idx, 0, pbp, &err);
+    if (!h) return 0;
+    return vm_hide_journal(h, out, cap);
+}
+
 static long vm_trap2(long nr, long *a, void *uc, char **pbp) {
     switch (nr) {
     case NR_mount: return vm_sys_mount(a, pbp);
@@ -630,6 +855,10 @@ static long vm_trap2(long nr, long *a, void *uc, char **pbp) {
         }
         return trap2_base(nr, a, uc, pbp);
     case NR_openat: {
+        char hb[VM_HIDE_PATH];
+        int ha = vm_hide_path(a, 1, pbp, hb, sizeof hb);
+        if (ha == 1) return -VMF_ENOENT;
+        if (ha == 2 && !(a[2] & 3)) return S4(NR_openat, AT_FDCWD, hb, a[2], a[3]);   // a replaced file reads as its stock backup; a write open keeps the overlay's file (the stock tree is read-only to the guest anyway)
         int info = 0;
         if (P(1) && g_vmt && __atomic_load_n(&g_vmt->live, __ATOMIC_RELAXED) && vm_is_mounts_path(P(1), &info)) {
             long r = vm_mounts_open(info);
@@ -648,6 +877,10 @@ static long vm_trap2(long nr, long *a, void *uc, char **pbp) {
         return r;
     }
     case NR_newfstatat: {
+        char hb[VM_HIDE_PATH];
+        int ha = vm_hide_path(a, 1, pbp, hb, sizeof hb);
+        if (ha == 1) return -VMF_ENOENT;
+        if (ha == 2) { struct kstat *st = (struct kstat *)a[2]; long r = S4(NR_newfstatat, AT_FDCWD, hb, st, a[3]); if (r == 0) fake_owner(st); return r; }
         long r = trap2_base(nr, a, uc, pbp);
         if (!P(1) || !P(1)[0] || (a[3] & 0x1000)) return r;
         struct kstat *st = (struct kstat *)a[2];
@@ -667,6 +900,10 @@ static long vm_trap2(long nr, long *a, void *uc, char **pbp) {
         return r;
     }
     case NR_statx: {
+        char hb[VM_HIDE_PATH];
+        int ha = vm_hide_path(a, 1, pbp, hb, sizeof hb);
+        if (ha == 1) return -VMF_ENOENT;
+        if (ha == 2) return S5(NR_statx, AT_FDCWD, hb, a[2], a[3], a[4]);
         long r = trap2_base(nr, a, uc, pbp);
         if (!P(1) || !P(1)[0] || !a[4] || (a[2] & 0x1000)) return r;
         u8 *sx = (u8 *)a[4];
@@ -691,11 +928,17 @@ static long vm_trap2(long nr, long *a, void *uc, char **pbp) {
         return r;
     }
     case NR_readlinkat: {
+        char hb[VM_HIDE_PATH];
+        if (vm_hide_path(a, 1, pbp, hb, sizeof hb) == 1) return -VMF_ENOENT;   // a Magisk link must not give its target away
         long r = trap2_base(nr, a, uc, pbp);
         if (r >= VM_DEVLEN + 6 && a[2] && pre((const char *)a[2], VM_DEV)) return -VMF_EINVAL;    // a device is not a link
         return r;
     }
     case NR_faccessat: {
+        char hb[VM_HIDE_PATH];
+        int ha = vm_hide_path(a, 1, pbp, hb, sizeof hb);
+        if (ha == 1) return -VMF_ENOENT;
+        if (ha == 2) return S4(NR_faccessat, AT_FDCWD, hb, a[2], a[3]);
         long r = trap2_base(nr, a, uc, pbp);
         if (r == -VMF_ENOENT && P(1) && P(1)[0]) {
             int err = 0; u32 t, maj, min, mode;

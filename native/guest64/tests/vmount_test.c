@@ -213,6 +213,37 @@ int main(void) {
     { struct kstat s; CHECK(T(NR_newfstatat, AT_FDCWD, (long)"/data/local/tmp/off000", (long)&s, 0, 0) == 0 && (s.st_mode & 07777) == 0); }
     g_vm = 1;
 
+    // PER-APP VIEWS: a listed uid reads the guest without Magisk; everyone else is untouched
+    mk("/system/bin"); mk("/system/lib"); mk("/data/adb"); mk("/data/adb/aemu-overlay"); mk("/data/adb/aemu-overlay/orig");
+    wr("/system/bin/su", "su\n"); wr("/data/adb/magisk.db", "db\n");
+    wr("/system/bin/tool", "module tool\n");                                  // a module file the overlay copied in
+    wr("/system/lib/libstock.so", "module\n"); wr("/data/adb/aemu-overlay/orig/1", "stock\n");   // a replaced stock file and its backup
+    wr("/data/adb/aemu-overlay/journal", "F\tsystem/bin/tool\nR\tsystem/lib/libstock.so\t1\n");
+    wr("/dev/.aemu-hideuids", "10177\n");
+    for (int i = 0; i < 200; i++) (void)vm_hidden();   // the list is written before boot in production (the first check loads it); here it appeared mid-run, past the refresh throttle
+    g_uid = 0;                                                                                     // root: the full view
+    CHECK(rd("/system/bin/su", b, sizeof b) > 0 && rd("/system/bin/tool", b, sizeof b) > 0);
+    CHECK(rd("/system/lib/libstock.so", b, sizeof b) > 0 && !strcmp(b, "module\n"));
+    g_uid = 10177;                                                                                 // the listed app
+    CHECK(T(NR_openat, AT_FDCWD, (long)"/system/bin/su", 0, 0, 0) == -2);                          // Magisk's own places: ENOENT
+    { struct kstat s; CHECK(T(NR_newfstatat, AT_FDCWD, (long)"/system/bin/su", (long)&s, 0, 0) == -2); }
+    CHECK(T(NR_faccessat, AT_FDCWD, (long)"/data/adb/magisk.db", 0, 0, 0) == -2);
+    CHECK(T(NR_openat, AT_FDCWD, (long)"/system/bin/tool", 0, 0, 0) == -2);                        // overlay-created: ENOENT
+    { struct kstat s; CHECK(T(NR_newfstatat, AT_FDCWD, (long)"/system/bin/tool", (long)&s, 0, 0) == -2); }
+    CHECK(rd("/system/lib/libstock.so", b, sizeof b) > 0 && !strcmp(b, "stock\n"));                // overlay-replaced: the stock backup
+    { char big[8192]; int n = rd("/proc/self/mounts", big, sizeof big); CHECK(n >= 0 && !strstr(big, "cacerts")); }   // mounts: no vmount entries
+    g_uid = 10178;                                                                                 // not listed: untouched even with a list present
+    CHECK(rd("/system/bin/su", b, sizeof b) > 0 && rd("/system/bin/tool", b, sizeof b) > 0);
+    CHECK(rd("/system/lib/libstock.so", b, sizeof b) > 0 && !strcmp(b, "module\n"));
+    { char buf[2048]; snprintf(b, sizeof b, "%.200s/dev", root); long fdd = open(b, O_RDONLY | O_DIRECTORY); long n = T(61, fdd, (long)buf, sizeof buf, 0, 0);
+      int ours = 0; for (long o = 0; o < n; o += *(u16 *)(buf + o + 16)) if (!strncmp(buf + o + 19, ".aemu-", 6)) ours++;
+      CHECK(ours == 0); close((int)fdd); }                                                         // our bookkeeping names never list
+    { char p[600]; snprintf(p, sizeof p, "%s/dev/.aemu-hideuids", root); unlink(p); }              // the list goes away: the view is the stock one again
+    g_uid = 10177;
+    for (int i = 0; i < 200; i++) (void)vm_hidden();
+    CHECK(rd("/system/bin/su", b, sizeof b) > 0);
+    g_uid = 0;
+
     printf(fails ? "%d FAILED\n" : "all vmount tests passed\n", fails);
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf %s", root); if (system(cmd)) {}
     return fails != 0;
