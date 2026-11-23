@@ -7,10 +7,13 @@ import java.io.File
  * Wi-Fi and Bluetooth services. It is the in-guest half of two features:
  *
  *  - the per-app views (the hide list): the mount layer can only filter by uid, and only the guest's own
- *    package manager knows which uid a package has. The agent resolves VmSettings.hiddenApps through it and
- *    keeps <root>/dev/.aemu-hideuids current; until it is up, [write] seeds the same file from the image's
- *    packages.xml, which is the package manager's own database (text form; Android 12+ writes a binary ABX
- *    form we do not parse — then only the agent's answer counts, and it comes as soon as it connects).
+ *    package manager knows which uid a package has. The list itself is the guest's own file ([LIST_FILE]),
+ *    owned and written by the Root Manager app inside the guest through the agent; the agent resolves it
+ *    to uids and keeps <root>/dev/.aemu-hideuids current. The host only ever reads the list: [write]
+ *    seeds the uid set from it (through the image's packages.xml) for the window before the agent is up,
+ *    and the boot path hands it to the Magisk daemon as its denylist. packages.xml is the package
+ *    manager's own database (text form; Android 12+ writes a binary ABX form we do not parse — then only
+ *    the agent's answer counts, and it comes as soon as it connects).
  *  - the APK import: the host streams the file over the agent socket and the agent writes it into the
  *    guest's own external storage (see AgentBridge.putApk), where the package installer can read it. The
  *    old staging wrote the file into the tree from the host, into a view of the sdcard the guest does not
@@ -20,8 +23,15 @@ import java.io.File
  * starts, so the guest is exactly what it was before this feature existed.
  */
 object AgentSupport {
-    /** settings + the hide list, read by the agent at start and on every SYNC */
+    /** the agent's settings (the enable flag; the hide list is [LIST_FILE], not in here any more) */
     const val FILE = "data/system/aemu-agent.properties"
+    /**
+     * The hide list itself: one package per line, inside the guest. Written only by the agent (for the
+     * Root Manager app); the host reads it in [readHideList] and never writes it — the single exception
+     * is the one-time migration in [write], which copies the legacy settings list over on the first boot
+     * that finds no guest file, so a list made with the old host-side picker is not silently dropped.
+     */
+    const val LIST_FILE = "data/system/aemu-hideapps.txt"
     /** the delivered service jar (TreeFixer) */
     const val JAR_PATH = "system/framework/aemu-agent.jar"
     const val JAR_NAME = "aemu-agent.jar"
@@ -48,23 +58,59 @@ object AgentSupport {
         supported(engine, api, recovery) && File(root, JAR_PATH).isFile
 
     /**
+     * The guest's hide list, or null when the guest has no list file yet (which is not the same as an
+     * empty list: an empty file is a list the manager set to nothing, a missing file is one nobody set —
+     * the migration in [write] keys on the difference). The Magisk app is filtered out wherever the list
+     * is consumed; it is refused at write time in the guest as well.
+     */
+    fun readHideList(root: File): List<String>? {
+        val f = File(root, LIST_FILE)
+        if (!f.isFile) return null
+        return runCatching {
+            f.readLines().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        }.getOrDefault(emptyList())
+    }
+
+    /**
      * Boot preparation: the agent's settings file, and the fallback uid set for the window before the agent
      * connects. An empty list (or the agent off) removes the uid file: no reader is hidden then, which is
-     * the baseline the mount layer must reproduce exactly.
+     * the baseline the mount layer must reproduce exactly. The list read here is the guest's own file; the
+     * one write of it the host ever does is the legacy migration below.
      */
     fun write(root: File, s: VmSettings, log: (String) -> Unit) {
-        // the manager itself is never hidden from: it is the one place root is managed from
-        val hidden = (if (s.agent) s.hiddenApps else emptyList()).filter { it != MagiskCore.PACKAGE }
         runCatching {
             val f = File(root, FILE).apply { parentFile?.mkdirs() }
             f.writeText(
                 "# the guest agent's settings (host-written at every boot)\n" +
-                    "enabled=${s.agent}\n" +
-                    "hidden=${hidden.joinToString(",")}\n"
+                    "enabled=${s.agent}\n"
             )
         }.onFailure { log("agent: could not write its settings: ${it.message}") }
         val uidFile = File(root, HIDEUIDS)
-        if (hidden.isEmpty()) {
+        if (!s.agent) {
+            if (uidFile.isFile && uidFile.delete()) log("agent: off, the uid set is removed (no reader is hidden)")
+            return
+        }
+        var hidden = readHideList(root)
+        if (hidden == null && s.hiddenApps.isNotEmpty()) {
+            // one-time migration: the list still lives in the legacy settings field (the host-side picker
+            // the Root Manager replaces). Copy it into the guest once; from then on the file is the only
+            // source and this branch never runs again for this image.
+            val migrated = s.hiddenApps.filter { it != MagiskCore.PACKAGE && it != APP_PACKAGE }.distinct()
+            val done = runCatching {
+                val f = File(root, LIST_FILE).apply { parentFile?.mkdirs() }
+                f.writeText(migrated.joinToString("\n", postfix = if (migrated.isEmpty()) "" else "\n"))
+                true
+            }.getOrDefault(false)
+            if (done) {
+                log("agent: the hide list moved into the guest (${migrated.size} package(s) from the old settings); the Root Manager app manages it now")
+                hidden = migrated
+            } else {
+                log("agent: could not move the hide list into the guest; the agent starts with an empty one")
+            }
+        }
+        // the places root is managed from are never hidden from (the agent refuses them at write time too)
+        val list = (hidden ?: emptyList()).filter { it != MagiskCore.PACKAGE && it != APP_PACKAGE }
+        if (list.isEmpty()) {
             if (uidFile.isFile && uidFile.delete()) log("agent: hide list empty, the uid set is removed (no reader is hidden)")
             return
         }
@@ -73,12 +119,12 @@ object AgentSupport {
             log("agent: packages.xml is not in text form; the uid set waits for the agent's own answer")
             return
         }
-        val uids = hidden.mapNotNull { pkgs[it] }.distinct().sorted()
+        val uids = list.mapNotNull { pkgs[it] }.distinct().sorted()
         runCatching {
             uidFile.parentFile?.mkdirs()
             uidFile.writeText(uids.joinToString("\n", postfix = "\n"))
-            log("agent: hide list seeded from packages.xml: ${uids.size} of ${hidden.size} package(s) resolved" +
-                if (uids.size < hidden.size) "; the rest is the agent's to resolve" else "")
+            log("agent: hide list seeded from packages.xml: ${uids.size} of ${list.size} package(s) resolved" +
+                if (uids.size < list.size) "; the rest is the agent's to resolve" else "")
         }.onFailure { log("agent: could not seed the uid set: ${it.message}") }
     }
 
@@ -113,7 +159,4 @@ object AgentSupport {
         }
         return out
     }
-
-    /** the image's installed packages for the settings picker; null when packages.xml is not parseable */
-    fun installedPackages(root: File): List<String>? = parsePackagesXml(root)?.keys?.sorted()
 }

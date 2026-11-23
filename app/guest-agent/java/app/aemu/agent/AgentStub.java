@@ -1,5 +1,7 @@
 package app.aemu.agent;
 
+import android.net.Credentials;
+import android.net.LocalServerSocket;
 import android.net.LocalSocket;
 import android.net.LocalSocketAddress;
 import android.os.Build;
@@ -8,39 +10,70 @@ import android.os.IBinder;
 import android.os.Looper;
 
 import java.io.BufferedInputStream;
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
  * The guest agent (started by the host like the Wi-Fi service; see AgentSupport on the host side).
  *
- * Two jobs, both needing a process inside the guest:
- *  - the hide list: the host names packages, only the guest's package manager knows their uids. The
- *    resolved set is kept in /dev/.aemu-hideuids, which is where the mount layer reads it from; it is
- *    re-resolved on start, on the host's SYNC and every minute (installs change uids).
+ * Three jobs, all needing a process inside the guest:
+ *  - the hide list: only the guest's package manager knows which uid a package has. The resolved set is
+ *    kept in /dev/.aemu-hideuids, which is where the mount layer reads it from; it is re-resolved on
+ *    start, on the host's SYNC and every minute (installs change uids). The list itself lives in the
+ *    guest — /data/system/aemu-hideapps.txt, one package per line — and is owned by the Root Manager
+ *    app (below): the host only reads it at boot (to seed the uid set before the agent is up and to
+ *    hand it to the Magisk daemon as its denylist), it never writes it.
  *  - the import inbox: the host streams an APK over the socket and the agent writes it into the guest's
  *    own external storage (AEmuImport/), a file born in the guest's view of the sdcard — the host writing
  *    into the tree from outside was the step that made the old import path fail.
+ *  - the Root Manager's server end: the manager app (package app.aemu.agent, the same package the inbox
+ *    app ships under) connects to the abstract socket "aemu-agent-mgr" and asks about the guest's root
+ *    state (STATUS), reads and changes the hide list (LIST / SETHIDE) and asks what a listed app would
+ *    see (SELFTEST). Every answer comes from surfaces that exist inside the guest — files the agent can
+ *    read, the package manager, the overlay journal, the mount layer's rules — and a cell the agent
+ *    cannot answer says so instead of guessing. Callers are admitted by peer uid: root, system, or the
+ *    manager app itself; the Magisk app and the manager itself can never be put on the hide list.
  *
- * Protocol (line-based, PUT payload raw): HELLO/UIDS/LOG to the host, SYNC and PUT from it, OK/ERR back.
+ * Host protocol (line-based, PUT payload raw): HELLO/UIDS/LOG/DENY to the host, SYNC, PUT and the
+ * DENIED/DENYDEFER/DENYERR answers from it, OK/ERR back.
  * Usage: app_process -Djava.class.path=/system/framework/aemu-agent.jar /system/bin app.aemu.agent.AgentStub
  */
 public final class AgentStub {
     private static final String SETTINGS = "/data/system/aemu-agent.properties";
     private static final String SOCKET = "/dev/socket/aemu-agent";
     private static final String HIDEUIDS = "/dev/.aemu-hideuids";
+    /** the hide list itself: guest-owned, written only through the manager protocol (atomically) */
+    private static final String LIST_FILE = "/data/system/aemu-hideapps.txt";
     private static final String INBOX = "AEmuImport";
+    /** the manager app's channel (abstract namespace: no file, admission is the peer-uid check) */
+    private static final String MGR_SOCKET = "aemu-agent-mgr";
+    private static final String OWN_PACKAGE = "app.aemu.agent";
+    private static final String MAGISK_PACKAGE = "com.topjohnwu.magisk";
+    private static final String MAGISK_STATE = "/data/adb/aemu-magisk.properties";
+    private static final String MAGISK_BIN = "/data/adb/magisk/magisk";
+    private static final String MODULES = "/data/adb/modules";
+    private static final String MODULES_UPDATE = "/data/adb/modules_update";
+    private static final String JOURNAL = "/data/adb/aemu-overlay/journal";
+
+    /** the host link's sending side, while connected: SETHIDE's DENY goes out over it */
+    private static volatile OutputStream hostOut;
+    private static volatile Object hostLock;
+    /** what the host last answered to a DENY, per package: "applied on", "deferred off", "error: ..." */
+    private static final ConcurrentHashMap<String, String> denyState = new ConcurrentHashMap<String, String>();
 
     private AgentStub() { }
 
@@ -77,7 +110,12 @@ public final class AgentStub {
             System.out.flush();
             return;
         }
-        syncUids(p, null);   // once before the link: the mount layer reads the file, not the socket
+        syncUids(null, null);   // once before the link: the mount layer reads the file, not the socket
+        Thread mgr = new Thread("aemu-agent-mgr") {
+            @Override public void run() { serveManager(); }
+        };
+        mgr.setDaemon(true);
+        mgr.start();
         long backoff = 1000;
         while (true) {
             LocalSocket s = null;
@@ -85,11 +123,13 @@ public final class AgentStub {
                 s = new LocalSocket();
                 s.connect(new LocalSocketAddress(SOCKET, LocalSocketAddress.Namespace.FILESYSTEM));
                 backoff = 1000;
-                serve(s, p);
+                serve(s);
             } catch (Throwable e) {
                 System.out.println("aemu-agent: link: " + e);
                 System.out.flush();
             } finally {
+                hostOut = null;
+                hostLock = null;
                 if (s != null) try { s.close(); } catch (Throwable ignored) { }
             }
             Thread.sleep(backoff);
@@ -97,22 +137,21 @@ public final class AgentStub {
         }
     }
 
-    private static void serve(LocalSocket s, Properties first) throws Exception {
+    private static void serve(LocalSocket s) throws Exception {
         final OutputStream out = s.getOutputStream();
         final InputStream in = new BufferedInputStream(s.getInputStream());
-        final Properties[] current = { first };
         final Object sendLock = new Object();
+        hostOut = out;
+        hostLock = sendLock;
         send(out, sendLock, "HELLO api=" + Build.VERSION.SDK_INT);
-        int n = syncUids(current[0], out, sendLock);
+        int n = syncUids(out, sendLock);
         if (n >= 0) send(out, sendLock, "UIDS " + n);
         Thread ticker = new Thread("aemu-agent-sync") {
             @Override public void run() {
                 while (true) {
                     try { Thread.sleep(60000); } catch (InterruptedException e) { return; }
-                    Properties p = loadSettings();
-                    if (p != null) current[0] = p;
                     try {
-                        int c = syncUids(current[0], null);
+                        int c = syncUids(null, null);
                         send(out, sendLock, "UIDS " + c);
                     } catch (Throwable t) {
                         return;   // the link is gone; the serve loop notices on its own
@@ -125,16 +164,26 @@ public final class AgentStub {
         String line;
         while ((line = readLine(in)) != null) {
             if (line.equals("SYNC")) {
-                Properties p = loadSettings();
-                if (p != null) current[0] = p;
-                int c = syncUids(current[0], null);
+                int c = syncUids(null, null);
                 send(out, sendLock, "UIDS " + c);
             } else if (line.startsWith("PUT ")) {
                 handlePut(line, in, out, sendLock);
+            } else if (line.startsWith("DENIED ") || line.startsWith("DENYDEFER ") || line.startsWith("DENYERR ")) {
+                recordDeny(line);
             } else {
                 send(out, sendLock, "ERR unknown command");
             }
         }
+    }
+
+    private static void recordDeny(String line) {
+        // DENIED <pkg> <on|off> / DENYDEFER <pkg> <on|off> / DENYERR <pkg> <on|off> <message...>
+        String[] parts = line.split(" ", 4);
+        if (parts.length < 3) return;
+        String state = parts[0].equals("DENIED") ? "applied " + parts[2]
+            : parts[0].equals("DENYDEFER") ? "deferred " + parts[2]
+            : "error: " + (parts.length > 3 ? parts[3] : "the host refused");
+        denyState.put(parts[1], state);
     }
 
     private static void send(OutputStream out, Object lock, String line) throws IOException {
@@ -198,15 +247,52 @@ public final class AgentStub {
 
     // ---- the hide list --------------------------------------------------------------------------------
 
+    /** The list is the guest's own file now; the host's settings file no longer carries it. */
+    private static List<String> hiddenList() {
+        List<String> out = new ArrayList<String>();
+        File f = new File(LIST_FILE);
+        if (!f.isFile()) return out;
+        BufferedReader r = null;
+        try {
+            r = new BufferedReader(new InputStreamReader(new FileInputStream(f), "UTF-8"));
+            String line;
+            while ((line = r.readLine()) != null) {
+                String t = line.trim();
+                if (!t.isEmpty() && !out.contains(t)) out.add(t);
+            }
+        } catch (Throwable t) {
+            System.out.println("aemu-agent: reading the hide list failed: " + t);
+            System.out.flush();
+        } finally {
+            if (r != null) try { r.close(); } catch (Throwable ignored) { }
+        }
+        return out;
+    }
+
+    /** Persists the list (an empty list stays an empty file: "set to nothing" differs from "never set"). */
+    private static void saveHiddenList(List<String> list) throws IOException {
+        File dst = new File(LIST_FILE);
+        File tmp = new File(LIST_FILE + ".tmp");
+        FileOutputStream fos = new FileOutputStream(tmp);
+        try {
+            StringBuilder sb = new StringBuilder();
+            for (String pkg : list) sb.append(pkg).append('\n');
+            fos.write(sb.toString().getBytes("UTF-8"));
+            fos.getFD().sync();
+        } finally {
+            fos.close();
+        }
+        if (!tmp.renameTo(dst)) { tmp.delete(); throw new IOException("rename to " + dst + " failed"); }
+    }
+
     /**
-     * Resolves the settings' package list to uids and rewrites /dev/.aemu-hideuids (atomically, through a
-     * rename). An empty list removes the file: no reader is hidden then. Returns the number of uids
-     * written, or -1 when the settings are unusable. Unresolved packages are reported (the host's log via
-     * [hostOut] when given, stdout otherwise) — a name the package manager does not know is a fact to
-     * surface, not to paper over.
+     * Resolves the hide list to uids and rewrites /dev/.aemu-hideuids (atomically, through a rename).
+     * An empty list removes the file: no reader is hidden then. Returns the number of uids written, or
+     * -1 when writing failed. Unresolved packages are reported (the host's log via [hostOut] when given,
+     * stdout otherwise) — a name the package manager does not know is a fact to surface, not to hide.
      */
-    private static int syncUids(Properties p, OutputStream hostOut, Object lock) {
-        List<String> hidden = hiddenList(p);
+    private static int syncUids(OutputStream hostOut, Object lock) {
+        List<String> hidden = hiddenList();
         File dst = new File(HIDEUIDS);
         if (hidden.isEmpty()) {
             if (dst.isFile()) dst.delete();
@@ -247,22 +333,6 @@ public final class AgentStub {
             return -1;
         }
         return uids.size();
-    }
-
-    private static int syncUids(Properties p, Object unused) {
-        return syncUids(p, null, null);
-    }
-
-    private static List<String> hiddenList(Properties p) {
-        List<String> out = new ArrayList<String>();
-        String csv = p == null ? null : p.getProperty("hidden", "");
-        if (csv != null) {
-            for (String s : csv.split(",")) {
-                String t = s.trim();
-                if (!t.isEmpty() && !out.contains(t)) out.add(t);
-            }
-        }
-        return out;
     }
 
     private static String join(List<String> xs) {
@@ -320,5 +390,313 @@ public final class AgentStub {
         } catch (Throwable t) {
             return -1;
         }
+    }
+
+    // ---- the Root Manager's server end ------------------------------------------------------------------
+
+    /**
+     * Serves the manager app on the abstract socket, one client at a time. Admission is by peer uid:
+     * root (0), system (1000) or the manager app's own uid — anything else is dropped before it can ask.
+     * The Magisk app and the manager itself are refused as hide-list entries here as well as in the
+     * host's boot path: the places root is managed from always see the full guest.
+     */
+    private static void serveManager() {
+        LocalServerSocket server;
+        try {
+            server = new LocalServerSocket(MGR_SOCKET);
+        } catch (Throwable t) {
+            System.out.println("aemu-agent: the manager socket failed: " + t);
+            System.out.flush();
+            return;
+        }
+        while (true) {
+            LocalSocket c = null;
+            try {
+                c = server.accept();
+                Credentials cred = c.getPeerCredentials();
+                int uid = cred == null ? -1 : cred.getUid();
+                int mgrUid = pmUid(OWN_PACKAGE);
+                if (uid != 0 && uid != 1000 && (mgrUid < 0 || uid != mgrUid)) {
+                    System.out.println("aemu-agent: manager socket: dropped a caller with uid " + uid);
+                    System.out.flush();
+                    c.close();
+                    c = null;
+                    continue;
+                }
+                handleManager(c);
+            } catch (Throwable t) {
+                System.out.println("aemu-agent: manager socket: " + t);
+                System.out.flush();
+            } finally {
+                if (c != null) try { c.close(); } catch (Throwable ignored) { }
+            }
+        }
+    }
+
+    private static void handleManager(LocalSocket c) throws IOException {
+        InputStream in = new BufferedInputStream(c.getInputStream());
+        OutputStream out = c.getOutputStream();
+        Object lock = new Object();
+        String line;
+        while ((line = readLine(in)) != null) {
+            if (line.equals("STATUS")) {
+                for (String l : status()) send(out, lock, l);
+                send(out, lock, "END");
+            } else if (line.equals("LIST")) {
+                for (String pkg : hiddenList()) send(out, lock, "pkg " + pkg);
+                send(out, lock, "END");
+            } else if (line.startsWith("SETHIDE ")) {
+                send(out, lock, setHide(line));
+            } else if (line.startsWith("SELFTEST ")) {
+                for (String l : selfTest(line.substring(9).trim())) send(out, lock, l);
+                send(out, lock, "END");
+            } else {
+                send(out, lock, "ERR unknown command");
+            }
+        }
+    }
+
+    /**
+     * SETHIDE <pkg> <1|0>: the guest-side write path of the hide list. The list file is updated first
+     * (it is the single source: the next boot's seed and denylist read it), then the uid set the mount
+     * layer filters by, then the running daemon's denylist through the host link — when the link is
+     * down the answer says so, and the boot path applies the list instead. Nothing here pretends a part
+     * it could not do.
+     */
+    private static String setHide(String line) {
+        String[] parts = line.split(" ");
+        if (parts.length != 3) return "ERR usage: SETHIDE <package> <1|0>";
+        String pkg = parts[1];
+        boolean on = parts[2].equals("1");
+        if (!pkg.matches("[A-Za-z0-9._]+")) return "ERR not a package name: " + pkg;
+        if (pkg.equals(MAGISK_PACKAGE)) return "ERR the Magisk app always sees the full guest";
+        if (pkg.equals(OWN_PACKAGE)) return "ERR the manager always sees the full guest";
+        synchronized (AgentStub.class) {
+            List<String> list = hiddenList();
+            boolean has = list.contains(pkg);
+            if (on && !has) list.add(pkg);
+            if (!on && has) list.remove(pkg);
+            try {
+                saveHiddenList(list);
+            } catch (Throwable t) {
+                return "ERR the list could not be written: " + t.getMessage();
+            }
+            int n = syncUids(null, null);
+            String deny;
+            OutputStream ho = hostOut;
+            Object hl = hostLock;
+            if (ho != null && hl != null) {
+                try {
+                    send(ho, hl, "DENY " + pkg + (on ? " on" : " off"));
+                    deny = "sent";
+                } catch (Throwable t) {
+                    deny = "failed";
+                }
+            } else {
+                deny = "offline";
+            }
+            return "OK hideuids=" + n + " denylist=" + deny;
+        }
+    }
+
+    // ---- discovery (STATUS) ------------------------------------------------------------------------------
+
+    /**
+     * The guest's root state, every cell from a surface inside the guest: Magisk's own state file (the
+     * host's installer wrote it into /data/adb), the binaries on disk, the package manager, the module
+     * directories and their prop files, the overlay journal, the native-bridge property the daemon sets
+     * for Zygisk. There is no cell for "the daemon is alive": nothing in here can ask it without
+     * executing it, so the report does not claim one.
+     */
+    private static List<String> status() {
+        List<String> out = new ArrayList<String>();
+        out.add("agent.api=" + Build.VERSION.SDK_INT);
+        Properties st = new Properties();
+        boolean stateFile = false;
+        File sf = new File(MAGISK_STATE);
+        if (sf.isFile()) {
+            InputStream in = null;
+            try {
+                in = new FileInputStream(sf);
+                st.load(in);
+                stateFile = true;
+            } catch (Throwable ignored) { } finally {
+                if (in != null) try { in.close(); } catch (Throwable ignored) { }
+            }
+        }
+        boolean bin = new File(MAGISK_BIN).isFile();
+        out.add("magisk.installed=" + (bin && stateFile ? "1" : "0"));
+        if (stateFile) {
+            out.add("magisk.version=" + st.getProperty("version", "?"));
+            out.add("magisk.code=" + st.getProperty("code", "?"));
+        }
+        out.add("magisk.bin=" + (bin ? "1" : "0"));
+        out.add("magisk.manager=" + (pmUid(MAGISK_PACKAGE) >= 0 ? "1" : "0"));
+        for (String path : new String[]{"/system/bin/su", "/system/xbin/su", "/system/bin/magisk", "/system/bin/resetprop", "/system/bin/magiskpolicy"}) {
+            File f = new File(path);
+            out.add("path." + path + "=" + (f.exists() ? "1" : "0"));
+            if (f.exists()) out.add("path." + path + ".ours=" + (new File(path + ".aemu-orig").exists() ? "1" : "0"));
+        }
+        String bridge = systemProperty("ro.dalvik.vm.native.bridge");
+        out.add("zygisk.bridge=" + (bridge == null || bridge.isEmpty() ? "-" : bridge));
+        out.add("zygisk.on=" + (bridge != null && bridge.startsWith("libzygisk.so") ? "1" : "0"));
+        // modules: /data/adb/modules/<id>/module.prop (+ disable/remove flags), updates beside them
+        File mods = new File(MODULES);
+        File[] dirs = mods.isDirectory() ? mods.listFiles() : null;
+        int count = 0;
+        if (dirs != null) {
+            java.util.Arrays.sort(dirs);
+            for (File d : dirs) {
+                if (!d.isDirectory()) continue;
+                count++;
+                Properties mp = new Properties();
+                File pf = new File(d, "module.prop");
+                if (pf.isFile()) {
+                    InputStream in = null;
+                    try {
+                        in = new FileInputStream(pf);
+                        mp.load(in);
+                    } catch (Throwable ignored) { } finally {
+                        if (in != null) try { in.close(); } catch (Throwable ignored) { }
+                    }
+                }
+                String id = d.getName();
+                out.add("module." + id + ".name=" + mp.getProperty("name", id));
+                out.add("module." + id + ".version=" + mp.getProperty("version", "?"));
+                out.add("module." + id + ".disabled=" + (new File(d, "disable").exists() ? "1" : "0"));
+                out.add("module." + id + ".remove=" + (new File(d, "remove").exists() ? "1" : "0"));
+                out.add("module." + id + ".update=" + (new File(MODULES_UPDATE, id).isDirectory() ? "1" : "0"));
+            }
+        }
+        out.add("modules.count=" + count);
+        // /data/adb at a glance: what is in there, not what is in the files
+        File adb = new File("/data/adb");
+        File[] entries = adb.isDirectory() ? adb.listFiles() : null;
+        out.add("adb.entries=" + (entries == null ? "0" : String.valueOf(entries.length)));
+        long[] bytes = { 0 };
+        int[] budget = { 100000 };
+        if (entries != null) for (File e : entries) addBytes(e, bytes, budget);
+        out.add("adb.bytes=" + bytes[0]);
+        // the overlay journal, by kind (F/D new, R/P replaced): what the mount layer would filter
+        int[] kinds = journalKinds();
+        out.add("journal.present=" + (kinds == null ? "0" : "1"));
+        if (kinds != null) {
+            out.add("journal.f=" + kinds[0]);
+            out.add("journal.d=" + kinds[1]);
+            out.add("journal.r=" + kinds[2]);
+            out.add("journal.p=" + kinds[3]);
+        }
+        out.add("hideapps.count=" + hiddenList().size());
+        List<Integer> uids = hideUids();
+        out.add("hideuids.present=" + (uids == null ? "0" : "1"));
+        if (uids != null) out.add("hideuids.count=" + uids.size());
+        return out;
+    }
+
+    private static void addBytes(File f, long[] bytes, int[] budget) {
+        if (budget[0]-- <= 0) return;
+        if (f.isFile()) { bytes[0] += f.length(); return; }
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) addBytes(k, bytes, budget);
+    }
+
+    /** journal kind counts [F, D, R, P], or null when there is no journal */
+    private static int[] journalKinds() {
+        File j = new File(JOURNAL);
+        if (!j.isFile()) return null;
+        int[] kinds = { 0, 0, 0, 0 };
+        BufferedReader r = null;
+        try {
+            r = new BufferedReader(new InputStreamReader(new FileInputStream(j), "UTF-8"));
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.startsWith("F\t")) kinds[0]++;
+                else if (line.startsWith("D\t")) kinds[1]++;
+                else if (line.startsWith("R\t")) kinds[2]++;
+                else if (line.startsWith("P\t")) kinds[3]++;
+            }
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (r != null) try { r.close(); } catch (Throwable ignored) { }
+        }
+        return kinds;
+    }
+
+    private static List<Integer> hideUids() {
+        File f = new File(HIDEUIDS);
+        if (!f.isFile()) return null;
+        List<Integer> out = new ArrayList<Integer>();
+        BufferedReader r = null;
+        try {
+            r = new BufferedReader(new InputStreamReader(new FileInputStream(f), "UTF-8"));
+            String line;
+            while ((line = r.readLine()) != null) {
+                try { out.add(Integer.valueOf(line.trim())); } catch (Throwable ignored) { }
+            }
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (r != null) try { r.close(); } catch (Throwable ignored) { }
+        }
+        return out;
+    }
+
+    private static String systemProperty(String key) {
+        try {
+            Method m = Class.forName("android.os.SystemProperties").getMethod("get", String.class);
+            Object r = m.invoke(null, key);
+            return r == null ? null : r.toString();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    // ---- the self test (SELFTEST) -------------------------------------------------------------------------
+
+    /**
+     * What a listed app would see, cell by cell, each cell labelled with where its answer comes from:
+     * "measured" (the agent read the layer's own files just now), "journal" (counted from the overlay
+     * journal), "rule" (the mount layer's fixed behaviour in vmount.h — the agent cannot read the guest
+     * through another uid's eyes, so this cell is the rule, not a probe) and "daemon" (the host's answer
+     * to the denylist request). A cell with no surface says "unproven" instead of borrowing confidence.
+     */
+    private static List<String> selfTest(String pkg) {
+        List<String> out = new ArrayList<String>();
+        if (pkg.isEmpty() || !pkg.matches("[A-Za-z0-9._]+")) {
+            out.add("ERR not a package name: " + pkg);
+            return out;
+        }
+        int uid = pmUid(pkg);
+        if (uid < 0) uid = xmlUid(pkg);
+        if (uid < 0) {
+            out.add("ERR the package manager does not know " + pkg);
+            return out;
+        }
+        out.add("uid=" + uid);
+        boolean listed = hiddenList().contains(pkg);
+        out.add("listed=" + (listed ? "1" : "0"));
+        List<Integer> uids = hideUids();
+        boolean inSet = uids != null && uids.contains(Integer.valueOf(uid));
+        out.add("hideuids.contains=" + (inSet ? "1" : "0"));
+        if (!listed) {
+            out.add("cell summary|not listed: this app sees the full guest|nothing is filtered for it|measured");
+            return out;
+        }
+        boolean su = new File("/system/bin/su").exists() || new File("/system/xbin/su").exists();
+        out.add("cell su paths|now: " + (su ? "present" : "absent") + "|listed view: not there (ENOENT)|rule: the mount layer's fixed set in vmount.h");
+        out.add("cell /data/adb|now: " + (new File("/data/adb").isDirectory() ? "present" : "absent") + "|listed view: not there (ENOENT)|rule: the mount layer's fixed set in vmount.h");
+        int[] kinds = journalKinds();
+        if (kinds == null) {
+            out.add("cell module files|now: no overlay journal|listed view: nothing to filter|measured: no journal file");
+        } else {
+            out.add("cell module files (new)|journal entries: " + (kinds[0] + kinds[1]) + "|listed view: not there (ENOENT)|journal: counted from the overlay journal");
+            out.add("cell module files (replaced)|journal entries: " + (kinds[2] + kinds[3]) + "|listed view: the original file, from the journal's backup|journal: counted from the overlay journal");
+        }
+        out.add("cell /proc/mounts|now: the base table plus the mount layer's entries|listed view: the base table only|rule: the mount layer serves the base table to listed uids — not probed, the agent has no second pair of eyes");
+        String deny = denyState.get(pkg);
+        out.add("cell zygisk (denylist)|daemon state: " + (deny == null ? "no answer recorded this boot" : deny) + "|listed view: zygisk stays out when the daemon applied it|daemon: the host's answer to the DENY request" + (deny == null ? " — unproven" : ""));
+        if (!inSet) out.add("cell warning|the uid is not in the uid set: the mount layer is not filtering this app right now|fix: toggle it off and on, or reboot|measured: /dev/.aemu-hideuids");
+        return out;
     }
 }

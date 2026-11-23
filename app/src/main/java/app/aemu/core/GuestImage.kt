@@ -117,7 +117,12 @@ data class VmSettings(
     val magisk: Boolean = false,
     /** the guest agent (identity sync for the per-app views, the APK import inbox): a guest service the host starts at boot, see AgentSupport; applies at the next full VM boot */
     val agent: Boolean = false,
-    /** packages that read the guest without root in it (the per-app views, see AgentSupport): package names, resolved to uids by the agent */
+    /**
+     * Legacy: the hide list of the per-app views, back when the host's settings page owned it. The list
+     * itself lives in the guest now (AgentSupport.LIST_FILE, managed by the Root Manager app in the
+     * guest); this field is kept only as the one-time migration source AgentSupport.write copies into
+     * the guest on the first boot after the move. No UI reads or writes it any more.
+     */
     val hiddenApps: List<String> = emptyList(),
 ) {
     fun toJson(): JSONObject = JSONObject()

@@ -45,7 +45,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     private val bluetoothSupported get() = engine == Engine.KK && img.api in 9..25 && !recoveryMode
     private val bluetooth = BluetoothBridge(ctx, paths, { settings.bluetooth && bluetoothSupported }, ::log)
     private val agentSupported get() = AgentSupport.offered(paths.root, engine, img.api, recoveryMode)
-    private val agent = AgentBridge(paths, { settings.agent && AgentSupport.supported(engine, img.api, recoveryMode) }, ::log)
+    private val agent = AgentBridge(paths, { settings.agent && AgentSupport.supported(engine, img.api, recoveryMode) },
+        { pkg, on -> agentDeny(pkg, on) }, ::log)
     @Volatile private var agentOn = false
 
     @Volatile var state = State.STOPPED
@@ -1548,6 +1549,18 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         return runCatching { installApk(guestPath) }.getOrElse { it.toString() }
     }
 
+    /**
+     * The Root Manager in the guest changed the hide list: the running daemon's denylist follows through
+     * its own CLI (the same channel the boot path uses). With Magisk off there is no daemon to tell —
+     * the guest's list file is applied by the boot path instead, and the bridge reports that as deferred,
+     * not as done.
+     */
+    private fun agentDeny(pkg: String, on: Boolean): AgentBridge.DenyAnswer {
+        if (!magiskOn) return AgentBridge.DenyAnswer(false, "Magisk is off; the guest's list applies at the next boot")
+        val out = magiskExec("--denylist ${if (on) "add" else "remove"} $pkg", 30_000)
+        return AgentBridge.DenyAnswer(true, out.ifBlank { "the daemon answered nothing" })
+    }
+
     // ---- Magisk (VmSettings.magisk, see MagiskCore): the host plays the part of init's boot stages ----------------
 
     private val magiskOn: Boolean get() =
@@ -1577,12 +1590,14 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             MagiskCore.unlockTmp(paths.root)    // its magic mount leaves directories at mode 000
             val version = guestShell("/${MagiskCore.TMP}/magisk -v; /${MagiskCore.TMP}/magisk -V", 15_000).trim().replace('\n', ' ')
             log("magisk: daemon answers \"$version\"")
-            // the hide list (VmSettings.hiddenApps) as the daemon's own denylist, beside the mount layer's
-            // per-app view: Zygisk then stays out of those apps. Through the daemon's CLI before the overlay
-            // places anything, every answer logged — a daemon that refuses shows up here, not as a success
-            if (settings.hiddenApps.isNotEmpty()) {
+            // the hide list (the guest's own file, AgentSupport.LIST_FILE — the Root Manager in the guest
+            // owns it) as the daemon's own denylist, beside the mount layer's per-app view: Zygisk then
+            // stays out of those apps. Through the daemon's CLI before the overlay places anything, every
+            // answer logged — a daemon that refuses shows up here, not as a success
+            val denyList = (AgentSupport.readHideList(paths.root) ?: emptyList()).filter { it != MagiskCore.PACKAGE }
+            if (denyList.isNotEmpty()) {
                 log("magisk: denylist enable -> ${magiskExec("--denylist enable", 30_000)}")
-                for (pkg in settings.hiddenApps) log("magisk: denylist add $pkg -> ${magiskExec("--denylist add $pkg", 30_000)}")
+                for (pkg in denyList) log("magisk: denylist add $pkg -> ${magiskExec("--denylist add $pkg", 30_000)}")
             }
             // Zygisk (docs/magisk.md): with it on in magisk.db the daemon's post-fs-data sets the native-bridge property to libzygisk.so;
             // its magic mount is ignored by the shim, so Overlay.apply copies the magisk binary into /system/lib64 under that name

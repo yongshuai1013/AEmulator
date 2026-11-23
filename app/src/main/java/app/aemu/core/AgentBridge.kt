@@ -14,6 +14,11 @@ import java.util.concurrent.TimeUnit
  *
  *   agent -> host   HELLO <api>            the agent is up
  *   agent -> host   UIDS <n>               the uid set was rewritten with n entries
+ *   agent -> host   DENY <pkg> <on|off>    the Root Manager changed the hide list: follow it in the
+ *                                          daemon's denylist (answered on a worker thread, the daemon's
+ *                                          CLI is slow: DENIED = applied now, DENYDEFER = no daemon
+ *                                          to tell, the boot path applies the guest's list instead,
+ *                                          DENYERR = the attempt failed)
  *   host  -> agent  SYNC                   re-read the settings file and re-resolve the hide list
  *   host  -> agent  PUT <bytes> <name>     followed by exactly <bytes> raw bytes
  *   agent -> host   OK <guest path>        the file is in the guest's import inbox
@@ -22,7 +27,13 @@ import java.util.concurrent.TimeUnit
  * One connection at a time; a new agent replaces the old one, like the other bridges. Everything the agent
  * reports lands in the VM log: a failed import says so here and to the caller, never a silent success.
  */
-class AgentBridge(paths: VmPaths, private val enabled: () -> Boolean, private val log: (String) -> Unit) {
+class AgentBridge(paths: VmPaths, private val enabled: () -> Boolean,
+                  private val deny: (pkg: String, on: Boolean) -> DenyAnswer,
+                  private val log: (String) -> Unit) {
+
+    /** [applied] false means there was nothing to apply to right now (no daemon): the change stands in
+     *  the guest's list and takes effect at the next boot — reported as deferred, never as done. */
+    data class DenyAnswer(val applied: Boolean, val note: String)
     private val lock = Any()
     private var session: Session? = null
     private var client: LocalSocket? = null
@@ -122,6 +133,24 @@ class AgentBridge(paths: VmPaths, private val enabled: () -> Boolean, private va
                 when {
                     line.startsWith("HELLO") -> log("agent: connected ($line)")
                     line.startsWith("UIDS") -> log("agent: $line")
+                    line.startsWith("DENY ") -> {
+                        val parts = line.split(" ")
+                        val pkg = parts.getOrNull(1)?.takeIf { it.isNotEmpty() }
+                        val on = parts.getOrNull(2) == "on"
+                        if (pkg == null || parts.size != 3 || (parts[2] != "on" && parts[2] != "off")) {
+                            log("agent: malformed DENY line \"$line\"")
+                        } else Thread {
+                            val answer = runCatching { deny(pkg, on) }
+                            val state = if (on) "on" else "off"
+                            val reply = answer.fold(
+                                onSuccess = { if (it.applied) "DENIED $pkg $state" else "DENYDEFER $pkg $state" },
+                                onFailure = { "DENYERR $pkg $state ${it.message ?: "the host refused"}" }
+                            )
+                            log("agent: denylist ${if (on) "add" else "remove"} $pkg -> " +
+                                (answer.getOrNull()?.note ?: "failed: ${answer.exceptionOrNull()?.message}"))
+                            runCatching { mine.send(reply) }
+                        }.start()
+                    }
                     line.startsWith("OK ") || line.startsWith("ERR ") -> {
                         val p = mine.pendingPut
                         if (p != null) p(line) else log("agent: $line")
