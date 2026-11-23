@@ -14,6 +14,7 @@ import org.anarres.lzo.LzoDecompressor;
 import org.anarres.lzo.LzoLibrary;
 import org.anarres.lzo.lzo_uintp;
 
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.File;
