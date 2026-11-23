@@ -57,6 +57,8 @@ class Importer(
     private var kernelBanner = ""
     // baseband version implied by a radio-<device>-<version>.img file name in the package
     private var baseband = ""
+    // boot loader version implied by a bootloader-<device>-<version>.img file name in the package
+    private var bootloaderName = ""
     private val symlinks = ArrayList<Pair<String, String>>() // (цель, путь ссылки в госте)
     private val perms = ArrayList<Triple<String, Int, Boolean>>() // (путь, режим, рекурсивно-файлы)
     private var files = 0
@@ -89,7 +91,7 @@ class Importer(
             if (recovery == null) runCatching { rebuildRecoveryFromBoot() }.onFailure { log("recovery: rebuild from boot failed (${it.message}), skipped") }
             recovery?.let { runCatching { RecoveryImage.install(paths, it, log) } }
             onProgress("Analyzing firmware", 0.97f)
-            val img = Analyzer(ctx, paths, ramdisk, kernelBanner, baseband).analyze(id, name)
+            val img = Analyzer(ctx, paths, ramdisk, kernelBanner, baseband, bootloaderName).analyze(id, name)
             TreeFixer(ctx, paths, img, log).sanitize()
             ImageStore.save(ctx, img.copy(sizeBytes = ImageStore.du(paths.dir)))
             onProgress("Done", 1f)
@@ -248,6 +250,7 @@ class Importer(
             val n = e.name.replace('\\', '/').removePrefix(wrap)
             val base = n.substringAfterLast('/')
             noteRadioFile(base)
+            noteBootloaderFile(base)
             when {
                 e.isDirectory -> {}
                 n.contains("__MACOSX/") || base.startsWith("._") -> {}
@@ -420,6 +423,7 @@ class Importer(
             if (n.isEmpty()) continue
             val base = n.substringAfterLast('/')
             noteRadioFile(base)
+            noteBootloaderFile(base)
             // дерево rootfs целиком (system/, data/, dev/, …)
             if (fullRoot == null && (n == "system" || n.startsWith("system/") || n.startsWith("init.rc") || n.startsWith("default.prop"))) fullRoot = true
             when {
@@ -908,6 +912,21 @@ class Importer(
         val half = dev.length / 2
         if (dev.length % 2 == 1 && dev[half] == '-' && dev.substring(0, half) == dev.substring(half + 1)) dev = dev.substring(0, half)
         if (dev.isNotEmpty()) { baseband = "$dev-$ver"; log("radio: baseband $baseband (from $base)") }
+    }
+
+    /**
+     * Factory packages ship the boot loader as bootloader-<device>-<version>.img (Google doubles
+     * the device: bootloader-angler-angler-03.84.img). The string the phone reports as ro.bootloader
+     * is "<device>-<version>" — the same derivation as the radio file above. First match wins.
+     */
+    private fun noteBootloaderFile(base: String) {
+        if (bootloaderName.isNotEmpty() || !base.startsWith("bootloader-", true)) return
+        val rest = base.substringBeforeLast('.').substring(11)
+        val ver = Regex("""\d+(\.\d+)+[0-9A-Za-z.]*$""").find(rest)?.value ?: return
+        var dev = rest.substring(0, rest.length - ver.length).trimEnd('-', '_')
+        val half = dev.length / 2
+        if (dev.length % 2 == 1 && dev[half] == '-' && dev.substring(0, half) == dev.substring(half + 1)) dev = dev.substring(0, half)
+        if (dev.isNotEmpty()) { bootloaderName = "$dev-$ver"; log("bootloader: $bootloaderName (from $base)") }
     }
 
     private fun takeBoot(data: ByteArray) {

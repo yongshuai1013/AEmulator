@@ -7,6 +7,7 @@ import app.aemu.core.InitPlan
 import app.aemu.core.PropArea
 import app.aemu.core.VmPaths
 import app.aemu.core.VmSettings
+import app.aemu.core.deriveSerialNo
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -22,6 +23,7 @@ class Analyzer(
     private val ramdisk: List<BootImage.CpioEntry>?,
     private val kernelBanner: String = "",
     private val baseband: String = "",
+    private val bootloaderName: String = "",
 ) {
     private val root = paths.root
 
@@ -88,6 +90,7 @@ class Analyzer(
         if (abi.startsWith("arm64") && api != 23) warnings += "64-bit firmware: the native arm64 engine is tuned for Android 6.0; other versions are experimental."
         if (abi.startsWith("x86") || abi.startsWith("mips")) warnings += "Firmware is not ARM ($abi) and will not run."
         if (api >= 21) warnings += "Android ${release}: support is experimental (ART, SELinux)."
+        if (bootloaderName.isEmpty()) warnings += "No bootloader version found in the package: ro.bootloader stays \"unknown\"."
 
         val density = all["ro.sf.lcd_density"]?.toIntOrNull() ?: 240
         val engine = Engine.forApi(api)
@@ -125,7 +128,7 @@ class Analyzer(
             sdcardPath = sdcard,
             volumes = voldVols,
             // the kernel banner extracted from boot.img pre-fills the (user-editable) setting
-            settings = settings.copy(kernelBanner = kernelBanner),
+            settings = settings.copy(kernelBanner = kernelBanner, bootloaderName = bootloaderName, serialNo = deriveSerialNo(id)),
             createdAt = System.currentTimeMillis(),
             sourceName = sourceName,
             runtime = if (api >= 21) "art" else "dalvik",
@@ -315,13 +318,12 @@ class Analyzer(
         val base = LinkedHashMap<String, String>()
         fun add(k: String, v: String) { if (!(k.startsWith("ro.") && base.containsKey(k))) base[k] = v }
         // то, что обычно выставляет init из командной строки ядра
-        add("ro.secure", "0")
-        add("ro.adb.secure", "0")
+        add("ro.secure", "1")
+        add("ro.adb.secure", "1")
         add("ro.debuggable", "0")
-        add("ro.serialno", "0123456789abcdef")
-        add("ro.bootmode", "unknown")
+        // ro.serialno is not a template default any more: every image carries its own, derived
+        // from its id at import and applied per boot from the settings (GuestVm)
         add("ro.baseband", "unknown")
-        add("ro.bootloader", "unknown")
         add("ro.carrier", "unknown")
         add("ro.revision", "0")
         add("ro.factorytest", "0")
@@ -339,6 +341,12 @@ class Analyzer(
         for ((k, v) in NET_DEFAULTS) add(k, v)
         val sysDefault = File(root, "system/default.prop")
         if (sysDefault.isFile) PropArea.parseProps(sysDefault.readText()).forEach { (k, v) -> add(k, v) }
+        // bootmode and the boot loader's version also come from the kernel command line on a phone:
+        // the firmware's own value wins (add() is first-wins for ro.*), these are only the fallbacks
+        // for firmware that carries neither. The boot loader string is normally superseded per boot
+        // by the value derived at import (the settings' bootloaderName).
+        add("ro.bootmode", "normal")
+        add("ro.bootloader", "unknown")
         // ro.sf.lcd_density и ro.kernel.qemu выставляются при каждом запуске из настроек образа
         base.remove("ro.sf.lcd_density")
         base.remove("ro.kernel.qemu")
