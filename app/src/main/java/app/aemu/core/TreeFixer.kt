@@ -1909,6 +1909,14 @@ class TreeFixer(
             )).firstOrNull() ?: return
             db.parentFile?.mkdirs()
             SQLiteDatabase.openOrCreateDatabase(db.absolutePath, null).use { d ->
+                // built in one transaction, the version stamp included (the framework's
+                // own SQLiteOpenHelper stamps it the same way): a failure anywhere rolls
+                // the whole database back, and the caller deletes what is left — a
+                // half-made settings.db (tables present, version 0) makes the guest's
+                // SettingsProvider die in its own onCreate, which is worse than the
+                // missing default this seed exists to fix
+                d.beginTransaction()
+                try {
                 d.execSQL("CREATE TABLE system (_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE ON CONFLICT REPLACE, value TEXT);")
                 d.execSQL("CREATE INDEX systemIndex1 ON system (name);")
                 d.execSQL("CREATE TABLE secure (_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE ON CONFLICT REPLACE, value TEXT);")
@@ -1921,17 +1929,33 @@ class TreeFixer(
                 d.execSQL("CREATE TABLE bookmarks (_id INTEGER PRIMARY KEY, title TEXT, folder TEXT, intent TEXT, shortcut INTEGER, ordering INTEGER);")
                 d.execSQL("CREATE INDEX bookmarksIndex1 ON bookmarks (folder);")
                 d.execSQL("CREATE INDEX bookmarksIndex2 ON bookmarks (shortcut);")
-                fun put(name: String, value: String) {
-                    val cv = android.content.ContentValues().apply { put("name", name); put("value", value) }
+                // NOT ContentValues.apply { put(...)}: a local put(name, value) has the
+                // same signature as ContentValues.put(String, String), and the unqualified
+                // calls inside apply bound to the local function — infinite recursion,
+                // StackOverflowError on the first row, and the tables above stayed behind
+                fun putSecure(name: String, value: String) {
+                    val cv = android.content.ContentValues()
+                    cv.put("name", name)
+                    cv.put("value", value)
                     d.insert("secure", null, cv)
                 }
-                put("enabled_input_methods", imes.joinToString(":") { it.id })
-                put("default_input_method", chosen.id)
+                putSecure("enabled_input_methods", imes.joinToString(":") { it.id })
+                putSecure("default_input_method", chosen.id)
                 d.version = spec.version
+                d.setTransactionSuccessful()
+                } finally {
+                    d.endTransaction()
+                }
             }
             db.setReadable(true, false)
             log("settings: default input method seeded for the first boot: ${chosen.id}")
-        }.onFailure { log("settings: IME seed failed: ${it.message}") }
+        }.onFailure {
+            // a failed seed must leave "no database" behind, never a half-made one:
+            // whatever was created goes, sidecar files included, so the guest falls
+            // back to exactly the behaviour it had before the seed existed
+            for (suffix in listOf("", "-journal", "-wal", "-shm")) File(db.absolutePath + suffix).delete()
+            log("settings: IME seed failed: ${it.message}")
+        }
     }
 
     /** the guest's own language, for ranking the seeded default (build.prop, as the analyzer reads it) */
