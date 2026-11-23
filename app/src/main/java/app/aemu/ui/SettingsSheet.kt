@@ -151,6 +151,10 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
                         label = { Text(stringResource(R.string.vs_sim_number)) }, supportingText = { Text(stringResource(R.string.vs_sim_number_sub)) },
                         singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
                         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+                    OutlinedTextField(value = s.simIccid, onValueChange = { v -> s = s.copy(simIccid = VmSettings.cleanSimIccid(v)) },
+                        label = { Text("ICCID") }, supportingText = { Text(stringResource(R.string.vs_sim_iccid_sub)) },
+                        singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
                 }
                 NetworkTypePicker(s.networkType, img.api) { s = s.copy(networkType = it) }
             }

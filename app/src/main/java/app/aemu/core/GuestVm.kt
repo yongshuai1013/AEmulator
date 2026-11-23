@@ -105,6 +105,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     val ril = RilStub(paths, ::log, img.settings.imei.ifBlank { VmSettings.DEFAULT_IMEI }, img.api, img.baseband,
         img.settings.basebandOverride, img.settings.operatorName, img.settings.operatorNumeric,
         simPresentSetting = img.settings.simPresent, simNumberSetting = img.settings.simNumber,
+        simIccidSetting = img.settings.simIccid,
         networkTypeSetting = img.settings.networkType)
     val vold = VoldStub(paths, img.sdcardPath, ::log, others = img.volumes, api = img.api)
     var onFrame: (() -> Unit)? = null

@@ -37,6 +37,8 @@ class RilStub(
     private val simPresentSetting: Boolean = true,
     /** the SIM's own phone number from the image settings; blank = the card carries no number (AEmulator Plus) */
     private val simNumberSetting: String = "",
+    /** the SIM's serial from the image settings; blank = derived from the operator code and the IMEI (AEmulator Plus) */
+    private val simIccidSetting: String = "",
     /** radio technology from the image settings (a NetworkType value); UMTS = what this modem always reported */
     networkTypeSetting: Int = NetworkType.UMTS,
 ) {
@@ -291,9 +293,15 @@ class RilStub(
         }
     }
 
-    /** ICCID in the SIM's swapped-BCD form: 89 (telecom) + the operator's MCC + digits from the IMEI */
+    /**
+     * ICCID in the SIM's swapped-BCD form. A serial from the image settings is answered as-is
+     * (F-padded to the full 20 digits); otherwise 89 (telecom) + the operator's MCC + digits
+     * from the IMEI, the long-standing derivation.
+     */
     private fun iccid(): String {
-        val digits = ("89" + mcc + imei.filter { it.isDigit() } + "0000000000").take(20)
+        val custom = simIccidSetting.filter { it.isDigit() }
+        val digits = if (custom.isNotEmpty()) custom.padEnd(20, 'F')
+            else ("89" + mcc + imei.filter { it.isDigit() } + "0000000000").take(20)
         return digits.chunked(2).joinToString("") { "${it[1]}${it[0]}" }
     }
 

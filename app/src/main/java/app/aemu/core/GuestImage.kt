@@ -81,6 +81,8 @@ data class VmSettings(
     val simPresent: Boolean = true,
     /** the SIM's own phone number (EF_MSISDN); blank = the card carries no number (AEmulator Plus) */
     val simNumber: String = "",
+    /** the SIM's serial (EF_ICCID); blank = derived from the operator code and the IMEI, as before (AEmulator Plus) */
+    val simIccid: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -100,6 +102,7 @@ data class VmSettings(
         .put("storageType", storageType)
         .put("simPresent", simPresent)
         .put("simNumber", simNumber)
+        .put("simIccid", simIccid)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -128,6 +131,9 @@ data class VmSettings(
             val digits = v.filter(Char::isDigit).take(15)
             return if (v.trimStart().startsWith("+") && digits.isNotEmpty()) "+$digits" else digits
         }
+
+        /** SIM serial as stored on the card: digits only, at most 20 (AEmulator Plus). */
+        fun cleanSimIccid(v: String): String = v.filter(Char::isDigit).take(20)
 
         /** Random Luhn-valid IMEI with a test TAC prefix. */
         fun randomImei(): String {
@@ -177,6 +183,7 @@ data class VmSettings(
                 storageType = StorageType.parse(o.optString("storageType", ""))?.id ?: "",
                 simPresent = o.optBoolean("simPresent", true),
                 simNumber = cleanSimNumber(o.optString("simNumber", "")),
+                simIccid = cleanSimIccid(o.optString("simIccid", "")),
             )
         }
     }
