@@ -197,6 +197,17 @@ class GuestRunner(
         if (noTcgOpt) e["DHD_NO_TCGOPT"] = "1"
         for (t in userTokens.filter(::isEnvToken)) e[t.substringBefore('=')] = t.substringAfter('=')
         e.putAll(extra)
+        // Self-built (SENSES-recipe) translators read GUEST_* instead of DHD_*:
+        // mirror every DHD_* variable under its GUEST_* name, except the two
+        // dhdrun-consumed families (DHD_ENV_* guest exports, DHD_SOCK_* init
+        // sockets). GUEST_FWINIT / GUEST_SELINUX / GUEST_FB_FLIP are never
+        // set on purpose: fwinit stays off (this harness plays init) and the
+        // framebuffer keeps its single-page fallback path.
+        for ((k, v) in e.entries.toList()) {
+            if (k.startsWith("DHD_") && !k.startsWith("DHD_ENV_") && !k.startsWith("DHD_SOCK_")) {
+                e.putIfAbsent("GUEST_" + k.removePrefix("DHD_"), v)
+            }
+        }
         return e
     }
 
