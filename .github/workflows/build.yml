@@ -15,7 +15,7 @@ jobs:
           SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | sort -V | tail -1)
           echo "sdkmanager: $SDKMANAGER"
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0" "build-tools;35.0.0"
+          "$SDKMANAGER" "platforms;android-36" "platforms;android-19" "build-tools;36.0.0" "build-tools;35.0.0"
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
@@ -39,6 +39,18 @@ jobs:
         with:
           name: aemu-wifi-jar
           path: app/src/main/assets/engines/kk/aemu-wifi.jar
+      - name: Build guest Bluetooth jar from source
+        run: |
+          export ANDROID_JAR="$ANDROID_HOME/platforms/android-19/android.jar"
+          export D8_JAR="$ANDROID_HOME/build-tools/36.0.0/lib/d8.jar"
+          export PATH="$ANDROID_HOME/build-tools/36.0.0:$PATH"
+          sh app/guest-bt/build.sh
+          ls -l app/src/main/assets/engines/kk/aemu-bt.jar
+          sha256sum app/src/main/assets/engines/kk/aemu-bt.jar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aemu-bt-jar
+          path: app/src/main/assets/engines/kk/aemu-bt.jar
       - name: Build APK
         run: |
           chmod +x gradlew
