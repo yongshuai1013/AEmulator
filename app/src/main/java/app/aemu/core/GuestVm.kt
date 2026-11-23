@@ -599,6 +599,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         if (!props.prepare(overrides, later, if (engine == Engine.N64) kernel.propAreaSize else PropArea.SIZE)) error("property area not ready")
         fixer.skipPreBoot(props)
         fixer.noScreenSleep()
+        fixer.seedDefaultIme()
         props.onSet = { k, v -> onProp(k, v) }
         props.onCtl = { start, svc -> onCtl(start, svc) }
 

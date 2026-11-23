@@ -1882,6 +1882,66 @@ class TreeFixer(
     }
 
     /**
+     * First boot of a 4.x guest: IMMS picks no default input method in its constructor —
+     * by design the pick is neither persisted nor applied until systemRunning(), which
+     * AMS calls only after the pre-boot receivers, and a window that gains focus in
+     * between kills system_server (InputMethodManager.startInputInner NPE on a fresh
+     * Moto 4.4, twice). The constructor does trust a persisted default, so on a fresh
+     * /data the settings database is created before the boot in the exact shape the
+     * guest's own DatabaseHelper would have made it (its onCreate schema, its version
+     * stamp), holding just the two input-method rows. An existing database is never
+     * touched: whatever a later boot has, stays.
+     */
+    fun seedDefaultIme() {
+        val spec = IME_SEED_VERSIONS[img.api] ?: return
+        if (spec.releasePrefix != null && !img.release.startsWith(spec.releasePrefix)) return
+        if (spec.onlyReleases != null && img.release !in spec.onlyReleases) return
+        val db = File(root, "data/data/com.android.providers.settings/databases/settings.db")
+        if (db.isFile) return
+        runCatching {
+            val imes = ImeProbe.detect(root)
+            if (imes.isEmpty()) return
+            val lang = guestLanguage()
+            val chosen = imes.filter { it.keyboard }.sortedWith(compareBy(
+                { if (it.pkg.contains("latin", true) || it.cls.contains("latin", true)) 0 else 1 },
+                { if (it.subtypeLocales.any { l -> l.substringBefore('_').lowercase() == lang }) 0 else 1 },
+                { it.id },
+            )).firstOrNull() ?: return
+            db.parentFile?.mkdirs()
+            SQLiteDatabase.openOrCreateDatabase(db.absolutePath, null).use { d ->
+                d.execSQL("CREATE TABLE system (_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE ON CONFLICT REPLACE, value TEXT);")
+                d.execSQL("CREATE INDEX systemIndex1 ON system (name);")
+                d.execSQL("CREATE TABLE secure (_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE ON CONFLICT REPLACE, value TEXT);")
+                d.execSQL("CREATE INDEX secureIndex1 ON secure (name);")
+                if (spec.global) {
+                    d.execSQL("CREATE TABLE global (_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE ON CONFLICT REPLACE, value TEXT);")
+                    d.execSQL("CREATE INDEX globalIndex1 ON global (name);")
+                }
+                d.execSQL("CREATE TABLE bluetooth_devices (_id INTEGER PRIMARY KEY, name TEXT, addr TEXT, channel INTEGER, type INTEGER);")
+                d.execSQL("CREATE TABLE bookmarks (_id INTEGER PRIMARY KEY, title TEXT, folder TEXT, intent TEXT, shortcut INTEGER, ordering INTEGER);")
+                d.execSQL("CREATE INDEX bookmarksIndex1 ON bookmarks (folder);")
+                d.execSQL("CREATE INDEX bookmarksIndex2 ON bookmarks (shortcut);")
+                fun put(name: String, value: String) {
+                    val cv = android.content.ContentValues().apply { put("name", name); put("value", value) }
+                    d.insert("secure", null, cv)
+                }
+                put("enabled_input_methods", imes.joinToString(":") { it.id })
+                put("default_input_method", chosen.id)
+                d.version = spec.version
+            }
+            db.setReadable(true, false)
+            log("settings: default input method seeded for the first boot: ${chosen.id}")
+        }.onFailure { log("settings: IME seed failed: ${it.message}") }
+    }
+
+    /** the guest's own language, for ranking the seeded default (build.prop, as the analyzer reads it) */
+    private fun guestLanguage(): String {
+        val props = runCatching { PropArea.parseProps(File(root, "system/build.prop").readText()) }.getOrDefault(emptyMap())
+        val lang = props["ro.product.locale.language"] ?: props["persist.sys.language"] ?: "en"
+        return lang.substringBefore('_').substringBefore('-').lowercase()
+    }
+
+    /**
      * 6.0 keeps the settings as XML files, one per table (data/system/users/0/settings_<table>.xml). The same values
      * as for the database: the screen stays on, and the device counts as set up, without which the setup wizard
      * stays the home screen.
@@ -2089,6 +2149,23 @@ class TreeFixer(
             "system/app/DiracManager",
         )
         private val LOGS = listOf("main", "system", "radio") // events — канал, его делает EventsSink
+
+        private data class ImeSeedSpec(val version: Int, val global: Boolean,
+            val releasePrefix: String? = null, val onlyReleases: Set<String>? = null)
+
+        /**
+         * The settings DATABASE_VERSION a guest's DatabaseHelper stamps, per API level,
+         * verified against the AOSP tags (see ime-firstboot-desk.md): 4.4.x is 98 at every
+         * point release and 4.3.x is 97; 4.2 stamps the oldest (94 — the 94→95 step only
+         * inserts one global default row) and 4.1.1/4.1.2 stamp 79 (79→80 only rewrites
+         * accessibility rows). 4.0.x drifts 70→74 over four unaudited steps: not seeded.
+         */
+        private val IME_SEED_VERSIONS = mapOf(
+            19 to ImeSeedSpec(98, true, releasePrefix = "4.4"),
+            18 to ImeSeedSpec(97, true, releasePrefix = "4.3"),
+            17 to ImeSeedSpec(94, true, releasePrefix = "4.2"),
+            16 to ImeSeedSpec(79, false, onlyReleases = setOf("4.1.1", "4.1.2")),
+        )
         private val DATA_DIRS = listOf(
             "data", "data/app", "data/app-private", "data/app-lib", "data/app-asec", "data/data", "data/dalvik-cache",
             "data/local", "data/local/tmp", "data/misc", "data/misc/keystore", "data/misc/wifi", "data/misc/zoneinfo",
