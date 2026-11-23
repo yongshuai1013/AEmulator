@@ -37,6 +37,7 @@ class Lights(private val root: File, private val log: (String) -> Unit) {
     ).map { File(root, "sys/class/leds/$it") }
 
     @Volatile private var running = false
+    @Volatile private var started = false
     private val state = HashMap<String, Led>()
     private val listeners = CopyOnWriteArrayList<(Led?) -> Unit>()
     @Volatile var current: Led? = null
@@ -51,6 +52,7 @@ class Lights(private val root: File, private val log: (String) -> Unit) {
     fun onChange(l: (Led?) -> Unit) { listeners.add(l) }
 
     fun start() {
+        started = true
         running = true
         runCatching {
             mkfifo(fifo)
@@ -70,6 +72,12 @@ class Lights(private val root: File, private val log: (String) -> Unit) {
     }
 
     fun stop() {
+        // Never started (recovery mode boots no lights service): the FIFO files
+        // can still exist in the tree with no reader threads holding them, and
+        // opening a FIFO for append blocks until a reader appears -- stop()
+        // would never return.
+        if (!started) return
+        started = false
         running = false
         // wake readers
         for (f in sysfsPaths + samsung + fifo) runCatching { File(f.absolutePath).appendText("0\n") }
