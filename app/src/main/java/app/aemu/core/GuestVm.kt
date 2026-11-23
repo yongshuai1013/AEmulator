@@ -422,7 +422,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             log("props: ro.hardware=$it (from settings)")
         }
         // storage technology the guest sees (AEmulator Plus): the boot-device properties follow the setting
-        StorageSpoof.props(StorageSpoof.StorageType.parse(s.storageType)).forEach { (k, v) -> overrides[k] = v }
+        StorageSpoof.props(StorageType.parse(s.storageType)).forEach { (k, v) -> overrides[k] = v }
         overrides["ro.sf.lcd_density"] = s.density.toString()
         overrides["qemu.sf.lcd_density"] = s.density.toString()
         // MIUI 10 forces the density of the phone's own panel from this one (440 on a 540-pixel screen)

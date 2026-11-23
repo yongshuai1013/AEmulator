@@ -75,7 +75,7 @@ data class VmSettings(
     val networkType: Int = NetworkType.UMTS,
     /** storage size the guest is told it has, in GiB; 0 = the phone's own disk, unspoofed (AEmulator Plus) */
     val storageGb: Int = 0,
-    /** storage technology the guest sees (an id of StorageSpoof.StorageType); blank = the firmware's own (AEmulator Plus) */
+    /** storage technology the guest sees (an id of StorageType); blank = the firmware's own (AEmulator Plus) */
     val storageType: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject()
@@ -162,7 +162,7 @@ data class VmSettings(
                 hardware = cleanHardware(o.optString("hardware", "")),
                 networkType = NetworkType.normalize(o.optInt("networkType", NetworkType.UMTS)),
                 storageGb = StorageSpoof.sanitizeGb(o.optInt("storageGb", 0)),
-                storageType = StorageSpoof.StorageType.parse(o.optString("storageType", ""))?.id ?: "",
+                storageType = StorageType.parse(o.optString("storageType", ""))?.id ?: "",
             )
         }
     }

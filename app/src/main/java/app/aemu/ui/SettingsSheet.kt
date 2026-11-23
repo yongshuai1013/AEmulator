@@ -50,6 +50,7 @@ import app.aemu.core.Engine
 import app.aemu.core.GuestImage
 import app.aemu.core.NetworkType
 import app.aemu.core.StorageSpoof
+import app.aemu.core.StorageType
 import app.aemu.core.VmSettings
 import kotlin.math.roundToInt
 
@@ -284,11 +285,11 @@ private fun StoragePicker(gb: Int, type: String, setGb: (Int) -> Unit, setType: 
                     Text(stringResource(R.string.vs_storage_type), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
                     Box {
                         TextButton(onClick = { open = true }) {
-                            Text(StorageSpoof.StorageType.parse(type)?.label ?: stringResource(R.string.vs_storage_type_auto))
+                            Text(StorageType.parse(type)?.label ?: stringResource(R.string.vs_storage_type_auto))
                         }
                         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
                             DropdownMenuItem(text = { Text(stringResource(R.string.vs_storage_type_auto)) }, onClick = { open = false; setType("") })
-                            StorageSpoof.StorageType.entries.forEach { e ->
+                            StorageType.entries.forEach { e ->
                                 DropdownMenuItem(text = { Text(e.label) }, onClick = { open = false; setType(e.id) })
                             }
                         }
