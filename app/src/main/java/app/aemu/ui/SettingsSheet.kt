@@ -202,6 +202,9 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             Spacer(Modifier.height(8.dp))
             RecoverySection(img)
 
+            var magiskBusy by remember { mutableStateOf(false) }
+            MagiskSection(img, s.magisk, magiskBusy, { magiskBusy = it }) { s = s.copy(magisk = it) }
+
             Spacer(Modifier.height(8.dp))
             Text(stringResource(R.string.vs_archive), style = MaterialTheme.typography.titleMedium)
             var archiveBusy by remember { mutableStateOf(false) }
