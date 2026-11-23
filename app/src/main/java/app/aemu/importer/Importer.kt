@@ -412,7 +412,66 @@ class Importer(
             val chans = parts.map { FileChannel.open(it.toPath(), StandardOpenOption.READ) }
             try { importImage(SparseSource(chans.map { ChannelSource(it) }), "system") } finally { chans.forEach { it.close() }; parts.forEach { it.delete() } }
         }
+        // Qualcomm EDL package: rawprogram*.xml + split partition images (AEmulator-Plus)
+        val rawProgramEntries = entries.filter { !it.isDirectory && !it.name.contains("__MACOSX/") &&
+            it.name.replace('\\', '/').substringAfterLast('/').matches(Regex("(?i)rawprogram.*\\.xml")) }
+        if (rawProgramEntries.isNotEmpty()) {
+            runCatching { importEdl(zip, entries, rawProgramEntries) }
+                .onFailure { if (cancelled) throw it; log("EDL: ${it.message ?: it.javaClass.simpleName}") }
+        }
         if (!names.any { it.startsWith("system/") } && !gotSystem) log("no system found in archive $name")
+    }
+
+    /**
+     * Qualcomm EDL package (rawprogram*.xml + split images). Of all rawprogram XMLs the one that describes the
+     * partition and whose chunk files are really in the archive is chosen, only the chunks it names are copied
+     * out, merged into one raw image (offsets relative to the lowest start sector, sparse chunks expanded) and
+     * imported. Same for boot and recovery when none was found. (Adapted from AEmulator-Plus; no OEM consumer here.)
+     */
+    private fun importEdl(zip: ZipFile, entries: List<ZipArchiveEntry>, xmlEntries: List<ZipArchiveEntry>) {
+        val edlDir = File(tmp, "edl-${System.nanoTime()}").apply { mkdirs() }
+        try {
+            val xmls = xmlEntries.map { spillEntry(zip, it) }
+            val byBase = HashMap<String, MutableList<ZipArchiveEntry>>()
+            for (x in entries) if (!x.isDirectory && !x.name.contains("__MACOSX/"))
+                byBase.getOrPut(x.name.replace('\\', '/').substringAfterLast('/').lowercase()) { ArrayList() }.add(x)
+            for (label in listOf("system", "boot", "recovery")) {
+                if (cancelled) throw IOException("cancelled")
+                if (label == "system" && gotSystem) continue
+                if (label == "boot" && ramdisk != null) continue
+                if (label == "recovery" && recovery != null) continue
+                val chunks = File(edlDir, label).apply { mkdirs() }
+                val raw = File(tmp, "edl-$label.raw.img")
+                try {
+                    val plan = FirmwareToolset.planEdl(xmls, byBase.keys, label) { msg -> log(msg) } ?: continue
+                    if (plan.missing > 0) log("EDL: ${plan.missing} $label chunk(s) missing from archive")
+                    val xmlDir = xmlEntries.getOrNull(xmls.indexOf(plan.xml))?.name?.replace('\\', '/')?.substringBeforeLast('/', "") ?: ""
+                    for (file in plan.files()) {
+                        val base = file.replace('\\', '/').substringAfterLast('/')
+                        val cands = byBase[base.lowercase()] ?: continue
+                        // prefer the copy next to the XML, otherwise the closest one
+                        val pick = cands.firstOrNull { it.name.replace('\\', '/').substringBeforeLast('/', "") == xmlDir }
+                            ?: cands.minByOrNull { it.name.length }!!
+                        onProgress("EDL: $base", -1f)
+                        zip.getInputStream(pick).use { i -> File(chunks, base).outputStream().buffered(1 shl 20).use { o -> i.copyTo(o, 1 shl 20) } }
+                    }
+                    FirmwareToolset.combineEdl(plan, chunks, raw) { msg -> log(msg) }
+                    chunks.deleteRecursively()
+                    FileChannel.open(raw.toPath(), StandardOpenOption.READ).use { c ->
+                        val src = ChannelSource(c)
+                        if (label == "system") importImage(if (SparseSource.probe(src)) SparseSource(listOf(src)) else src, "system")
+                        else if (raw.length() <= 128L shl 20) {
+                            if (label == "recovery") { if (raw.length() < 64_000_000) recovery = raw.readBytes() }
+                            else takeBoot(raw.readBytes())
+                        }
+                    }
+                } catch (t: Throwable) {
+                    if (cancelled) throw t
+                    log("EDL $label combine skipped: ${t.message ?: t.javaClass.simpleName}")
+                } finally { chunks.deleteRecursively(); raw.delete() }
+            }
+            xmls.forEach { it.delete() }
+        } finally { edlDir.deleteRecursively() }
     }
 
     /** 7z: entries are read in order (solid archives cannot seek); interesting ones are unpacked like their zip twins */
