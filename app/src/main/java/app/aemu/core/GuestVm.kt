@@ -1319,7 +1319,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         stopping = true
         setState(State.STOPPING)
         log("stopping system")
-        runCatching { guestRunner.run(listOf("/system/bin/sync"), 5_000) }
+        if (recoveryMode) log("stop: skipping guest sync (recovery mode)")
+        else runCatching { guestRunner.run(listOf("/system/bin/sync"), 5_000) }
         killAll()
         adb.stop(); props.stop(); input.stop(); frames.stop(); ril.stop(); vold.stop(); audio.stop(); net.stop(); dns.stop(); events.stop(); logd.stop(); lights.stop(); sensors.stop(); mic.stop(); camera.stop(); GlHost.stop()
         extraStubs.forEach { it.stop() }; extraStubs.clear()
