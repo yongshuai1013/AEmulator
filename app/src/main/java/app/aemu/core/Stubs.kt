@@ -33,6 +33,8 @@ class RilStub(
     /** operator identity from the image settings; blank = the generic test-network identity */
     private val operatorNameSetting: String = "",
     private val operatorNumericSetting: String = "",
+    /** SIM card in the slot; false = empty slot, the guest shows "No SIM card" (AEmulator Plus) */
+    private val simPresentSetting: Boolean = true,
     /** radio technology from the image settings (a NetworkType value); UMTS = what this modem always reported */
     networkTypeSetting: Int = NetworkType.UMTS,
 ) {
@@ -49,6 +51,8 @@ class RilStub(
         get() = operatorNumericSetting.filter { it.isDigit() }.ifBlank { VmSettings.DEFAULT_OPERATOR_NUMERIC }
     private val mcc: String get() = operatorNumeric.take(3)
     private val mnc: String get() = operatorNumeric.drop(3).ifBlank { "01" }
+    /** SIM card in the slot, from the image settings */
+    private val simPresent: Boolean get() = simPresentSetting
     /** MEID answered in RIL_REQUEST_DEVICE_IDENTITY, derived deterministically from the IMEI */
     private val meid: String by lazy { synthMeid(imei) }
     /** what RIL_REQUEST_BASEBAND_VERSION answers: the settings value first, then the image's own radio version, then the generic answer */
@@ -151,7 +155,7 @@ class RilStub(
             val serial = b.getInt()
             val (err, payload) = runCatching {
                 when {
-                    request == RIL_REQUEST_SIM_IO -> 0 to simIo(b)
+                    request == RIL_REQUEST_SIM_IO -> if (simPresent) 0 to simIo(b) else E_GENERIC_FAILURE to ByteArray(0)
                     // Qualcomm's own requests travel as OEM_HOOK_RAW with a "QOEMHOOK" header. The telephony of CAF
                     // builds treats a failure as "this modem has no such request" and goes on; a success with a
                     // made-up payload is parsed and crashes com.android.phone (MIUI 7 on 5.0: modem capability)
@@ -206,13 +210,19 @@ class RilStub(
             RIL_REQUEST_ANSWER -> { call = call?.let { it.first to CALL_ACTIVE }; 0 to ByteArray(0) }
             in HANGUPS -> { call = null; 0 to ByteArray(0) }
             RIL_REQUEST_LAST_CALL_FAIL_CAUSE -> 0 to ints(16)   // normal clearing
-            RIL_REQUEST_GET_IMSI -> 0 to str(mcc + mnc + "0123456789".take(15 - mcc.length - mnc.length))
+            RIL_REQUEST_GET_IMSI -> if (simPresent) 0 to str(mcc + mnc + "0123456789".take(15 - mcc.length - mnc.length))
+                else E_GENERIC_FAILURE to ByteArray(0)
             RIL_REQUEST_SIGNAL_STRENGTH -> 0 to ints(20, 99, -1, -1, -1, -1, -1, 99, -1, -1, -1, -1, -1)
-            RIL_REQUEST_VOICE_REGISTRATION_STATE -> 0 to strs("1", "0001", "00000001", networkType.toString())
-            RIL_REQUEST_DATA_REGISTRATION_STATE -> 0 to strs("1", "0001", "00000001", networkType.toString(), "0", "1")
-            RIL_REQUEST_OPERATOR -> 0 to strs(operatorName, operatorName, operatorNumeric)
-            RIL_REQUEST_SETUP_DATA_CALL -> 0 to dataCall(single = true)
-            RIL_REQUEST_DATA_CALL_LIST -> 0 to dataCall(single = false)
+            // no SIM: the network still answers (emergency calls only), but there is no registration and no data
+            RIL_REQUEST_VOICE_REGISTRATION_STATE -> 0 to (if (simPresent) strs("1", "0001", "00000001", networkType.toString())
+                else strs("0", "0001", "00000001", networkType.toString()))
+            RIL_REQUEST_DATA_REGISTRATION_STATE -> 0 to (if (simPresent) strs("1", "0001", "00000001", networkType.toString(), "0", "1")
+                else strs("0", "0001", "00000001", networkType.toString(), "0", "1"))
+            RIL_REQUEST_OPERATOR -> 0 to (if (simPresent) strs(operatorName, operatorName, operatorNumeric)
+                else le(3) + str(null) + str(null) + str(null))
+            RIL_REQUEST_SETUP_DATA_CALL -> if (simPresent) 0 to dataCall(single = true) else E_GENERIC_FAILURE to ByteArray(0)
+            RIL_REQUEST_DATA_CALL_LIST -> 0 to (if (simPresent) dataCall(single = false)
+                else if (api < 14) le(0) else le(RIL_VERSION) + le(0))
             RIL_REQUEST_GET_IMEI -> 0 to str(imei)
             RIL_REQUEST_GET_IMEISV -> 0 to str(IMEISV)
             RIL_REQUEST_BASEBAND_VERSION -> 0 to str(basebandVersion)
@@ -300,6 +310,14 @@ class RilStub(
     }
 
     private fun simStatus(): ByteArray {
+        if (!simPresent) {                                // empty slot: "No SIM card" (AEmulator Plus)
+            val b = ByteArrayOutputStream()
+            b.write(le(0)); b.write(le(0))                // card absent, universal PIN unknown
+            b.write(le(-1)); b.write(le(-1))              // no GSM/UMTS app, no CDMA app
+            if (api >= 16) b.write(le(-1))                // no IMS app
+            b.write(le(0))                                // no applications
+            return b.toByteArray()
+        }
         val b = ByteArrayOutputStream()
         b.write(le(1)); b.write(le(0))                    // card present, universal PIN unknown
         b.write(le(0)); b.write(le(-1))                   // GSM/UMTS app 0, no CDMA app

@@ -104,6 +104,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         if (TreeFixer.isMtkAudio(paths.root)) "dev/aemu_pcm" else "dev/eac")
     val ril = RilStub(paths, ::log, img.settings.imei.ifBlank { VmSettings.DEFAULT_IMEI }, img.api, img.baseband,
         img.settings.basebandOverride, img.settings.operatorName, img.settings.operatorNumeric,
+        simPresentSetting = img.settings.simPresent,
         networkTypeSetting = img.settings.networkType)
     val vold = VoldStub(paths, img.sdcardPath, ::log, others = img.volumes, api = img.api)
     var onFrame: (() -> Unit)? = null

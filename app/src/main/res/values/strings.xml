@@ -129,6 +129,8 @@
     <string name="vs_operator_name">Operator name (custom)</string>
     <string name="vs_operator_numeric">Operator code MCC+MNC (custom)</string>
     <string name="vs_operator_reset">Reset to default</string>
+    <string name="vs_sim_present">SIM card inserted</string>
+    <string name="vs_sim_present_sub">Off: the slot is empty — no SIM status, no registration, emergency calls only. Applies at the next boot</string>
     <string name="vs_network">Reported network</string>
     <string name="vs_network_sub">What the status bar shows: 2G to LTE. Applies at the next boot</string>
     <string name="vs_advanced">Advanced</string>

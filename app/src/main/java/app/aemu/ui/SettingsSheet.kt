@@ -145,6 +145,7 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
                     TextButton(onClick = { s = s.copy(imei = VmSettings.randomImei()) }) { Text(stringResource(R.string.vs_random)) }
                 }
                 OperatorSection(s) { s = it }
+                Toggle(stringResource(R.string.vs_sim_present), stringResource(R.string.vs_sim_present_sub), s.simPresent) { s = s.copy(simPresent = it) }
                 NetworkTypePicker(s.networkType, img.api) { s = s.copy(networkType = it) }
             }
 

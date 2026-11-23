@@ -77,6 +77,8 @@ data class VmSettings(
     val storageGb: Int = 0,
     /** storage technology the guest sees (an id of StorageType); blank = the firmware's own (AEmulator Plus) */
     val storageType: String = "",
+    /** SIM card inserted in the fake modem; off = empty slot, the guest shows "No SIM card" (AEmulator Plus) */
+    val simPresent: Boolean = true,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -94,6 +96,7 @@ data class VmSettings(
         .put("networkType", networkType)
         .put("storageGb", storageGb)
         .put("storageType", storageType)
+        .put("simPresent", simPresent)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -163,6 +166,7 @@ data class VmSettings(
                 networkType = NetworkType.normalize(o.optInt("networkType", NetworkType.UMTS)),
                 storageGb = StorageSpoof.sanitizeGb(o.optInt("storageGb", 0)),
                 storageType = StorageType.parse(o.optString("storageType", ""))?.id ?: "",
+                simPresent = o.optBoolean("simPresent", true),
             )
         }
     }
