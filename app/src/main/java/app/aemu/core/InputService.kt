@@ -225,13 +225,14 @@ class InputService(private val paths: VmPaths, private val log: (String) -> Unit
             val src = ByteBuffer.wrap(a).order(ByteOrder.LITTLE_ENDIAN); val dst = ByteBuffer.wrap(o).order(ByteOrder.LITTLE_ENDIAN)
             repeat(a.size / EV) { dst.putLong(src.int.toLong()); dst.putLong(src.int.toLong()); dst.putShort(src.short); dst.putShort(src.short); dst.putInt(src.int) }
         }
-        // A/B (single variable): the sink gets the RAW records exactly as built above, not the
-        // widened copy the socket clients receive — the probe run proved the FIFO is drained
-        // but a 64-bit minui never reacted to the 24-byte stream, so test whether the consumer
-        // actually parses the raw 16-byte layout. Client path below is untouched.
+        // Single variable vs the A/B run: the sink now gets the WIDENED 24-byte stream (w),
+        // the same copy the socket clients receive — the earlier 24B sink test ran on the old
+        // shared symlink topology, so retest it on the current clean one (aux FIFOs silent,
+        // event0 the only speaker). When wide is false, w === a and this is a no-op.
+        // Client path below is untouched.
         sink?.let { s ->
-            runCatching { s.write(a); s.flush() }.onSuccess {
-                sinkBytes += a.size
+            runCatching { s.write(w); s.flush() }.onSuccess {
+                sinkBytes += w.size
                 sinkEvents += a.size / EV
                 val nowMs = System.currentTimeMillis()
                 if (sinkLogAt == 0L || nowMs - sinkLogAt >= 1000) {
@@ -249,7 +250,7 @@ class InputService(private val paths: VmPaths, private val log: (String) -> Unit
                         }
                         backlogIn?.available() ?: -1
                     }.getOrDefault(-1)
-                    log("input sink: wrote ${a.size}B (total ${sinkBytes}B, ${sinkEvents} events, backlog ${if (backlog >= 0) "${backlog}B" else "-1"})")
+                    log("input sink: wrote ${w.size}B (total ${sinkBytes}B, ${sinkEvents} events, backlog ${if (backlog >= 0) "${backlog}B" else "-1"})")
                 }
             }.onFailure {
                 log("input sink: write failed, sink dropped (${it.message ?: it.javaClass.simpleName})")
