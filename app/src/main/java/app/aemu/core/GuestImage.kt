@@ -65,6 +65,8 @@ data class VmSettings(
     val hostBattery: Boolean = true,
     /** the guest may vibrate the phone through the vibrator bridge (AEmulator Plus; legacy engines) */
     val vibration: Boolean = true,
+    /** ro.hardware given to the guest at launch; blank = whatever the firmware defines (AEmulator Plus) */
+    val hardware: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -78,6 +80,7 @@ data class VmSettings(
         .put("basebandOverride", basebandOverride)
         .put("hostBattery", hostBattery)
         .put("vibration", vibration)
+        .put("hardware", hardware)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -92,6 +95,14 @@ data class VmSettings(
 
         /** baseband version of the generic fake modem, used while nothing else names one */
         const val DEFAULT_BASEBAND = "AEmulator"
+
+        /** Suggested ro.hardware values for the settings menu (any other value can be typed). */
+        val HARDWARE_PRESETS = listOf("goldfish", "ranchu", "qcom")
+
+        /** Characters allowed in ro.hardware: it names HAL libraries (gralloc.<hw>.so, init.<hw>.rc), so no path or shell characters. */
+        const val HARDWARE_MAX = 32
+        fun cleanHardware(v: String): String =
+            v.filter { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '_' || it == '-' || it == '.' }.take(HARDWARE_MAX)
 
         /** Random Luhn-valid IMEI with a test TAC prefix. */
         fun randomImei(): String {
@@ -135,6 +146,7 @@ data class VmSettings(
                 basebandOverride = o.optString("basebandOverride", ""),
                 hostBattery = o.optBoolean("hostBattery", true),
                 vibration = o.optBoolean("vibration", true),
+                hardware = cleanHardware(o.optString("hardware", "")),
             )
         }
     }

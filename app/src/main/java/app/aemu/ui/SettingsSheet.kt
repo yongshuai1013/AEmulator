@@ -4,6 +4,7 @@ import app.aemu.R
 import androidx.compose.foundation.clickable
 import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -15,6 +16,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonGroupDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
@@ -152,6 +155,7 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
                 label = { Text(stringResource(R.string.vs_baseband)) }, placeholder = { Text(effBaseband) },
                 supportingText = { Text(stringResource(R.string.vs_baseband_sub, effBaseband)) },
                 singleLine = true, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+            HardwarePicker(s.hardware) { s = s.copy(hardware = it) }
 
             Spacer(Modifier.height(8.dp))
             RecoverySection(img)
@@ -211,6 +215,27 @@ private fun OperatorSection(s: VmSettings, set: (VmSettings) -> Unit) {
         singleLine = true, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
     if (s.operatorName.isNotBlank() || s.operatorNumeric.isNotBlank()) {
         TextButton(onClick = { set(s.copy(operatorName = "", operatorNumeric = "")) }) { Text(stringResource(R.string.vs_operator_reset)) }
+    }
+}
+
+/** ro.hardware given to the guest: free text plus a menu of common values; blank = the firmware's own. */
+@Composable
+private fun HardwarePicker(value: String, set: (String) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        OutlinedTextField(value = value, onValueChange = { set(VmSettings.cleanHardware(it)) },
+            label = { Text(stringResource(R.string.vs_hardware)) }, placeholder = { Text(stringResource(R.string.vs_hardware_default)) },
+            supportingText = { Text(stringResource(R.string.vs_hardware_sub)) }, singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii), modifier = Modifier.weight(1f))
+        Box {
+            TextButton(onClick = { open = true }) { Text(stringResource(R.string.vs_hardware_pick)) }
+            DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                DropdownMenuItem(text = { Text(stringResource(R.string.vs_hardware_default)) }, onClick = { open = false; set("") })
+                VmSettings.HARDWARE_PRESETS.forEach { hw ->
+                    DropdownMenuItem(text = { Text(hw) }, onClick = { open = false; set(hw) })
+                }
+            }
+        }
     }
 }
 

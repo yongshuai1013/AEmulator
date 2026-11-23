@@ -415,6 +415,11 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             val hw = File(paths.root, "vendor/etc/init/hw").list().orEmpty().mapNotNull { Regex("^init[.](qcom|mt[0-9]+[a-z]*)[.]rc$").find(it)?.groupValues?.get(1) }.firstOrNull()
             if (hw != null) overrides["ro.boot.hardware"] = hw
         }
+        // ro.hardware from the settings (blank = the firmware's own value); the guest picks HAL libraries by it
+        VmSettings.cleanHardware(s.hardware).takeIf { it.isNotEmpty() }?.let {
+            overrides["ro.hardware"] = it
+            log("props: ro.hardware=$it (from settings)")
+        }
         overrides["ro.sf.lcd_density"] = s.density.toString()
         overrides["qemu.sf.lcd_density"] = s.density.toString()
         // MIUI 10 forces the density of the phone's own panel from this one (440 on a 540-pixel screen)

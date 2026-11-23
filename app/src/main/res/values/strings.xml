@@ -132,6 +132,10 @@
     <string name="vs_vibration_sub">The guest vibrates the phone itself through the vibrator bridge (legacy engines; the 64-bit engine uses the sensor channel).</string>
     <string name="vs_host_battery">Use host battery status</string>
     <string name="vs_host_battery_sub">Sets the battery status of the VM to your device\'s battery level and charging state.</string>
+    <string name="vs_hardware">ro.hardware</string>
+    <string name="vs_hardware_default">Firmware default</string>
+    <string name="vs_hardware_pick">Choose</string>
+    <string name="vs_hardware_sub">Value of ro.hardware given to the guest at launch. The system looks up HAL libraries by it (gralloc.&lt;value&gt;.so, lights.&lt;value&gt;.so…), so change it only if you know what the firmware expects. Takes effect after a full VM restart.</string>
     <string name="vs_baseband">Baseband version</string>
     <string name="vs_baseband_sub">The modem firmware version the guest sees in About phone. Effective now: %1$s. Clear it to fall back to the factory package\'s version. Applies at the next boot</string>
     <string name="m_power_menu">Power menu</string>
