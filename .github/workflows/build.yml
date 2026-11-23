@@ -93,7 +93,14 @@ jobs:
             "${BT}apksigner" sign --ks /tmp/aemulator.p12 --ks-type PKCS12 --ks-key-alias aemulator --ks-pass pass:"$AEMU_KEYSTORE_PASSWORD" --key-pass pass:"$AEMU_KEYSTORE_PASSWORD" --out "$out" "$f"
             "${BT}apksigner" verify --print-certs "$out" | head -4
           done
+      - name: Stage the installable signed APK
+        run: |
+          mkdir -p signed-out
+          src="app/build/outputs/apk/standard/release/app-standard-release-signed.apk"
+          test -s "$src"
+          cp "$src" signed-out/AEmulator.apk
+          ls -l signed-out
       - uses: actions/upload-artifact@v4
         with:
           name: aemulator-apk-signed
-          path: app/build/outputs/apk/*/release/*-signed.apk
+          path: signed-out/AEmulator.apk
