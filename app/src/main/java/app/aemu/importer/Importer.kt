@@ -429,6 +429,27 @@ class Importer(
                         t.delete()
                     }
                 }
+                // Odin-era tars (early Galaxy: I7500 and kin) carry the system partition under a bare
+                // name — no extension at all, so SYSTEM_IMAGE cannot see it. The content decides: a
+                // filesystem image is claimed exactly like a named one; anything else keeps the
+                // rootfs-tree treatment further down, byte for byte.
+                base.equals("system", true) && e.isFile -> {
+                    if (under != null) {
+                        val ext = ExtentSource(under, listOf(tar.bytesRead to e.size))
+                        if (isFsImage(ext)) importImage(ext, "system")
+                        else writeFile(n, tar.nonClosing(), e.mode)
+                    } else {
+                        val t = spill(maybeLz4(tar, base), base)
+                        var claimed = false
+                        try {
+                            FileChannel.open(t.toPath(), StandardOpenOption.READ).use { c ->
+                                val src = ChannelSource(c)
+                                if (isFsImage(src)) { importImage(src, "system"); claimed = true }
+                            }
+                            if (!claimed) writeFile(n, t.inputStream(), e.mode)
+                        } finally { t.delete() }
+                    }
+                }
                 // other partitions as separate images (Samsung CSC: prism, optics; pre-super AP: vendor, product, odm)
                 base.matches(PART_IMAGE) && e.isFile && e.size > 4096 -> {
                     val p = base.lowercase().substringBefore('.')
@@ -441,6 +462,12 @@ class Importer(
                 base.matches(Regex("(?i)(system|kernel|boot)\\.sin")) && e.isFile -> importSin(tar.nonClosing(), base)
                 base.matches(Regex("(?i)(boot\\.img|zImage|kernel)(\\.lz4)?")) && e.isFile -> takeBoot(maybeLz4(tar, base).readBytes())
                 base.matches(Regex("(?i)recovery\\.img(\\.lz4)?")) && e.isFile && e.size < 64_000_000 -> recovery = maybeLz4(tar, base).readBytes()
+                // the same Odin-era bare naming for the recovery partition; only a real boot image is taken
+                base.equals("recovery", true) && e.isFile && e.size < 64_000_000 -> {
+                    val b = tar.readBytes()
+                    if (b.size >= 8 && String(b, 0, 8, Charsets.ISO_8859_1) == "ANDROID!") recovery = b
+                    else log("bare \"recovery\" is not a boot image, skipped")
+                }
                 base.matches(Regex("(?i).*\\.(tar|tar\\.md5)")) && e.isFile && e.size > 20_000_000 -> importTarStream(tar.nonClosing(), base, depth + 1)
                 // factory-образы Google: tgz → image-*.zip → system.img/boot.img; Samsung: zip внутри tar
                 base.lowercase().endsWith(".zip") && e.isFile && e.size > 20_000_000 -> {
@@ -489,6 +516,11 @@ class Importer(
     }
 
     // ------------------------------------------------------------------ образы ФС
+
+    /** the content probes [importImage] dispatches on: an entry is a partition image iff one of them hits */
+    private fun isFsImage(src: RandomSource): Boolean =
+        SparseSource.probe(src) || Ext4Reader.probe(src) || SuperImage.probe(src) || Yaffs2Image.probe(src) ||
+            FatImage.probe(src) || ErofsReader.probe(src) || UbiFsReader.probe(src)
 
     /** A partition image of any supported file system: sparse → ext4, super.img (dynamic partitions), YAFFS2, FAT/RFS. */
     private fun importImage(src0: RandomSource, mount: String) {
