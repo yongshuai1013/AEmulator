@@ -22,11 +22,13 @@ class AudioIn(private val ctx: Context, private val root: File, private val log:
     private val ctl = File(root, "dev/aemu_mic_ctl")
     private val pcm = File(root, "dev/aemu_mic")
     @Volatile private var running = false
+    @Volatile private var started = false
     @Volatile private var rec: Thread? = null
     @Volatile private var want: Pair<Int, Int>? = null
     @Volatile var onPermissionNeeded: (() -> Unit)? = null
 
     fun start() {
+        started = true
         running = true
         runCatching {
             for (f in listOf(ctl, pcm)) { f.delete(); f.parentFile?.mkdirs(); Os.mkfifo(f.absolutePath, "666".toInt(8)); Os.chmod(f.absolutePath, "666".toInt(8)) }
@@ -35,6 +37,12 @@ class AudioIn(private val ctx: Context, private val root: File, private val log:
     }
 
     fun stop() {
+        // Never started (recovery mode starts no mic): the ctl FIFO can
+        // still exist in the tree with no reader thread holding it, and
+        // opening a FIFO for append blocks until a reader appears --
+        // stop() would never return.
+        if (!started) return
+        started = false
         running = false
         want = null
         runCatching { File(ctl.absolutePath).appendText("stop\n") }

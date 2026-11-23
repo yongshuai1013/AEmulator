@@ -27,9 +27,11 @@ class Sensors(private val ctx: Context, private val root: File, private val log:
     private val vibFifo = File(root, "sys/class/timed_output/vibrator/enable")
     @Volatile private var out: FileDescriptor? = null
     @Volatile private var running = false
+    @Volatile private var started = false
     private val rec = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
 
     fun start() {
+        started = true
         running = true
         runCatching {
             mkfifo(accelFifo)
@@ -45,6 +47,12 @@ class Sensors(private val ctx: Context, private val root: File, private val log:
     }
 
     fun stop() {
+        // Never started (recovery mode starts no sensors): the vibrator FIFO
+        // can still exist in the tree with no reader thread holding it, and
+        // opening a FIFO for append blocks until a reader appears -- stop()
+        // would never return.
+        if (!started) return
+        started = false
         running = false
         apply()
         runCatching { out?.let { Os.close(it) } }; out = null
