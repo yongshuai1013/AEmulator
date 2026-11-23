@@ -11,6 +11,7 @@ import app.aemu.core.RecoveryImage
 import app.aemu.importer.tools.FirmwareToolset
 import app.aemu.importer.tools.SquashFs
 import app.aemu.importer.tools.WimReader
+import app.aemu.importer.tools.WindowsCab
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.archivers.sevenz.SevenZFile
@@ -141,6 +142,10 @@ class Importer(
             HuaweiApp.probe(h) -> importHuaweiApp(src, name, strict = depth == 0)
             // Acer flash package (*.bin / *.nb0): table of named images, YAFFS2 rootfs + system (AEmulator-Plus)
             AcerBin.probe(h) -> importAcerBin(src, name, strict = depth == 0)
+            // Windows servicing cabinet of the Android subsystem of Windows 10 Mobile (microsoft_ms_projecta_mainos_cbs_*.cab):
+            // LZX folder with aow.wim inside. Ahead of the LG KDZ route, which takes every plain *.cab for an LG one. (AEmulator-Plus)
+            h.size >= 4 && h[0] == 'M'.code.toByte() && h[1] == 'S'.code.toByte() && h[2] == 'C'.code.toByte() && h[3] == 'F'.code.toByte() &&
+                !name.endsWith(".kdz", true) && WindowsCab.hasWim(cabSource(src)) -> importWindowsCab(src, name)
             // aow.wim on its own (the Android subsystem image of a Windows 10 Mobile servicing package) (AEmulator-Plus)
             WimReader.probe(h) -> importWimStandalone(src, name)
             SparseSource.probe(src) || Ext4Reader.probe(src) || SuperImage.probe(src) || ErofsReader.probe(src) || UbiFsReader.probe(src) || SquashFsImage.probe(src) -> importImage(src, "system")
@@ -1042,6 +1047,31 @@ class Importer(
                 }
             }
         } finally { f.delete(); work.deleteRecursively() }
+    }
+
+    private fun cabSource(src: RandomSource) = object : WindowsCab.Source {
+        override fun length() = src.size
+        override fun readFully(pos: Long, b: ByteArray, off: Int, len: Int) { src.read(pos, ByteBuffer.wrap(b, off, len)) }
+    }
+
+    /**
+     * microsoft_ms_projecta_mainos_cbs_*.cab: an LZX cabinet with update.mum, manifests, the subsystem's Windows-side DLLs
+     * and windows/System32/aow/aow.wim, whose image is the Android root file system (init, system/, sbin/ ...). Only the
+     * WIM is of use to the guest; it is unpacked to a temp file and read by [importWimFile]. (AEmulator-Plus)
+     */
+    private fun importWindowsCab(src: RandomSource, name: String) {
+        val work = File(tmp, "cab-${System.nanoTime()}").apply { mkdirs() }
+        try {
+            onProgress("Opening $name", -1f)
+            val wims = WindowsCab.extractWims(cabSource(src), work) { msg -> log(msg) }
+            var any = false
+            for (w in wims) {
+                if (cancelled) throw IOException("cancelled")
+                if (importWimFile(w, w.name)) any = true
+                w.delete()                       // the unpacked copy is no longer needed
+            }
+            if (!any) throw IOException("no Android system partition found in file")
+        } finally { work.deleteRecursively() }
     }
 
     private fun importWimStandalone(src: RandomSource, name: String) {
