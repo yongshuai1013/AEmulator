@@ -135,6 +135,8 @@ class Importer(
             Iso9660.probe(src) -> importIso(src, name, depth)
             // a whole-disk image (GPT or MBR partition table), e.g. an eMMC/SD dump (AEmulator-Plus)
             isDiskImage(src) -> importDiskImage(src, name)
+            // Huawei dload/UPDATE.APP: packet chain of raw partition images (the container has no name-based hint) (AEmulator-Plus)
+            HuaweiApp.probe(h) -> importHuaweiApp(src, name, strict = depth == 0)
             // Acer flash package (*.bin / *.nb0): table of named images, YAFFS2 rootfs + system (AEmulator-Plus)
             AcerBin.probe(h) -> importAcerBin(src, name, strict = depth == 0)
             SparseSource.probe(src) || Ext4Reader.probe(src) || SuperImage.probe(src) || ErofsReader.probe(src) || UbiFsReader.probe(src) || SquashFsImage.probe(src) -> importImage(src, "system")
@@ -351,6 +353,12 @@ class Importer(
                     withEntrySource(zip, e) { s ->
                         val hb = ByteBuffer.allocate(1100); s.read(0, hb)
                         if (AcerBin.probe(hb.array())) importAcerBin(s, base, strict = false)
+                    }
+                // Huawei UPDATE.APP packed in the archive: the magic at 0x5C decides (AEmulator-Plus)
+                base.endsWith(".app", true) && e.size > 0x100 ->
+                    withEntrySource(zip, e) { s ->
+                        val hb = ByteBuffer.allocate(1100); s.read(0, hb)
+                        if (HuaweiApp.probe(hb.array())) importHuaweiApp(s, base, strict = false)
                     }
             }
             done += maxOf(0L, e.size)
@@ -923,6 +931,61 @@ class Importer(
             if (e.base.endsWith(".img", true) && e.size >= 4096)
                 log("acer $label: skipped ${e.base} (${e.size shr 10} KB)")
         }
+    }
+
+    /**
+     * Huawei UPDATE.APP (see [HuaweiApp]). Of its images the importer needs the system partition (YAFFS2 or ext4),
+     * the boot image and, optionally, the recovery image; modem, bootloader pieces, userdata and the carrier
+     * customisation partition are skipped. Which ANDROID! image is boot and which is recovery is decided by the
+     * ramdisk (/sbin/recovery), because the image ids differ between devices.
+     * [strict]: the file was chosen directly, so a package without a system partition (UPDATE_cust.APP) is an error.
+     * (Adapted from AEmulator-Plus.)
+     */
+    private fun importHuaweiApp(src: RandomSource, name: String, strict: Boolean) {
+        val label = name.replace('\\', '/').substringAfterLast('/')
+        val packets = try { HuaweiApp.packets(src) } catch (ex: IOException) {
+            if (strict) throw ex
+            log("skipped $label: ${ex.message}"); return
+        }
+        if (packets.isEmpty()) {
+            if (strict) throw IOException("not a Huawei update package: $label")
+            log("skipped $label: not a Huawei update package"); return
+        }
+        log("huawei $label: ${packets.size} packets, hardware ${packets[0].hardware.ifEmpty { "?" }}, built ${packets[0].date}")
+        fun slice(p: HuaweiApp.Packet): RandomSource = SliceSource(src, p.dataOffset, p.size)
+        fun head(p: HuaweiApp.Packet, n: Int): ByteArray {
+            val b = ByteBuffer.allocate(minOf(n.toLong(), p.size).toInt()); slice(p).read(0, b); return b.array()
+        }
+
+        // boot / recovery
+        for (p in packets) {
+            if (cancelled) throw IOException("cancelled")
+            if (p.size < 4096 || p.size > 64_000_000) continue
+            if (String(head(p, 8), Charsets.ISO_8859_1) != "ANDROID!") continue
+            val data = readAllFrom(slice(p))
+            if (hasRecoveryBinary(data)) { if (recovery == null) recovery = data } else takeBoot(data)
+        }
+
+        // filesystems: the system partition is image id 0, otherwise the one whose tree looks like /system
+        val fsParts = packets.filter { p ->
+            if (p.size < (4L shl 20)) return@filter false
+            val h = head(p, 8)
+            if (String(h, Charsets.ISO_8859_1) == "ANDROID!" || (h[0].toInt() == 0x7f && h[1] == 'E'.code.toByte())) return@filter false
+            isFsImage(slice(p))
+        }
+        val systemPacket = fsParts.firstOrNull { it.id == HuaweiApp.ID_SYSTEM }
+            ?: fsParts.firstOrNull { looksLikeSystem(slice(it)) }
+        if (systemPacket == null || gotSystem) {
+            val what = if (gotSystem) "system already imported" else "no system partition"
+            if (strict && !gotSystem) throw IOException("\"$label\" has no system partition (customization-only package?); import UPDATE.APP instead")
+            log("huawei $label: $what; skipped ${fsParts.size} other partition(s)")
+            return
+        }
+        onProgress("Verifying $label", -1f)
+        val bad = HuaweiApp.verify(src, systemPacket) { if (cancelled) throw IOException("cancelled") }
+        if (bad > 0) log("huawei $label: $bad block(s) of the system image fail their CRC, the download may be damaged")
+        importImage(slice(systemPacket), "system")
+        for (p in fsParts) if (p !== systemPacket) log("huawei $label: skipped partition id 0x%02x (%d KB)".format(p.id, p.size shr 10))
     }
 
     /**
