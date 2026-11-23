@@ -1086,7 +1086,6 @@ class Importer(
      * (Adapted from AEmulator-Plus.)
      */
     private fun importToolsetExtract(src: RandomSource, name: String, depth: Int) {
-        if (depth >= MAX_DEPTH) throw IOException("archive nested too deeply")
         val f = spill(streamOf(src), name)
         val work = File(tmp, "fw-${System.nanoTime()}").apply { mkdirs() }
         try {
@@ -1100,13 +1099,18 @@ class Importer(
                 if (cancelled) throw IOException("cancelled")
                 val base = a.file.name.lowercase()
                 when {
-                    a.role == FirmwareToolset.Role.BOOT -> takeBoot(readAllFrom(FileSource(a.file)))
+                    a.role == FirmwareToolset.Role.BOOT ->
+                        if (a.file.length() <= (128L shl 20)) takeBoot(a.file.readBytes())
                     a.role == FirmwareToolset.Role.RECOVERY ->
-                        if (a.file.length() < 64_000_000) recovery = readAllFrom(FileSource(a.file))
-                    base.startsWith("vendor") -> runCatching { importImage(FileSource(a.file), "vendor") }
+                        if (a.file.length() < 64_000_000) recovery = a.file.readBytes()
+                    base.startsWith("vendor") -> runCatching {
+                        FileChannel.open(a.file.toPath(), StandardOpenOption.READ).use { c -> importImage(ChannelSource(c), "vendor") }
+                    }
                     base.contains("product") || base.contains("system_ext") || base.contains("odm") ||
                         base.contains("modem") || base.contains("oem") -> log("fw: skipped ${a.file.name}")
-                    else -> handle(FileSource(a.file), a.file.name, depth + 1)
+                    else -> FileChannel.open(a.file.toPath(), StandardOpenOption.READ).use { c ->
+                        handle(ChannelSource(c), c, a.file.name, depth + 1)
+                    }
                 }
             }
         } finally { f.delete(); work.deleteRecursively() }
