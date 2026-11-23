@@ -51,6 +51,18 @@ data class VmSettings(
      * feature is off and the guest keeps the host's answers. Takes effect at the next boot.
      */
     val kernelBanner: String = "",
+    /**
+     * The boot loader version string the guest reports as ro.bootloader ("angler-03.84").
+     * Derived at import from the factory package's bootloader file name; blank = not derivable,
+     * the guest then keeps the template's answer. Takes effect at the next boot.
+     */
+    val bootloaderName: String = "",
+    /**
+     * The serial number the guest reports as ro.serialno. Filled in at import with the value
+     * [deriveSerialNo] makes from the image id (stable per image, unique across images);
+     * blank = derived from the image id at boot instead.
+     */
+    val serialNo: String = "",
     /** operator name the fake modem reports; blank = the generic sample name */
     val operatorName: String = "",
     /** operator PLMN (MCC+MNC digits) the fake modem reports; blank = the test network 00101 */
@@ -110,6 +122,8 @@ data class VmSettings(
         .put("keepScreenOn", keepScreenOn).put("showLed", showLed).put("mtMode", mtMode).put("legacyEngine", legacyEngine)
         .put("ramMb", ramMb).put("radio", radio).put("native32", native32).put("imei", imei).put("qemuArgs", qemuArgs)
         .put("kernelBanner", kernelBanner)
+        .put("bootloaderName", bootloaderName)
+        .put("serialNo", serialNo)
         .put("operatorName", operatorName).put("operatorNumeric", operatorNumeric)
         .put("basebandOverride", basebandOverride)
         .put("hostBattery", hostBattery)
@@ -194,6 +208,8 @@ data class VmSettings(
                 imei = o.optString("imei", ""),
                 qemuArgs = o.optString("qemuArgs", ""),
                 kernelBanner = o.optString("kernelBanner", ""),
+                bootloaderName = o.optString("bootloaderName", ""),
+                serialNo = o.optString("serialNo", ""),
                 operatorName = o.optString("operatorName", ""),
                 operatorNumeric = o.optString("operatorNumeric", ""),
                 basebandOverride = o.optString("basebandOverride", ""),
@@ -365,4 +381,16 @@ data class GuestImage(
             )
         }
     }
+}
+
+/**
+ * A stable per-image serial number derived from the image id: the same image always reports the
+ * same serial, and two images never share one. The shape (ten upper-case alphanumerics) follows the
+ * common retail convention; exact per-model formats are to be calibrated against real getprop
+ * samples later (detection map §5.3) — what matters now is that no two guests answer alike.
+ */
+fun deriveSerialNo(id: String): String {
+    val digest = java.security.MessageDigest.getInstance("SHA-256").digest(id.toByteArray(Charsets.UTF_8))
+    val alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    return buildString(10) { for (i in 0 until 10) append(alphabet[(digest[i].toInt() and 0xff) % alphabet.length]) }
 }

@@ -433,6 +433,26 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             overrides["ro.hardware"] = it
             log("props: ro.hardware=$it (from settings)")
         }
+        // The verified-boot state a locked retail phone reports. Our guests have no boot loader, so
+        // without this the whole family reads empty — which no real phone ever does. The constants
+        // live here, in the per-boot overrides, so images imported earlier are covered too: their
+        // templates still carry the old defaults (ro.secure=0, ro.bootmode=unknown, …).
+        overrides["ro.boot.flash.locked"] = "1"
+        overrides["ro.boot.verifiedbootstate"] = "green"
+        overrides["ro.boot.veritymode"] = "enforcing"
+        overrides["ro.bootmode"] = "normal"
+        overrides["ro.secure"] = "1"
+        overrides["ro.adb.secure"] = "1"
+        // the AVB device state exists only from Android 8.0 on; on 6.0 its absence is the correct answer
+        if (img.api >= 26) overrides["ro.boot.vbmeta.device_state"] = "locked"
+        // a Knox property: only Samsung firmware carries it
+        if (img.brand.equals("samsung", ignoreCase = true)) overrides["ro.boot.warranty_bit"] = "0"
+        // the boot loader's version string, derived at import from the factory package (blank = the
+        // template's answer stays)
+        if (s.bootloaderName.isNotEmpty()) overrides["ro.bootloader"] = s.bootloaderName
+        // a serial per image, never a shared constant: the settings value, or the same derivation
+        // from the image id for images imported before the field existed
+        overrides["ro.serialno"] = s.serialNo.ifBlank { deriveSerialNo(img.id) }
         // storage technology the guest sees (AEmulator Plus): the boot-device properties follow the setting
         StorageSpoof.props(StorageType.parse(s.storageType)).forEach { (k, v) -> overrides[k] = v }
         overrides["ro.sf.lcd_density"] = s.density.toString()
