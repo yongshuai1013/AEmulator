@@ -111,6 +111,10 @@ class InputService(private val paths: VmPaths, private val log: (String) -> Unit
     private var sinkEvents = 0L
     private var sinkLogAt = 0L
 
+    // probe: read-side view of the current sink's fd, for pipe backlog checks
+    private var backlogFor: java.io.OutputStream? = null
+    private var backlogIn: java.io.FileInputStream? = null
+
     private fun send(now: List<P>) {
         if (clients.isEmpty() && sink == null) return
         val b = ByteBuffer.allocate((now.size * 7 + 3) * EV).order(ByteOrder.LITTLE_ENDIAN)
@@ -233,12 +237,17 @@ class InputService(private val paths: VmPaths, private val log: (String) -> Unit
                 if (sinkLogAt == 0L || nowMs - sinkLogAt >= 1000) {
                     sinkLogAt = nowMs
                     // probe: bytes still sitting unread in the event0 pipe at log
-                    // time (FIONREAD on the host fd behind the sink stream).
-                    // -1 when unmeasurable; measuring must never break writing.
+                    // time. Os.ioctlInt is not in the public SDK, so read the pipe
+                    // through a cached FileInputStream on the same fd instead —
+                    // available() is FIONREAD underneath. -1 when unmeasurable;
+                    // measuring must never break writing.
                     val backlog = runCatching {
-                        val fd = (s as? java.io.FileOutputStream)?.fd
-                        if (fd == null) -1
-                        else android.system.Os.ioctlInt(fd, android.system.OsConstants.FIONREAD)
+                        val fos = s as? java.io.FileOutputStream ?: return@runCatching -1
+                        if (backlogFor !== s) {
+                            backlogFor = s
+                            backlogIn = java.io.FileInputStream(fos.fd)
+                        }
+                        backlogIn?.available() ?: -1
                     }.getOrDefault(-1)
                     log("input sink: wrote ${a.size}B (total ${sinkBytes}B, ${sinkEvents} events, backlog ${if (backlog >= 0) "${backlog}B" else "-1"})")
                 }
