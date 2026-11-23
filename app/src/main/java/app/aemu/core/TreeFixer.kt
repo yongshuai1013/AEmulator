@@ -1040,7 +1040,7 @@ class TreeFixer(
     private fun procIdentity() = runCatching {
         val cmd = File(root, "proc/cmdline")
         cmd.parentFile?.mkdirs()
-        val ct = GuestProcInfo.cmdline(img) + "\n"
+        val ct = GuestProcInfo.cmdline(img, root) + "\n"
         if (!cmd.isFile || cmd.readText() != ct) cmd.writeText(ct)
         val cpu = File(root, "proc/cpuinfo")
         val ut = GuestProcInfo.cpuinfo(img, root)

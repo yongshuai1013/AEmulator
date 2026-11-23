@@ -74,10 +74,11 @@ object GuestProcInfo {
      * sources (ro.boot.hardware's value, the derived serial, the derived bootloader), so the file and
      * the properties cannot contradict each other.
      */
-    fun cmdline(img: GuestImage): String {
+    fun cmdline(img: GuestImage, root: File): String {
         val s = img.settings
         val parts = ArrayList<String>()
-        parts += "androidboot.hardware=${img.hardware.ifBlank { "unknown" }}"
+        val hw = s.hardware.ifBlank { imageProps(root)["ro.hardware"].orEmpty() }
+        parts += "androidboot.hardware=${hw.ifBlank { "unknown" }}"
         if (s.serialNo.isNotBlank()) parts += "androidboot.serialno=${s.serialNo}"
         if (s.bootloaderName.isNotEmpty()) parts += "androidboot.bootloader=${s.bootloaderName}"
         parts += "androidboot.mode=normal"
@@ -87,7 +88,7 @@ object GuestProcInfo {
     /** The SoC platform the image names for itself (ro.board.platform of its build.prop). */
     fun platform(img: GuestImage, root: File): String {
         val p = imageProps(root)
-        return (p["ro.board.platform"] ?: p["ro.product.board"] ?: img.hardware).trim()
+        return (p["ro.board.platform"] ?: p["ro.product.board"] ?: p["ro.hardware"] ?: img.settings.hardware).trim()
     }
 
     /**
