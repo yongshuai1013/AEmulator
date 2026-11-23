@@ -627,6 +627,18 @@ class TreeFixer(
                 jar.setReadable(true, false); copied++
             }
         }.onFailure { log("aemu-stubs.jar: ${it.message}") }
+        // the emulated Wi-Fi (WifiEmu): the same dex jar as for the 32-bit guests; the guest's own
+        // IWifiManager is read at run time. GuestVm starts it when the setting is on; the jar of a
+        // guest that was switched off stays unused
+        runCatching {
+            val jar = File(root, WifiEmu.JAR_PATH)
+            val bytes = EngineAssets.open(ctx, "engines/kk/${WifiEmu.JAR_NAME}").use { it.readBytes() }
+            if (!jar.isFile || !jar.readBytes().contentEquals(bytes)) {
+                jar.parentFile?.mkdirs()
+                jar.writeBytes(bytes)
+                jar.setReadable(true, false); copied++
+            }
+        }.onFailure { log("${WifiEmu.JAR_NAME}: ${it.message}") }
         if (copied > 0) log("engine n64 files updated: $copied")
         // qemu-arm (the firmware's 32-bit programs) asks for the lowest mappable address; the phone hides the real file
         runCatching { File(root, "proc/sys/vm").mkdirs(); File(root, "proc/sys/vm/mmap_min_addr").writeText("65536") }
@@ -723,6 +735,7 @@ class TreeFixer(
                 "audio.primary.default.so" to "system/lib/hw/audio.primary.default.so",
                 "gralloc.default.so" to "system/lib/hw/gralloc.default.so",
                 "aemu-stubs.jar" to "system/framework/aemu-stubs.jar",
+                "aemu-wifi.jar" to "system/framework/aemu-wifi.jar",
             )
             Engine.GB -> listOf(
                 "libashmemshim.so" to "system/lib/libashmemshim.so",

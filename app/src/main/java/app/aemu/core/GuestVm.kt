@@ -36,6 +36,11 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     val settings get() = img.settings
     val engine get() = img.engine
 
+    /** emulated Wi-Fi (WifiEmu) can serve this image: engine and API in range, and not a recovery boot */
+    private val wifiSupported get() = WifiEmu.supported(engine, img.api, recoveryMode, false)
+    /** the guest Wi-Fi service is up for this run: its network replaces the Ethernet stand-in */
+    @Volatile private var wifiOn = false
+
     @Volatile var state = State.STOPPED
         private set
     @Volatile var bootAt = 0L
@@ -673,6 +678,14 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
 
         // 5. службы гостя по плану из init.rc прошивки
         val plan = servicePlan()
+        // emulated Wi-Fi: the settings file the guest service reads, written (or, when off, removed)
+        // before anything starts; the phone's own connection is mirrored into it when there is one
+        val wifi = settings.wifi && wifiSupported && File(paths.root, WifiEmu.JAR_PATH).isFile
+        if (settings.wifi && wifiSupported && !wifi) log("wifi: ${WifiEmu.JAR_NAME} is not installed (build guest-wifi/build.sh), the guest keeps its normal network")
+        val mirror = if (wifi && settings.wifiMirrorHost) HostWifi.current(ctx) else null
+        WifiEmu.write(paths.root, settings, wifi, mirror)
+        wifiOn = wifi
+        if (wifi) log("wifi: emulated network \"${mirror?.ssid ?: settings.wifiSsid}\" (${if (WifiEmu.secured(settings)) "WPA2" else "open"})" + (if (mirror != null) ", mirroring the phone's connection" else ""))
         var glDone = false
         // (debugging, see Kernel64.syncLog: only the first N services are started, then the guest is left as it is)
         val stopAfter = if (engine == Engine.N64 && kernel.syncLog) runCatching { File(paths.root, "dev/.aemu-stop-after").readText().trim().toInt() }.getOrNull() else null
@@ -708,8 +721,15 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 startService(GuestService("aemu-vold", listOf("/system/bin/app_process",
                     "-Djava.class.path=/system/framework/aemu-stubs.jar", "/system/bin", "app.aemu.stub.VoldStub") + (if (kernel.volumeAtUserStart) listOf("userstart") else emptyList()), optional = true))
             }
+            // emulated Wi-Fi: the guest service answers WifiManager as a connected access point and, on 5.0+,
+            // registers the Wi-Fi network itself (instead of the Ethernet stand-in below)
+            if (svc.name == "zygote" && wifiOn) {
+                synchronized(procs) { procs.remove("aemu-wifi") }?.let { runCatching { it.destroyForcibly() } }
+                startService(GuestService("aemu-wifi", listOf("/system/bin/app_process",
+                    "-Djava.class.path=/${WifiEmu.JAR_PATH}", "/system/bin", "app.aemu.stub.WifiStub"), optional = true))
+            }
             // 5.0–7.x: a registered network, otherwise ConnectivityService says "no active network" and browsers stay offline
-            if (svc.name == "zygote" && (if (engine == Engine.N64) kernel.registeredNetwork else img.api in 21..25) && engine != Engine.GB && File(paths.root, "system/framework/aemu-stubs.jar").isFile) {
+            if (svc.name == "zygote" && !wifiOn && (if (engine == Engine.N64) kernel.registeredNetwork else img.api in 21..25) && engine != Engine.GB && File(paths.root, "system/framework/aemu-stubs.jar").isFile) {
                 synchronized(procs) { procs.remove("aemu-net") }?.let { runCatching { it.destroyForcibly() } }
                 startService(GuestService("aemu-net", listOf("/system/bin/app_process",
                     "-Djava.class.path=/system/framework/aemu-stubs.jar", "/system/bin", "app.aemu.stub.NetStub") + (if (Kernel64.forApi(img.api).ethernetStandIn) listOf("ethernet") else emptyList()), optional = true))
@@ -965,6 +985,25 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         runCatching { guestShell("service call SurfaceFlinger 1008 i32 1", 15_000) }
     }
 
+    /**
+     * The emulated Wi-Fi registers with ConnectivityService and connects, but its NetworkMonitor then
+     * marks it "validation failed" for good: every probe socket it binds to the network is refused and
+     * DNS through the network answers ENONET, because netd cannot attach an interface to the network
+     * here. Internet itself works (the guest's traffic goes out through the host), so the check is
+     * switched off: with captive_portal_mode = 0 (IGNORE) NetworkMonitor reports the network as
+     * validated without probing it. (AEmulator Plus; here only for a guest whose emulated Wi-Fi is on,
+     * and read by NetworkMonitor when the network registers, so it is set once the system is up.)
+     */
+    private fun skipInternetCheck() {
+        if (img.api < 21) return
+        runCatching {
+            val out = guestShell("export PATH=/system/bin:/system/xbin:\$PATH; " +
+                "settings put global captive_portal_mode 0; settings put global captive_portal_detection_enabled 0; " +
+                "settings get global captive_portal_mode", 60_000)
+            log("wifi: internet check off (captive_portal_mode=" + out.trim().lines().lastOrNull().orEmpty() + ")")
+        }.onFailure { log("wifi: could not switch the internet check off: ${it.message}") }
+    }
+
     private fun onProp(k: String, v: String) {
         if (k == "sys.powerctl") { powerRequest(v); return }
         // SurfaceFlinger has just come up (it resets this before starting the boot animation)
@@ -1075,6 +1114,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             runCatching { guestShell("cmd webviewupdate disable-multiprocess", 30_000) }
         TreeFixer(ctx, paths, img, ::log).noScreenSleep()
         disableBrokenComponents()
+        if (wifiOn) skipInternetCheck()
         if (img.api >= 24) runCatching { enableHome() }.onFailure { log("home screen check failed: $it") }
         val img2 =img.copy(lastBootMs = bootDoneAt - bootAt, bootCount = img.bootCount + 1)
         ImageStore.save(ctx, img2)
@@ -1320,8 +1360,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         File("/proc").listFiles()?.forEach { d ->
             val pid = d.name.toIntOrNull() ?: return@forEach
             val cmd = runCatching { String(File(d, "cmdline").readBytes(), Charsets.ISO_8859_1) }.getOrNull() ?: return@forEach
-            // app_process с aemu-stubs.jar — наша заглушка bluetooth_manager, не приложение зиготы
-            if (cmd.contains(marker) && cmd.contains("/system/bin/app_process") && !cmd.contains("aemu-stubs.jar")) {
+            // app_process с aemu-stubs.jar / aemu-wifi.jar — наши службы (bluetooth_manager, Wi-Fi), не приложения зиготы
+            if (cmd.contains(marker) && cmd.contains("/system/bin/app_process") && !cmd.contains("aemu-stubs.jar") && !cmd.contains("aemu-wifi.jar")) {
                 runCatching { AProcess.sendSignal(pid, 9) }; n++
             } else if (orphanOfThisImage(d)) {
                 // 7.0+: a zygote child rewrites its whole command line ("system_server"), so the path is gone from it;
