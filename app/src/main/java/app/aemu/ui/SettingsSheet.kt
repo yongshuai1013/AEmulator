@@ -61,6 +61,7 @@ import app.aemu.core.NetworkType
 import app.aemu.core.StorageSpoof
 import app.aemu.core.StorageType
 import app.aemu.core.VmSettings
+import app.aemu.core.deriveSerialNo
 import app.aemu.core.WifiEmu
 import kotlin.math.roundToInt
 
@@ -184,6 +185,13 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             OutlinedTextField(value = s.kernelBanner, onValueChange = { s = s.copy(kernelBanner = it) },
                 label = { Text(stringResource(R.string.vs_kernel)) }, supportingText = { Text(stringResource(R.string.vs_kernel_sub)) },
                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+            OutlinedTextField(value = s.bootloaderName, onValueChange = { s = s.copy(bootloaderName = it) },
+                label = { Text(stringResource(R.string.vs_bootloader)) }, supportingText = { Text(stringResource(R.string.vs_bootloader_sub)) },
+                singleLine = true, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+            OutlinedTextField(value = s.serialNo, onValueChange = { s = s.copy(serialNo = it) },
+                label = { Text(stringResource(R.string.vs_serialno)) }, placeholder = { Text(deriveSerialNo(img.id)) },
+                supportingText = { Text(stringResource(R.string.vs_serialno_sub)) },
+                singleLine = true, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
             val effBaseband = s.basebandOverride.ifBlank { img.baseband }.ifBlank { VmSettings.DEFAULT_BASEBAND }
             OutlinedTextField(value = s.basebandOverride, onValueChange = { s = s.copy(basebandOverride = it) },
                 label = { Text(stringResource(R.string.vs_baseband)) }, placeholder = { Text(effBaseband) },

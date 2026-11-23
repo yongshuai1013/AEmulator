@@ -161,6 +161,10 @@
     <string name="vs_qemu_args_sub">Example: -d unimp DHD_TBFLUSH=2 (NAME=value becomes an environment variable)</string>
     <string name="vs_kernel">Linux kernel version</string>
     <string name="vs_kernel_sub">The banner from the firmware\'s own kernel: shown in /proc/version and reported by uname. Clear it to turn this off. Applies at the next boot</string>
+    <string name="vs_bootloader">Bootloader version</string>
+    <string name="vs_bootloader_sub">Reported to the guest as ro.bootloader. Filled in from the factory package at import; blank = the version is unknown. Applies at the next boot</string>
+    <string name="vs_serialno">Serial number</string>
+    <string name="vs_serialno_sub">Reported to the guest as ro.serialno. Blank = the one derived from this image, unique per image. Applies at the next boot</string>
     <string name="vs_vibration">Vibration bridge</string>
     <string name="vs_vibration_sub">The guest vibrates the phone itself through the vibrator bridge (legacy engines; the 64-bit engine uses the sensor channel).</string>
     <string name="vs_host_battery">Use host battery status</string>
