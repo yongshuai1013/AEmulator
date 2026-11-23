@@ -225,6 +225,15 @@ static void say(struct camera_device *d, const char *cmd) { if (d->fd >= 0) writ
 typedef int (*aemu_log_fn)(int prio, const char *tag, const char *fmt, ...);
 static aemu_log_fn g_log_fn;
 static int g_log_state;   /* 0 = untried, 1 = ready, -1 = no liblog in this guest */
+static aemu_log_fn log_fn(void) {
+    if (!g_log_state) {
+        g_log_state = -1;
+        void *h = dlopen("liblog.so", 0);
+        void *f = h ? dlsym(h, "__android_log_print") : 0;
+        if (f) { g_log_fn = (aemu_log_fn)f; g_log_state = 1; }
+    }
+    return g_log_state == 1 ? g_log_fn : 0;
+}
 static void probe(struct camera_device *d, const char *what, long n) {
     char msg[64];
     unsigned i = 0;
@@ -239,13 +248,8 @@ static void probe(struct camera_device *d, const char *what, long n) {
         while (m > 0) msg[i++] = num[--m];
     }
     msg[i] = 0;
-    if (!g_log_state) {
-        g_log_state = -1;
-        void *h = dlopen("liblog.so", 0);
-        void *f = h ? dlsym(h, "__android_log_print") : 0;
-        if (f) { g_log_fn = (aemu_log_fn)f; g_log_state = 1; }
-    }
-    if (g_log_state == 1) g_log_fn(4 /* ANDROID_LOG_INFO */, "aemu-cam", "%s", msg);
+    aemu_log_fn lf = log_fn();
+    if (lf) lf(4 /* ANDROID_LOG_INFO */, "aemu-cam", "%s", msg);
     if (d && d->fd >= 0) {
         char line[80];
         unsigned j = 0;
@@ -254,6 +258,26 @@ static void probe(struct camera_device *d, const char *what, long n) {
         for (unsigned k = 0; msg[k] && j < sizeof(line) - 1; k++) line[j++] = msg[k];
         if (j < sizeof(line) - 1) line[j++] = '\n';
         write(d->fd, line, j);
+    }
+}
+/* probe() with a whole string instead of a marker: for the parameter string of set_parameters, which is the
+ * measurement itself and does not fit the marker buffer. Same two channels, same shape: one aemu-cam line in
+ * the guest log and one "probe ..." line to the host (it reads lines of any length and logs them verbatim). */
+static void probe_text(struct camera_device *d, const char *what, const char *text) {
+    aemu_log_fn lf = log_fn();
+    if (lf) lf(4 /* ANDROID_LOG_INFO */, "aemu-cam", "%s %s", what, text);
+    if (d && d->fd >= 0) {
+        unsigned wl = (unsigned)slen(what), tl = (unsigned)slen(text);
+        char *line = malloc(6 + wl + 1 + tl + 1);
+        if (!line) return;
+        char *o = line;
+        copy(o, "probe ", 6); o += 6;
+        copy(o, what, wl); o += wl;
+        *o++ = ' ';
+        copy(o, text, tl); o += tl;
+        *o++ = '\n';
+        write(d->fd, line, (unsigned long)(o - line));
+        free(line);
     }
 }
 static int read_full(int fd, void *buf, unsigned long n) {
@@ -391,10 +415,12 @@ static int c_set_window(struct camera_device *d, struct preview_ops *w) {
     return 0;
 }
 static void c_set_callbacks(struct camera_device *d, notify_cb n, data_cb c, data_ts_cb t, request_memory g, void *user) {
+    /* the probe number is a presence mask: 1 notify, 2 data, 4 data_ts, 8 request_memory (15 = all set) */
+    probe(d, "set_callbacks", (n ? 1 : 0) | (c ? 2 : 0) | (t ? 4 : 0) | (g ? 8 : 0));
     (void)t; d->notify = n; d->data = c; d->get_memory = g; d->user = user;
 }
-static void c_enable(struct camera_device *d, int32_t m) { d->msgs |= m; }
-static void c_disable(struct camera_device *d, int32_t m) { d->msgs &= ~m; }
+static void c_enable(struct camera_device *d, int32_t m) { probe(d, "enable_msg", m); d->msgs |= m; }
+static void c_disable(struct camera_device *d, int32_t m) { probe(d, "disable_msg", m); d->msgs &= ~m; }
 static int c_enabled(struct camera_device *d, int32_t m) { return (d->msgs & m) != 0; }
 static int c_start_preview(struct camera_device *d) { probe(d, "start_preview", -1); d->previewing = 1; say(d, "start\n"); return 0; }
 static void c_stop_preview(struct camera_device *d) { probe(d, "stop_preview", -1); d->previewing = 0; say(d, "stop\n"); }
@@ -410,12 +436,17 @@ static int c_take_picture(struct camera_device *d) { probe(d, "take_picture", -1
 static int c_cancel_picture(struct camera_device *d) { (void)d; return 0; }
 static int c_set_params(struct camera_device *d, const char *p) {
     if (!p) return -22;
+    probe_text(d, "set_params", p);
     char *n = sdup(p);
     if (!n) return -12;
     free(d->params); d->params = n;
     return 0;
 }
-static char *c_get_params(struct camera_device *d) { return sdup(d->params ? d->params : DEFAULTS); }
+static char *c_get_params(struct camera_device *d) {
+    char *r = sdup(d->params ? d->params : DEFAULTS);
+    probe(d, "get_params", r ? (long)slen(r) : -1);   /* the number is the length of the returned string */
+    return r;
+}
 static void c_put_params(struct camera_device *d, char *p) { (void)d; free(p); }
 static int c_command(struct camera_device *d, int32_t c, int32_t a, int32_t b) { (void)d; (void)c; (void)a; (void)b; return 0; }
 static void c_release(struct camera_device *d) {
