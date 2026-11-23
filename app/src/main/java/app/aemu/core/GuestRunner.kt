@@ -98,13 +98,15 @@ class GuestRunner(
         e["HOME"] = "/data"; e["TMPDIR"] = "/data/local/tmp"; e["TZ"] = "UTC"
         e["AEMU64_ROOT"] = paths.root.absolutePath
         e["AEMU64_PROPS"] = paths.props.absolutePath
-        // the guest kernel's identity: release/version parsed out of the settings' kernel banner
-        // (pre-filled from boot.img at import). No parseable release → no variables → the runner
-        // leaves uname to the host kernel, exactly as when the banner is blank.
-        val utsRelease = BootImage.bannerRelease(img.settings.kernelBanner)
+        // the guest kernel's identity: release/version parsed out of the banner in force for the image
+        // (KernelBanner: the settings' banner — pre-filled from boot.img at import — or the era baseline
+        // when blank). The baseline keeps uname and /proc/version from ever falling through to the
+        // phone's own kernel, which a blank banner used to expose.
+        val utsBanner = KernelBanner.effectiveBanner(img)
+        val utsRelease = BootImage.bannerRelease(utsBanner)
         if (utsRelease.isNotEmpty()) {
             e["AEMU64_UTS_RELEASE"] = utsRelease
-            val utsVersion = BootImage.bannerVersion(img.settings.kernelBanner)
+            val utsVersion = BootImage.bannerVersion(utsBanner)
             if (utsVersion.isNotEmpty()) e["AEMU64_UTS_VERSION"] = utsVersion
         }
         e["AEMU64_BINDER"] = paths.binderSock.absolutePath
@@ -161,6 +163,11 @@ class GuestRunner(
         e["AEMU_RO_SYSTEM"] = "1"
         // libaemushim serves /proc/meminfo scaled to this budget instead of the phone's own memory
         e["AEMU_RAM_KB"] = (guestRamMb(img.api, s.ramMb) * 1024L).toString()
+        // libaemushim serves these /proc files with the image's own identity (GuestProcInfo) instead of
+        // the phone's, which qemu would otherwise pass straight through
+        e["AEMU_PROC_VERSION"] = KernelBanner.effectiveBanner(img)
+        e["AEMU_PROC_CMDLINE"] = GuestProcInfo.cmdline(img)
+        e["AEMU_CPUINFO"] = GuestProcInfo.cpuinfo(img, paths.root)
         e["HOME"] = "/data"
         e["TMPDIR"] = "/data/local/tmp"
         e["ASHMEM_SHIM_DIR"] = "/data/local/tmp"

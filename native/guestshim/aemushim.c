@@ -702,6 +702,45 @@ static int meminfo_open(const char *path) {
     return (int)m;
 }
 
+/*
+ * /proc/version, /proc/cmdline and /proc/cpuinfo: qemu passes the phone's own /proc through, so the
+ * guest read the phone's kernel banner, the phone's boot command line and the phone's SoC. The host
+ * hands the image's own identity over in the environment (AEMU_PROC_VERSION / AEMU_PROC_CMDLINE /
+ * AEMU_CPUINFO, decided by the app from the image itself); serve that text instead. No variable (an
+ * engine or a build without them) keeps the old behaviour.
+ */
+static const char *env_str(const char *key) {
+    for (char **e = environ; e && *e; e++) {
+        const char *v = *e;
+        int i = 0;
+        while (key[i] && v[i] == key[i]) i++;
+        if (key[i] || v[i] != '=') continue;
+        return v + i + 1;
+    }
+    return 0;
+}
+static int procfile_open(const char *path) {
+    static const char *const names[3] = { "/proc/version", "/proc/cmdline", "/proc/cpuinfo" };
+    static const char *const keys[3] = { "AEMU_PROC_VERSION", "AEMU_PROC_CMDLINE", "AEMU_CPUINFO" };
+    int k = -1;
+    for (int i = 0; i < 3; i++) {
+        int j = 0;
+        while (names[i][j] && path[j] == names[i][j]) j++;
+        if (!names[i][j] && !path[j]) { k = i; break; }
+    }
+    if (k < 0) return -1;
+    const char *text = env_str(keys[k]);
+    if (!text || !*text) return -1;
+    long m = sys3(SYS_memfd_create, (long)"aemu-proc", 0, 0);
+    if (m < 0) return -1;
+    long len = 0; while (text[len]) len++;
+    long w = 0;
+    while (w < len) { long n = sys3(SYS_write, m, (long)(text + w), len - w); if (n <= 0) break; w += n; }
+    if (k != 2) sys3(SYS_write, m, (long)"\n", 1);   /* version and cmdline end with a newline; cpuinfo text already does */
+    sys3(SYS_lseek, m, 0, 0);
+    return (int)m;
+}
+
 EXPORT int open(const char *path, int flags, ...) {
     char b[128];
     int mode = 0;
@@ -716,6 +755,8 @@ EXPORT int open(const char *path, int flags, ...) {
         int fd = cmdline_open(path);
         if (fd >= 0) return fd;
         fd = meminfo_open(path);
+        if (fd >= 0) return fd;
+        fd = procfile_open(path);
         if (fd >= 0) return fd;
         fd = maps_open(path);
         if (fd >= 0) return fd;

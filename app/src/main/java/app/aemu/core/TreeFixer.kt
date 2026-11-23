@@ -132,6 +132,7 @@ class TreeFixer(
         kernelPolicyUnread()
         makeSysNodes()
         makeProcMounts()
+        procIdentity()
         resolvConf()
         caCerts()
         audioPolicy()
@@ -1006,6 +1007,24 @@ class TreeFixer(
         }
     }.onFailure { log("MediaTek DRVB: failed: ${it.message}") }
 
+    /**
+     * /proc/cmdline and /proc/cpuinfo of the image (GuestProcInfo): written into the tree for every
+     * engine. The native engine serves the image's own /proc files first, so these are the answers
+     * there; without them the guest fell through to the phone's own /proc — the phone's kernel command
+     * line and the phone's SoC in cpuinfo. The qemu engines pass the phone's /proc through too, but
+     * their shim serves the same strings from the environment instead (GuestRunner); the tree files
+     * keep the two from ever disagreeing.
+     */
+    private fun procIdentity() = runCatching {
+        val cmd = File(root, "proc/cmdline")
+        cmd.parentFile?.mkdirs()
+        val ct = GuestProcInfo.cmdline(img) + "\n"
+        if (!cmd.isFile || cmd.readText() != ct) cmd.writeText(ct)
+        val cpu = File(root, "proc/cpuinfo")
+        val ut = GuestProcInfo.cpuinfo(img, root)
+        if (!cpu.isFile || cpu.readText() != ut) cpu.writeText(ut)
+    }
+
     private fun qtaguid() = runCatching {
         val d = File(root, "data/.aemu_qtaguid").apply { mkdirs() }
         d.setReadable(true, false); d.setExecutable(true, false)
@@ -1032,15 +1051,16 @@ class TreeFixer(
                 if (!it.isFile || !it.readBytes().contentEquals(gz)) it.writeBytes(gz)
             } else if (!it.isFile || it.readText() != text) it.writeText(text)
         }
-        // /proc/version: the kernel banner from the image's settings (pre-filled from its boot.img
-        // at import, user-editable) — the line Settings shows as "Kernel version". A blank banner
-        // turns the feature off: no file, and a stale one from an earlier boot does not stay.
-        if (engine == Engine.N64) {
+        // /proc/version: the kernel banner in force for the image (KernelBanner: its own from the
+        // settings — pre-filled from its boot.img at import, user-editable — or the era baseline when
+        // blank). The line Settings shows as "Kernel version". A blank banner used to delete the file,
+        // which on the native engine left the guest reading the phone's own /proc/version; the file is
+        // now always written, for every engine (the qemu engines' shim serves the same text by env).
+        runCatching {
             val f = File(root, "proc/version")
-            if (img.settings.kernelBanner.isNotBlank()) {
-                val text = img.settings.kernelBanner + "\n"
-                if (!f.isFile || f.readText() != text) f.writeText(text)
-            } else f.delete()
+            f.parentFile?.mkdirs()
+            val text = KernelBanner.effectiveBanner(img) + "\n"
+            if (!f.isFile || f.readText() != text) f.writeText(text)
         }
     }
 
@@ -1552,9 +1572,13 @@ class TreeFixer(
         add("none", "/acct", "cgroup", "rw,relatime,cpuacct")
         add("tmpfs", "/mnt/asec", "tmpfs", "rw,relatime,mode=755,gid=1000")
         add("tmpfs", "/mnt/obb", "tmpfs", "rw,relatime,mode=755,gid=1000")
-        add("/dev/block/platform/aemu/by-name/system", "/system", "ext4", "ro,relatime")
-        add("/dev/block/platform/aemu/by-name/userdata", "/data", "ext4", "rw,nosuid,nodev,noatime")
-        add("/dev/block/platform/aemu/by-name/cache", "/cache", "ext4", "rw,nosuid,nodev,noatime")
+        // the partitions are named the way the firmware's own fstab names them (its platform by-name
+        // prefix), not with this emulator's name in the path; a firmware without one gets a plain
+        // platform shape
+        val byName = GuestProcInfo.byNamePrefix(root) ?: "/dev/block/platform/soc.0/by-name"
+        add("$byName/system", "/system", "ext4", "ro,relatime")
+        add("$byName/userdata", "/data", "ext4", "rw,nosuid,nodev,noatime")
+        add("$byName/cache", "/cache", "ext4", "rw,nosuid,nodev,noatime")
         // точки монтирования из init*.rc и fstab прошивки
         val rcs = (root.listFiles()?.filter { it.isFile && (it.name.endsWith(".rc") || it.name.startsWith("fstab")) } ?: emptyList()) +
             listOfNotNull(File(root, "system/etc/vold.fstab").takeIf { it.isFile })
