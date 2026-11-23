@@ -116,6 +116,10 @@ class Importer(
         src.read(0, head); head.flip()
         val h = ByteArray(head.remaining()).also { head.get(it) }
         when {
+            // Oppo OFP in its ZIP flavour: an encrypted ZIP (the toolset knows the password), so the name has to win
+            // over the plain ZIP branch below. (AEmulator-Plus)
+            name.endsWith(".ofp", true) && h.size > 4 && h[0] == 'P'.code.toByte() && h[1] == 'K'.code.toByte() && h[2].toInt() == 3 && h[3].toInt() == 4 ->
+                importToolsetExtract(src, name, depth)
             h.size > 4 && h[0] == 'P'.code.toByte() && h[1] == 'K'.code.toByte() && h[2].toInt() == 3 && h[3].toInt() == 4 -> {
                 if (ch != null) importZip(ch, name, depth) else throw IOException("zip without random access")
             }
@@ -167,6 +171,10 @@ class Importer(
             // (an RC4-encrypted CAB whose key is the file size, so it has to be recognised from random-looking bytes) and
             // anything named *.kdz, whose table the toolset validates before unpacking. (AEmulator-Plus)
             isLgFirmware(h, name, src) -> importToolsetExtract(src, name, depth)
+            // Oppo / OnePlus OFP and OPS flash packages: the encrypted bytes carry no usable magic, so the name
+            // routes them; the toolset validates the content itself (MTK/QC key brute-force, OPS settings decrypt).
+            // (AEmulator-Plus)
+            name.endsWith(".ofp", true) || name.endsWith(".ops", true) -> importToolsetExtract(src, name, depth)
             else -> throw IOException("unknown file format \"$name\"")
         }
     }
@@ -1080,8 +1088,9 @@ class Importer(
     }
 
     /**
-     * LG KDZ / DZ / TOT / BIN and the HTC containers via [FirmwareToolset] (only those two families are routed here;
-     * the toolset's other formats stay with the routes above). The unpacked partition images are fed back by role:
+     * LG KDZ / DZ / TOT / BIN, the HTC containers and Oppo / OnePlus OFP / OPS via [FirmwareToolset] (only those
+     * families are routed here; the toolset's other formats stay with the routes above). The unpacked partition
+     * images are fed back by role:
      * boot and recovery directly, the rest through [handle] so the usual content probes classify them.
      * (Adapted from AEmulator-Plus.)
      */
