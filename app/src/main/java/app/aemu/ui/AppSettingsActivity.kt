@@ -119,6 +119,7 @@ private fun AppSettings(onBack: () -> Unit, onRestyle: () -> Unit) {
     var dynamic by remember { mutableStateOf(AppPrefs.dynamicColor(ctx)) }
     val scope = rememberCoroutineScope()
     var autoUpdates by remember { mutableStateOf(AppPrefs.autoCheckUpdates(ctx)) }
+    var library3d by remember { mutableStateOf(AppPrefs.library3d(ctx)) }
     var updateState by remember { mutableStateOf<UpdateState>(UpdateState.Idle) }
     var downloadJob by remember { mutableStateOf<Job?>(null) }
 
@@ -237,6 +238,9 @@ private fun AppSettings(onBack: () -> Unit, onRestyle: () -> Unit) {
                         }
                     }
                     VmThemeRow()
+                    Toggle(stringResource(R.string.as_library_3d), stringResource(R.string.as_library_3d_sub), library3d) {
+                        library3d = it; AppPrefs.setLibrary3d(ctx, it)
+                    }
                 }
             }
 

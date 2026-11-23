@@ -263,6 +263,27 @@ fun Library(model: LibraryModel) {
     ) { pad ->
         val full: androidx.compose.foundation.lazy.grid.LazyGridItemSpanScope.() -> androidx.compose.foundation.lazy.grid.GridItemSpan =
             { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }
+        if (view3d && images.isNotEmpty()) {
+            Column(Modifier.fillMaxSize().padding(pad).verticalScroll(rememberScrollState())
+                .padding(start = 16.dp, end = 16.dp, bottom = 120.dp)) {
+                StorageAccessCard()
+                AnimatedVisibility(imp.active || imp.error != null || imp.done != null) {
+                    Box(Modifier.padding(bottom = 12.dp)) {
+                        ImportCard(imp, onCancel = model::cancelImport, onDismiss = model::dismissImport)
+                    }
+                }
+                // the 3D cabinet ignores the arrangement (as in Plus): the images in store order, newest first
+                Library3D(
+                    images,
+                    emptySet(),
+                    baseNameOf = { img -> images.firstOrNull { it.id == img.baseId }?.name },
+                    onStart = { img, _ -> VmActivity.start(ctx, img.id) },
+                    onSettings = { settingsFor = it },
+                    onRename = { renameFor = it },
+                    onDelete = { deleteFor = it },
+                )
+            }
+        } else {
         val gridState = rememberLazyGridState()
         val controller = remember(gridState, arranger, drag) { LibraryDragController(drag, gridState.dragHost(), arranger) }
         LibraryDragAutoScroll(controller)
@@ -313,6 +334,7 @@ fun Library(model: LibraryModel) {
                     }
                 }
             }
+        }
         }
     }
 

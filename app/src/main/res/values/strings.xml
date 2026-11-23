@@ -360,4 +360,17 @@
         <item quantity="one">%1$d ROM</item>
         <item quantity="other">%1$d ROMs</item>
     </plurals>
+    <string name="lib3d_container">Container</string>
+    <string name="lib3d_show_back">Show the back</string>
+    <string name="lib3d_show_front">Show the screen</string>
+    <string name="lib3d_tap_hint">Tap the phone to turn it over</string>
+    <string name="lib3d_card_description">%1$s, Android %2$s</string>
+    <string name="lib3d_spec_skin">Skin</string>
+    <string name="lib3d_spec_screen">Screen</string>
+    <string name="lib3d_spec_size">Size</string>
+    <string name="lib3d_spec_model">Model</string>
+    <string name="lpm_start">Start in charging-only mode</string>
+    <string name="open_vm">Open</string>
+    <string name="as_library_3d">3D firmware library</string>
+    <string name="as_library_3d_sub">Show imported firmwares and containers as 3D phones you swipe through, instead of the card list. Off by default.</string>
 </resources>
