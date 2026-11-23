@@ -46,6 +46,12 @@ class Importer(
     private val tmp = File(ctx.cacheDir, "import").apply { mkdirs() }
     private var ramdisk: List<BootImage.CpioEntry>? = null
     private var recovery: ByteArray? = null
+    // the first boot image's raw bytes: a recovery-from-boot.p is applied to them (AEmulator-Plus)
+    private var bootBytes: ByteArray? = null
+    // recovery-from-boot.p and its companions, captured while scanning an archive (AEmulator-Plus)
+    private var rfbPatch: ByteArray? = null
+    private var rfbScript: String? = null
+    private var rfbBonus: ByteArray? = null
     // the firmware kernel's banner, read from its boot image: pre-fills the image's kernelBanner setting
     private var kernelBanner = ""
     // baseband version implied by a radio-<device>-<version>.img file name in the package
@@ -79,6 +85,7 @@ class Importer(
             if (!File(root, "system/framework").isDirectory && !File(root, "system/build.prop").isFile)
                 throw IOException("no Android system partition found in file")
             finishTree()
+            if (recovery == null) runCatching { rebuildRecoveryFromBoot() }.onFailure { log("recovery: rebuild from boot failed (${it.message}), skipped") }
             recovery?.let { runCatching { RecoveryImage.install(paths, it, log) } }
             onProgress("Analyzing firmware", 0.97f)
             val img = Analyzer(ctx, paths, ramdisk, kernelBanner, baseband).analyze(id, name)
@@ -271,6 +278,11 @@ class Importer(
                 PartitionNames.isDiskImageName(base) && e.size > (16L shl 20) -> withEntrySource(zip, e) { s ->
                     if (isDiskImage(s)) importDiskImage(s, base) else log("$base: not a GPT/MBR disk image, skipped")
                 }
+                // recovery-from-boot.p and its companions (OTA "recovery/" folder): captured for rebuildRecoveryFromBoot
+                RecoveryFromBoot.isPatchFile(base) && e.size in 1..(32L shl 20) -> zip.getInputStream(e).use { rfbPatch = it.readBytes() }
+                RecoveryFromBoot.isScriptFile(base) && e.size in 1..(1L shl 20) ->
+                    zip.getInputStream(e).use { rfbScript = String(it.readBytes(), Charsets.UTF_8) }
+                RecoveryFromBoot.isBonusFile(base) && e.size in 1..(8L shl 20) -> zip.getInputStream(e).use { rfbBonus = it.readBytes() }
             }
             done += maxOf(0L, e.size)
             onProgress("Extracting: $base", 0.9f * done / total)
@@ -456,6 +468,10 @@ class Importer(
                         e.isFile -> { writeFile(p, tar.nonClosing(), e.mode); gotSystem = true }
                     }
                 }
+                // recovery-from-boot.p and its companions: captured for rebuildRecoveryFromBoot (AEmulator-Plus)
+                RecoveryFromBoot.isPatchFile(base) && e.isFile && e.size in 1..(32L shl 20) -> rfbPatch = tar.readBytes()
+                RecoveryFromBoot.isScriptFile(base) && e.isFile && e.size in 1..(1L shl 20) -> rfbScript = String(tar.readBytes(), Charsets.UTF_8)
+                RecoveryFromBoot.isBonusFile(base) && e.isFile && e.size in 1..(8L shl 20) -> rfbBonus = tar.readBytes()
             }
             if (files % 200 == 0) onProgress("Extracting: $base", -1f)
         }
@@ -776,6 +792,7 @@ class Importer(
     }
 
     private fun takeBoot(data: ByteArray) {
+        if (bootBytes == null) bootBytes = data
         if (kernelBanner.isEmpty()) runCatching {
             BootImage.kernelBanner(data)?.let { b ->
                 kernelBanner = b
@@ -787,6 +804,24 @@ class Importer(
         if (rd.isNullOrEmpty()) { log("boot: ramdisk not recognized"); return }
         ramdisk = rd
         log("boot: ramdisk, ${rd.size} files")
+    }
+
+    /**
+     * No recovery image in the firmware, but a stock recovery-from-boot.p (from the OTA's "recovery/" folder, or from /system of a
+     * system image): the recovery is the boot image patched with it, exactly what install-recovery.sh does on the device.
+     * (AEmulator-Plus; the boot image comes from the bytes takeBoot kept — this Importer never writes a boot.img file.)
+     */
+    private fun rebuildRecoveryFromBoot() {
+        fun tree(rel: String): ByteArray? = File(root, rel).takeIf { it.isFile && it.length() in 1..(64L shl 20) }
+            ?.let { runCatching { it.readBytes() }.getOrNull() }
+        val patch = rfbPatch ?: tree("system/recovery-from-boot.p") ?: return
+        val script = rfbScript ?: (tree("system/etc/install-recovery.sh") ?: tree("system/bin/install-recovery.sh"))?.toString(Charsets.UTF_8)
+        val bonus = rfbBonus ?: tree("system/etc/recovery-resource.dat")
+        val boot = bootBytes
+        if (boot == null) { log("recovery: recovery-from-boot.p found, but the firmware has no boot image to patch"); return }
+        log("recovery: no recovery image, rebuilding it from the boot image and recovery-from-boot.p")
+        RecoveryFromBoot.rebuild(boot, script, patch, bonus, log)?.let { recovery = it }
+        rfbPatch = null; rfbScript = null; rfbBonus = null
     }
 
     // ------------------------------------------------------------------ файлы, ссылки, права
