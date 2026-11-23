@@ -123,6 +123,8 @@ class Importer(
                 if (h[6].toInt() == 1) throw IOException("RAR5 archives are not supported yet: repack \"$name\" as ZIP or 7z")
                 importRar(src, name, depth)
             }
+            // Chrome extension container (.crx / .crx3): a ZIP behind a small header (AEmulator-Plus)
+            CrxContainer.probe(h) -> importCrx(src, name, depth)
             PacFile.probe(h) -> if (ch != null) importPac(src, ch) else throw IOException("pac without random access")
             PayloadReader.probe(h) -> importPayload(src)
             SinImage.probe(h) || SinImage.probeOld(h) && name.endsWith(".sin", true) -> importSin(streamOf(src), name.substringAfterLast('/'))
@@ -165,6 +167,58 @@ class Importer(
         val t = spill(b, inner.substringAfterLast('/'))
         try { FileChannel.open(t.toPath(), StandardOpenOption.READ).use { c -> handle(ChannelSource(c), c, inner, depth + 1) } }
         finally { t.delete() }
+    }
+
+    /**
+     * Opens a CRX container and imports what is in it. Only the ZIP's entries that can hold firmware are looked at
+     * (not manifest.json and _metadata/). An entry is either a 7-Zip self-extractor / 7z archive, whose archive part is
+     * cut out and imported, or anything else the importer knows, which is imported as it is. (AEmulator-Plus)
+     */
+    private fun importCrx(src: RandomSource, name: String, depth: Int) {
+        val start = CrxContainer.zipStart(src) ?: throw IOException("unknown file format \"$name\"")
+        ZipFile.builder().setSeekableByteChannel(RandomSourceChannel(src, start)).get().use { zip ->
+            val entries = zip.entries.toList()
+                .filter { !it.isDirectory && it.size >= 1024 && !it.name.startsWith("_metadata/") && !it.name.equals("manifest.json", true) }
+                .sortedByDescending { it.size }
+            if (entries.isEmpty()) throw IOException("unknown file format \"$name\"")
+            log("crx: " + entries.joinToString { "${it.name} ${it.size shr 20} MB" })
+            for (e in entries) {
+                if (cancelled) throw IOException("cancelled")
+                val base = e.name.substringAfterLast('/')
+                onProgress("Extracting: $base", 0.1f)
+                val f = zip.getInputStream(e).use { spill(it, base) }
+                try { importCrxEntry(f, base, depth) } finally { f.delete() }
+                if (gotSystem) break
+            }
+        }
+    }
+
+    private fun importCrxEntry(f: File, base: String, depth: Int) {
+        // the 7z archive follows the SFX stub (7zr.exe) in the same file: find it in the first bytes of the file
+        val headLen = minOf(f.length(), CrxContainer.MAX_STUB.toLong()).toInt()
+        val head = ByteArray(headLen)
+        var n = 0
+        f.inputStream().use { inp -> while (n < headLen) { val k = inp.read(head, n, headLen - n); if (k < 0) break; n += k } }
+        val at = CrxContainer.locateSevenZ(head, n, f.length())
+        if (at >= 0) {
+            log("crx: $base holds a 7z archive at offset $at (${(f.length() - at) shr 20} MB)")
+            val z = File(tmp, "${System.nanoTime()}-payload.7z")
+            try {
+                java.io.FileInputStream(f).use { inp ->
+                    inp.channel.position(at.toLong())
+                    z.outputStream().use { o -> inp.copyTo(o, 1 shl 20) }
+                }
+                FileChannel.open(z.toPath(), StandardOpenOption.READ).use { c -> handle(ChannelSource(c), c, "payload.7z", depth + 1) }
+            } finally { z.delete() }
+            return
+        }
+        try {
+            FileChannel.open(f.toPath(), StandardOpenOption.READ).use { c -> handle(ChannelSource(c), c, base, depth + 1) }
+        } catch (t: Throwable) {
+            // a file of the extension that is no firmware (script, image, locale): not a reason to give up on the others
+            if (cancelled || gotSystem) throw t
+            log("crx: $base skipped (${t.message ?: t.javaClass.simpleName})")
+        }
     }
 
     /** RAR 4 (junrar): entries handled like those of a zip, via temporary files. */
