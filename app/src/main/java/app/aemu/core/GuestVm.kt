@@ -147,6 +147,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
      *  Default 1: modern recoveries draw 32bpp, so the geometry is right from the first frame
      *  (at worst R/B swapped until detection below pins the exact variant). */
     @Volatile var recoveryFormat = 1
+    /** Host ends of the silent aux input FIFOs (event1-3 in recovery): held open for the
+     *  whole recovery session so minui can adopt those nodes, but never written to. */
+    private val auxInputFds = mutableListOf<java.io.FileDescriptor>()
 
     private fun doRecovery() {
         paths.bin.mkdirs()
@@ -178,11 +181,22 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             val fd = android.system.Os.open(ev.path, android.system.OsConstants.O_RDWR, 0)
             input.sink = java.io.FileOutputStream(fd)
             log("recovery input: fifo ready")
+            // event1-3 used to be symlinks onto event0's one FIFO: minui adopts all
+            // four nodes and the single event stream gets split across four fds, so
+            // a tap rarely arrives whole on any one device. Give each aux node its
+            // own FIFO instead, held open by the host and never written: the nodes
+            // stay present and adoptable, but the stream reaches minui only via event0.
+            auxInputFds.forEach { runCatching { android.system.Os.close(it) } }
+            auxInputFds.clear()
             for (alt in listOf("event1", "event2", "event3")) {
                 val f = File(RecoveryImage.dir(paths), "dev/input/$alt")
                 f.delete()
-                runCatching { android.system.Os.symlink(ev.path, f.path) }
+                runCatching {
+                    android.system.Os.mkfifo(f.path, "666".toInt(8))
+                    auxInputFds += android.system.Os.open(f.path, android.system.OsConstants.O_RDWR, 0)
+                }
             }
+            log("recovery input: aux fifos ready")
         }.onFailure { log("recovery: no input channel: ${it.message}") }
         val (w, h) = runCatching { File(paths.root, "dhd.fbgeom").readText().trim().split(Regex("\\s+")).map { it.toInt() } }
             .getOrNull()?.takeIf { it.size >= 2 }?.let { it[0] to it[1] } ?: (settings.width to settings.height)
