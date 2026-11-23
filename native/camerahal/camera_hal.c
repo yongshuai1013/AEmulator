@@ -28,10 +28,12 @@ extern void *dlopen(const char *name, int flags);
 extern void *dlsym(void *h, const char *name);
 extern int pthread_create(long *t, const void *attr, void *(*fn)(void *), void *arg);
 extern int pthread_join(long t, void **ret);
+extern int clock_gettime(int clk, void *ts);
 
 #define EXPORT __attribute__((visibility("default")))
 #define W 640
 #define H 480
+#define VID_SLOTS 6   /* recording frames in flight with the framework at once (see the pool below) */
 
 struct hw_module;
 struct hw_device;
@@ -130,14 +132,22 @@ struct camera_device {
     volatile int previewing, running, msgs, window_ready;
     long thread;
     struct preview_ops *window;
-    notify_cb notify; data_cb data; request_memory get_memory; void *user;
+    notify_cb notify; data_cb data; data_ts_cb data_ts; request_memory get_memory; void *user;
     char *params;
+    /* recording: frames are handed to the framework through data_ts and come back one by one through
+     * release_recording_frame; the pool is the memory in flight, a slot may be reused only once freed */
+    volatile int recording;
+    struct camera_memory *vid_mem[VID_SLOTS];
+    volatile int vid_busy[VID_SLOTS];
+    unsigned long vid_size;
+    long vid_dropped;
 };
 
 #define MSG_ERROR 0x001
 #define MSG_SHUTTER 0x002
 #define MSG_FOCUS 0x004
 #define MSG_PREVIEW_FRAME 0x010
+#define MSG_VIDEO_FRAME 0x020
 #define MSG_RAW_IMAGE 0x080
 #define MSG_COMPRESSED_IMAGE 0x100
 #define MSG_RAW_IMAGE_NOTIFY 0x200
@@ -367,6 +377,37 @@ static void scale_nv21(unsigned char *dst, int dw, int dh, const unsigned char *
     }
 }
 
+/* CLOCK_MONOTONIC in nanoseconds: the timestamp recording frames are delivered with */
+static int64_t now_ns(void) {
+    struct { long sec, nsec; } ts;
+    if (clock_gettime(1 /* CLOCK_MONOTONIC */, &ts) != 0) return 0;
+    return (int64_t)ts.sec * 1000000000 + (int64_t)ts.nsec;
+}
+
+static void vid_pool_close(struct camera_device *d) {
+    for (int i = 0; i < VID_SLOTS; i++) {
+        if (d->vid_mem[i] && d->vid_mem[i]->release) d->vid_mem[i]->release(d->vid_mem[i]);
+        d->vid_mem[i] = 0;
+        d->vid_busy[i] = 0;
+    }
+    d->vid_size = 0;
+}
+/* The recording frame pool: VID_SLOTS buffers of the current frame size, taken from the framework once
+ * per recording size. Unlike a preview frame — copied out synchronously by the framework — a recording
+ * frame is queued by the encoder and given back later through release_recording_frame, so a slot stays
+ * busy until then; when every slot is busy the reader skips the frame instead of stalling. */
+static int vid_pool_open(struct camera_device *d, unsigned long size) {
+    if (d->vid_mem[0] && d->vid_size == size) return 0;
+    vid_pool_close(d);
+    for (int i = 0; i < VID_SLOTS; i++) {
+        struct camera_memory *m = d->get_memory(-1, size, 1, d->user);
+        if (!m || !m->data) { vid_pool_close(d); return -1; }
+        d->vid_mem[i] = m;
+    }
+    d->vid_size = size;
+    return 0;
+}
+
 static void *reader(void *arg) {
     struct camera_device *d = arg;
     long got = 0;
@@ -392,6 +433,27 @@ static void *reader(void *arg) {
                     d->data(MSG_PREVIEW_FRAME, m, 0, 0, d->user);
                 }
                 if (m && m->release) m->release(m);
+            }
+            if (d->recording && (d->msgs & MSG_VIDEO_FRAME) && d->data_ts) {
+                int pw, ph;
+                preview_size(d, &pw, &ph);
+                unsigned long need = (unsigned long)pw * ph * 3 / 2;
+                int slot = -1;
+                if (need <= d->vid_size)
+                    for (int i = 0; i < VID_SLOTS; i++)
+                        if (d->vid_mem[i] && !d->vid_busy[i]) { slot = i; break; }
+                if (slot < 0) {
+                    /* every slot is still with the framework (or the size moved): skip this frame
+                     * rather than stall the reader — the preview above keeps its pace either way */
+                    d->vid_dropped++;
+                    if (d->vid_dropped == 1 || d->vid_dropped % 30 == 0) probe(d, "video_dropped", d->vid_dropped);
+                } else {
+                    struct camera_memory *m = d->vid_mem[slot];
+                    if (pw == W && ph == H) copy(m->data, frame + W * H * 4, W * H * 3 / 2);
+                    else scale_nv21(m->data, pw, ph, frame + W * H * 4);
+                    d->vid_busy[slot] = 1;
+                    d->data_ts(now_ns(), MSG_VIDEO_FRAME, m, 0, d->user);
+                }
             }
         } else if (type == 2) {
             /* a picture from the host. Its arrival is the event the whole still path turns on, so it is
@@ -443,7 +505,7 @@ static int c_set_window(struct camera_device *d, struct preview_ops *w) {
 static void c_set_callbacks(struct camera_device *d, notify_cb n, data_cb c, data_ts_cb t, request_memory g, void *user) {
     /* the probe number is a presence mask: 1 notify, 2 data, 4 data_ts, 8 request_memory (15 = all set) */
     probe(d, "set_callbacks", (n ? 1 : 0) | (c ? 2 : 0) | (t ? 4 : 0) | (g ? 8 : 0));
-    (void)t; d->notify = n; d->data = c; d->get_memory = g; d->user = user;
+    d->notify = n; d->data = c; d->data_ts = t; d->get_memory = g; d->user = user;
 }
 static void c_enable(struct camera_device *d, int32_t m) { probe(d, "enable_msg", m); d->msgs |= m; }
 static void c_disable(struct camera_device *d, int32_t m) { probe(d, "disable_msg", m); d->msgs &= ~m; }
@@ -452,10 +514,23 @@ static int c_start_preview(struct camera_device *d) { probe(d, "start_preview", 
 static void c_stop_preview(struct camera_device *d) { probe(d, "stop_preview", -1); d->previewing = 0; say(d, "stop\n"); }
 static int c_preview_enabled(struct camera_device *d) { return d->previewing; }
 static int c_meta(struct camera_device *d, int e) { (void)d; return e ? -38 : 0; }
-static int c_start_rec(struct camera_device *d) { (void)d; return -38; }   /* video recording is not supported yet */
-static void c_stop_rec(struct camera_device *d) { (void)d; }
-static int c_rec_enabled(struct camera_device *d) { (void)d; return 0; }
-static void c_release_frame(struct camera_device *d, const void *p) { (void)d; (void)p; }
+static int c_start_rec(struct camera_device *d) {
+    /* recording frames leave through data_ts into pool memory: without either callback there is
+     * honestly nothing to record into, and -38 stays the answer for that case */
+    if (!d->data_ts || !d->get_memory) { probe(d, "start_recording no_callbacks", -1); return -38; }
+    int pw, ph;
+    preview_size(d, &pw, &ph);
+    if (vid_pool_open(d, (unsigned long)pw * ph * 3 / 2) != 0) { probe(d, "start_recording no_memory", -1); return -12; }
+    d->recording = 1;
+    probe(d, "start_recording", -1);
+    return 0;
+}
+static void c_stop_rec(struct camera_device *d) { if (d->recording) probe(d, "stop_recording", -1); d->recording = 0; }
+static int c_rec_enabled(struct camera_device *d) { return d->recording; }
+static void c_release_frame(struct camera_device *d, const void *p) {
+    for (int i = 0; i < VID_SLOTS; i++)
+        if (d->vid_mem[i] && d->vid_mem[i]->data == p) { d->vid_busy[i] = 0; return; }
+}
 static int c_focus(struct camera_device *d) { if ((d->msgs & MSG_FOCUS) && d->notify) d->notify(MSG_FOCUS, 1, 0, d->user); return 0; }
 static int c_cancel_focus(struct camera_device *d) { (void)d; return 0; }
 static int c_take_picture(struct camera_device *d) { probe(d, "take_picture", -1); say(d, "shot\n"); return 0; }
@@ -477,6 +552,7 @@ static void c_put_params(struct camera_device *d, char *p) { (void)d; free(p); }
 static int c_command(struct camera_device *d, int32_t c, int32_t a, int32_t b) { (void)d; (void)c; (void)a; (void)b; return 0; }
 static void c_release(struct camera_device *d) {
     d->previewing = 0;
+    d->recording = 0;
     if (d->running) {
         d->running = 0;
         say(d, "close\n");
@@ -485,6 +561,9 @@ static void c_release(struct camera_device *d) {
         shutdown(d->fd, 2);
         pthread_join(d->thread, 0);
     }
+    /* the pool is framework memory: by the time the device is released the client has disconnected,
+     * so every frame is back or its owner is gone */
+    vid_pool_close(d);
     if (d->fd >= 0) { close(d->fd); d->fd = -1; }
 }
 static int c_dump(struct camera_device *d, int fd) { (void)d; (void)fd; return 0; }
