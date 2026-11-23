@@ -571,20 +571,43 @@ class VmActivity : ComponentActivity() {
         recorder = r; recOn.value = true
     }
 
-    // APK picked on the host: copied into the shared card folder, then installed by the guest's package manager
+    // APK picked on the host: streamed to the guest agent, which writes it into the guest's own import
+    // inbox (a file born in the guest's view of its storage); the guest's package manager installs it
+    // from there. The old staging — the host writing aemu-install.apk into the shared card folder, a view
+    // the guest does not share, so pm could not parse the file — is gone, not kept as a fallback: when
+    // the agent is off or not connected the import says so.
     private val pickApk = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@registerForActivityResult
-        val dir = app.aemu.core.Sdcard.hostDir(vm.paths)
-        if (dir == null) { toast(getString(R.string.m_failed)); return@registerForActivityResult }
         toast(getString(R.string.m_install_apk_start))
         thread {
-            val ok = runCatching {
-                contentResolver.openInputStream(uri)!!.use { i -> java.io.File(dir, "aemu-install.apk").outputStream().use { o -> i.copyTo(o) } }
-            }.isSuccess
-            if (!ok) { toast(getString(R.string.m_failed)); return@thread }
-            val out = runCatching { vm.guestShell("pm install -r " + vm.img.sdcardPath.trimEnd('/') + "/aemu-install.apk", 300_000) }.getOrElse { it.toString() }
-            runCatching { app.aemu.core.TreeFixer(this@VmActivity, vm.paths, vm.img, vm::log).seedOwners() }
-            toast(out.trim().lines().lastOrNull { it.isNotBlank() }?.take(200) ?: getString(R.string.m_failed))
+            var name = "import.apk"
+            var size = -1L
+            runCatching {
+                contentResolver.query(uri, null, null, null, null)?.use { c ->
+                    if (c.moveToFirst()) {
+                        val ni = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        val si = c.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                        if (ni >= 0) c.getString(ni)?.let { name = java.io.File(it).name }
+                        if (si >= 0) size = c.getLong(si)
+                    }
+                }
+            }
+            if (!name.endsWith(".apk")) name = "import.apk"
+            var spool: java.io.File? = null
+            if (size <= 0) {
+                // the provider did not report a size: spool once in the host cache to learn the length the
+                // transfer header needs (host cache only — nothing is staged into the guest any more)
+                val f = java.io.File(cacheDir, "aemu-import-spool.apk")
+                val ok = runCatching { contentResolver.openInputStream(uri)!!.use { i -> f.outputStream().use { o -> i.copyTo(o) } } }.isSuccess
+                if (!ok) { toast(getString(R.string.m_failed)); return@thread }
+                spool = f
+                size = f.length()
+            }
+            val src = spool
+            val out = vm.importApk(name, size) { if (src != null) src.inputStream() else contentResolver.openInputStream(uri) }
+            spool?.delete()
+            if (out == null) toast(getString(R.string.m_install_apk_no_agent))
+            else toast(out.trim().lines().lastOrNull { it.isNotBlank() }?.take(200) ?: getString(R.string.m_failed))
         }
     }
 

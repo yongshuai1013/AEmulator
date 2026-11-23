@@ -640,6 +640,26 @@ class TreeFixer(
                 jar.setReadable(true, false); copied++
             }
         }.onFailure { log("${WifiEmu.JAR_NAME}: ${it.message}") }
+        // the guest agent (AgentSupport): the same dex jar as for the 32-bit guests, and its inbox app,
+        // which GuestVm installs at boot complete (pm path absent or a different length)
+        runCatching {
+            val jar = File(root, AgentSupport.JAR_PATH)
+            val bytes = EngineAssets.open(ctx, "engines/kk/${AgentSupport.JAR_NAME}").use { it.readBytes() }
+            if (!jar.isFile || !jar.readBytes().contentEquals(bytes)) {
+                jar.parentFile?.mkdirs()
+                jar.writeBytes(bytes)
+                jar.setReadable(true, false); copied++
+            }
+        }.onFailure { log("${AgentSupport.JAR_NAME}: ${it.message}") }
+        runCatching {
+            val apk = File(root, AgentSupport.APK_COPY)
+            val bytes = EngineAssets.open(ctx, "engines/kk/aemu-agent.apk").use { it.readBytes() }
+            if (!apk.isFile || !apk.readBytes().contentEquals(bytes)) {
+                apk.parentFile?.mkdirs()
+                apk.writeBytes(bytes)
+                apk.setReadable(true, false); copied++
+            }
+        }.onFailure { log("aemu-agent.apk: ${it.message}") }
         if (copied > 0) log("engine n64 files updated: $copied")
         // qemu-arm (the firmware's 32-bit programs) asks for the lowest mappable address; the phone hides the real file
         runCatching { File(root, "proc/sys/vm").mkdirs(); File(root, "proc/sys/vm/mmap_min_addr").writeText("65536") }
@@ -738,6 +758,8 @@ class TreeFixer(
                 "aemu-stubs.jar" to "system/framework/aemu-stubs.jar",
                 "aemu-wifi.jar" to "system/framework/aemu-wifi.jar",
                 "aemu-bt.jar" to "system/framework/aemu-bt.jar",
+                "aemu-agent.jar" to "system/framework/aemu-agent.jar",
+                "aemu-agent.apk" to "data/adb/aemu-agent.apk",
             )
             Engine.GB -> listOf(
                 "libashmemshim.so" to "system/lib/libashmemshim.so",

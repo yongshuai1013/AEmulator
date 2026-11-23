@@ -115,6 +115,10 @@ data class VmSettings(
     val bluetooth: Boolean = false,
     /** Magisk root (arm64 guests on the native engine): the host starts the daemon at boot, see MagiskCore; applies at the next full VM boot (AEmulator Plus) */
     val magisk: Boolean = false,
+    /** the guest agent (identity sync for the per-app views, the APK import inbox): a guest service the host starts at boot, see AgentSupport; applies at the next full VM boot */
+    val agent: Boolean = false,
+    /** packages that read the guest without root in it (the per-app views, see AgentSupport): package names, resolved to uids by the agent */
+    val hiddenApps: List<String> = emptyList(),
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -142,6 +146,8 @@ data class VmSettings(
         .put("wifiMirrorHost", wifiMirrorHost)
         .put("bluetooth", bluetooth)
         .put("magisk", magisk)
+        .put("agent", agent)
+        .put("hiddenApps", org.json.JSONArray(hiddenApps))
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -233,6 +239,8 @@ data class VmSettings(
                 wifiMirrorHost = o.optBoolean("wifiMirrorHost", d.wifiMirrorHost),
                 bluetooth = o.optBoolean("bluetooth", d.bluetooth),
                 magisk = o.optBoolean("magisk", d.magisk),
+                agent = o.optBoolean("agent", d.agent),
+                hiddenApps = o.optJSONArray("hiddenApps")?.let { a -> (0 until a.length()).mapNotNull { a.optString(it).trim().takeIf { s -> s.isNotEmpty() } }.distinct() } ?: d.hiddenApps,
             )
         }
     }

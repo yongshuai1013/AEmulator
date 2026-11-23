@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The guest agent and the per-app hide list (AgentSupport / AgentSection). -->
+<resources>
+    <string name="vs_agent">Guest agent</string>
+    <string name="vs_agent_sub">A service of ours inside the guest: it keeps the hide list below resolved and receives imported APKs (the “AEmu Import” app in the guest). Applies at the next boot.</string>
+    <string name="vs_agent_hidden">Hide root from these apps</string>
+    <string name="vs_agent_hidden_sub">A listed app reads the guest as if Magisk were not in it: no su, no module files, unmounted /proc/mounts. Apps that are not listed — the Magisk app above all — always see the full guest. Applies at the next boot.</string>
+    <string name="vs_agent_hidden_abx">This image’s package list is not in a readable form, so apps cannot be picked here — type package names instead; the agent resolves them inside the guest.</string>
+    <string name="vs_agent_pkg_hint">Package name</string>
+    <string name="vs_agent_add">Add</string>
+    <string name="vs_agent_remove">Remove</string>
+</resources>

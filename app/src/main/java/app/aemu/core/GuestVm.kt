@@ -44,6 +44,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     /** host Bluetooth bridge (AEmulator-Plus #18) can serve this image: the 4.4 engine, API 9–25, not a recovery boot */
     private val bluetoothSupported get() = engine == Engine.KK && img.api in 9..25 && !recoveryMode
     private val bluetooth = BluetoothBridge(ctx, paths, { settings.bluetooth && bluetoothSupported }, ::log)
+    private val agentSupported get() = AgentSupport.offered(paths.root, engine, img.api, recoveryMode)
+    private val agent = AgentBridge(paths, { settings.agent && AgentSupport.supported(engine, img.api, recoveryMode) }, ::log)
+    @Volatile private var agentOn = false
 
     @Volatile var state = State.STOPPED
         private set
@@ -162,6 +165,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             if (recoveryMode) doRecovery() else doBoot()
         } catch (t: Throwable) {
             bluetooth.stop()
+            agent.stop()
             failure = t.message ?: t.toString()
             log("✖ boot aborted: $failure")
             setState(State.FAILED)
@@ -606,6 +610,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         if (engine != Engine.N64) vibration.serve()   // 64-bit guests get vibration through Sensors
         frames.serve()
         if (s.bluetooth && bluetoothSupported) bluetooth.serve()
+        if (s.agent) agent.serve()
         if (s.radio) ril.serve() else log("radio: emulation disabled in settings")
         vold.serve()
         // у vold производителей бывают дополнительные сокеты (Samsung: usbstorage, enc_report) — отвечаем «ладно»
@@ -712,6 +717,14 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         WifiEmu.write(paths.root, settings, wifi, mirror)
         wifiOn = wifi
         if (wifi) log("wifi: emulated network \"${mirror?.ssid ?: settings.wifiSsid}\" (${if (WifiEmu.secured(settings)) "WPA2" else "open"})" + (if (mirror != null) ", mirroring the phone's connection" else ""))
+        // the guest agent: its settings file and the fallback uid set for the per-app views, before
+        // anything starts (the agent service itself starts with zygote, below)
+        if (AgentSupport.supported(engine, img.api, recoveryMode)) {
+            if (settings.agent && !File(paths.root, AgentSupport.JAR_PATH).isFile)
+                log("agent: ${AgentSupport.JAR_NAME} is not installed (build guest-agent/build.sh), the agent stays off")
+            agentOn = settings.agent && agentSupported
+            AgentSupport.write(paths.root, settings, ::log)
+        }
         // Magisk (VmSettings.magisk): init's post-fs-data stage, run by the host before the first service starts
         if (!stopping) magiskPostFsData()
         var glDone = false
@@ -763,6 +776,13 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 synchronized(procs) { procs.remove("aemu-wifi") }?.let { runCatching { it.destroyForcibly() } }
                 startService(GuestService("aemu-wifi", listOf("/system/bin/app_process",
                     "-Djava.class.path=/${WifiEmu.JAR_PATH}", "/system/bin", "app.aemu.stub.WifiStub"), optional = true))
+            }
+            // the guest agent (the hide list's identity sync, the import inbox): with zygote, since it
+            // needs the package manager; its lookups retry until system_server answers
+            if (svc.name == "zygote" && agentOn) {
+                synchronized(procs) { procs.remove("aemu-agent") }?.let { runCatching { it.destroyForcibly() } }
+                startService(GuestService("aemu-agent", listOf("/system/bin/app_process",
+                    "-Djava.class.path=/${AgentSupport.JAR_PATH}", "/system/bin", AgentSupport.MAIN_CLASS), optional = true))
             }
             // 5.0–7.x: a registered network, otherwise ConnectivityService says "no active network" and browsers stay offline
             if (svc.name == "zygote" && !wifiOn && (if (engine == Engine.N64) kernel.registeredNetwork else img.api in 21..25) && engine != Engine.GB && File(paths.root, "system/framework/aemu-stubs.jar").isFile) {
@@ -1053,6 +1073,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             log("★ system booted in ${(bootDoneAt - bootAt) / 1000} s")
             setState(State.RUNNING)
             Thread { magiskBootComplete() }.start()
+            Thread { agentBootComplete() }.start()
             Thread { afterBoot() }.start()
         }
     }
@@ -1400,8 +1421,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         File("/proc").listFiles()?.forEach { d ->
             val pid = d.name.toIntOrNull() ?: return@forEach
             val cmd = runCatching { String(File(d, "cmdline").readBytes(), Charsets.ISO_8859_1) }.getOrNull() ?: return@forEach
-            // app_process с aemu-stubs.jar / aemu-wifi.jar / aemu-bt.jar — наши службы (bluetooth_manager, Wi-Fi), не приложения зиготы
-            if (cmd.contains(marker) && cmd.contains("/system/bin/app_process") && !cmd.contains("aemu-stubs.jar") && !cmd.contains("aemu-wifi.jar") && !cmd.contains("aemu-bt.jar")) {
+            // app_process с aemu-stubs.jar / aemu-wifi.jar / aemu-bt.jar / aemu-agent.jar — наши службы (bluetooth_manager, Wi-Fi, агент), не приложения зиготы
+            if (cmd.contains(marker) && cmd.contains("/system/bin/app_process") && !cmd.contains("aemu-stubs.jar") && !cmd.contains("aemu-wifi.jar") && !cmd.contains("aemu-bt.jar") && !cmd.contains("aemu-agent.jar")) {
                 runCatching { AProcess.sendSignal(pid, 9) }; n++
             } else if (orphanOfThisImage(d)) {
                 // 7.0+: a zygote child rewrites its whole command line ("system_server"), so the path is gone from it;
@@ -1515,6 +1536,18 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
 
     fun installApk(apkOnSdcard: String): String = guestShell("pm install -r $apkOnSdcard", 600_000)
 
+    /**
+     * APK import through the guest agent: the file is streamed over the agent socket and written by the
+     * agent into the guest's own import inbox, then installed from there by [installApk]. Returns pm's
+     * output, or null when the agent is not connected (the reason is in the log; there is no fallback
+     * staging — the host writing into the guest's card folder was the broken path this replaces).
+     */
+    fun importApk(name: String, size: Long, open: () -> java.io.InputStream?): String? {
+        val guestPath = agent.putApk(name, size, open) ?: return null
+        log("agent: imported $name -> $guestPath, installing")
+        return runCatching { installApk(guestPath) }.getOrElse { it.toString() }
+    }
+
     // ---- Magisk (VmSettings.magisk, see MagiskCore): the host plays the part of init's boot stages ----------------
 
     private val magiskOn: Boolean get() =
@@ -1544,6 +1577,13 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             MagiskCore.unlockTmp(paths.root)    // its magic mount leaves directories at mode 000
             val version = guestShell("/${MagiskCore.TMP}/magisk -v; /${MagiskCore.TMP}/magisk -V", 15_000).trim().replace('\n', ' ')
             log("magisk: daemon answers \"$version\"")
+            // the hide list (VmSettings.hiddenApps) as the daemon's own denylist, beside the mount layer's
+            // per-app view: Zygisk then stays out of those apps. Through the daemon's CLI before the overlay
+            // places anything, every answer logged — a daemon that refuses shows up here, not as a success
+            if (settings.hiddenApps.isNotEmpty()) {
+                log("magisk: denylist enable -> ${magiskExec("--denylist enable", 30_000)}")
+                for (pkg in settings.hiddenApps) log("magisk: denylist add $pkg -> ${magiskExec("--denylist add $pkg", 30_000)}")
+            }
             // Zygisk (docs/magisk.md): with it on in magisk.db the daemon's post-fs-data sets the native-bridge property to libzygisk.so;
             // its magic mount is ignored by the shim, so Overlay.apply copies the magisk binary into /system/lib64 under that name
             val zygiskLib = MagiskCore.zygiskLibName(guestShell("getprop ${MagiskCore.NATIVE_BRIDGE_PROP}", 15_000))
@@ -1603,6 +1643,32 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 magiskManagerSetup()
             }
         }.onFailure { log("magisk: boot-complete stage failed: ${it.message}") }
+    }
+
+    /**
+     * sys.boot_completed: the agent's inbox app (the AEmuImport list inside the guest). Installed the way
+     * the Magisk app is — staged through data/local/tmp, a plain tree directory the installer reads fine —
+     * when it is missing or its length differs from the delivered copy.
+     */
+    private fun agentBootComplete() {
+        if (!agentOn) return
+        runCatching {
+            val apk = File(paths.root, AgentSupport.APK_COPY)
+            if (!apk.isFile) { log("agent: aemu-agent.apk is not in the image (build guest-agent-app/build.sh), no inbox app"); return }
+            val pkgPath = guestShell("pm path ${AgentSupport.APP_PACKAGE}", 60_000).lines()
+                .firstOrNull { it.startsWith("package:") }?.removePrefix("package:")?.trim()
+            val guestLen = pkgPath?.let { guestShell("wc -c < $it", 30_000).trim().toLongOrNull() }
+            if (pkgPath != null && guestLen == apk.length()) return
+            val staged = File(paths.root, "data/local/tmp").apply { mkdirs() }.let { File(it, "aemu-agent.apk") }
+            java.nio.file.Files.copy(apk.toPath(), staged.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            staged.setReadable(true, false)
+            try {
+                val out = installApk("/data/local/tmp/aemu-agent.apk").trim()
+                log("agent: inbox app install -> ${out.take(300)}")
+            } finally {
+                staged.delete()
+            }
+        }.onFailure { log("agent: boot-complete stage failed: ${it.message}") }
     }
 
     /**

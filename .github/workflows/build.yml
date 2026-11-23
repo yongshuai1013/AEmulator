@@ -51,6 +51,26 @@ jobs:
         with:
           name: aemu-bt-jar
           path: app/src/main/assets/engines/kk/aemu-bt.jar
+      - name: Build guest agent jar from source
+        run: |
+          export ANDROID_JAR="$ANDROID_HOME/platforms/android-19/android.jar"
+          export D8_JAR="$ANDROID_HOME/build-tools/36.0.0/lib/d8.jar"
+          sh app/guest-agent/build.sh
+          ls -l app/src/main/assets/engines/kk/aemu-agent.jar
+          sha256sum app/src/main/assets/engines/kk/aemu-agent.jar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aemu-agent-jar
+          path: app/src/main/assets/engines/kk/aemu-agent.jar
+      - name: Build guest agent inbox app from source
+        run: |
+          sh app/guest-agent-app/build.sh
+          ls -l app/src/main/assets/engines/kk/aemu-agent.apk
+          sha256sum app/src/main/assets/engines/kk/aemu-agent.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aemu-agent-apk
+          path: app/src/main/assets/engines/kk/aemu-agent.apk
       - name: Build APK
         run: |
           chmod +x gradlew

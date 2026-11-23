@@ -204,6 +204,7 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
 
             var magiskBusy by remember { mutableStateOf(false) }
             MagiskSection(img, s.magisk, magiskBusy, { magiskBusy = it }) { s = s.copy(magisk = it) }
+            AgentSection(img, s) { s = it }
 
             Spacer(Modifier.height(8.dp))
             Text(stringResource(R.string.vs_archive), style = MaterialTheme.typography.titleMedium)
