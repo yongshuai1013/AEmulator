@@ -9,7 +9,7 @@ import java.util.zip.ZipFile
  * The input methods a firmware ships, found on the host before the first boot (TreeFixer's
  * default-IME seed). An APK of /system/app or /system/priv-app contributes one entry per
  * service that answers android.view.InputMethod under BIND_INPUT_METHOD — the same test
- * IMMS applies. The service's method XML (the res/*.xml whose root is <input-method>)
+ * IMMS applies. The service's method XML (the one under res/ whose root is <input-method>)
  * tells a keyboard from a pure voice panel: subtype modes are enum ints in the compiled
  * XML (keyboard 0, voice 1, handwriting 2). Only the compiled XML's string pool and
  * element tree are read; anything unexpected parses as null and the file is skipped.
