@@ -232,7 +232,15 @@ class InputService(private val paths: VmPaths, private val log: (String) -> Unit
                 val nowMs = System.currentTimeMillis()
                 if (sinkLogAt == 0L || nowMs - sinkLogAt >= 1000) {
                     sinkLogAt = nowMs
-                    log("input sink: wrote ${a.size}B (total ${sinkBytes}B, ${sinkEvents} events)")
+                    // probe: bytes still sitting unread in the event0 pipe at log
+                    // time (FIONREAD on the host fd behind the sink stream).
+                    // -1 when unmeasurable; measuring must never break writing.
+                    val backlog = runCatching {
+                        val fd = (s as? java.io.FileOutputStream)?.fd
+                        if (fd == null) -1
+                        else android.system.Os.ioctlInt(fd, android.system.OsConstants.FIONREAD)
+                    }.getOrDefault(-1)
+                    log("input sink: wrote ${a.size}B (total ${sinkBytes}B, ${sinkEvents} events, backlog ${if (backlog >= 0) "${backlog}B" else "-1"})")
                 }
             }.onFailure {
                 log("input sink: write failed, sink dropped (${it.message ?: it.javaClass.simpleName})")
