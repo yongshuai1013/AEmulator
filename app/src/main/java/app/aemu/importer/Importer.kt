@@ -131,7 +131,7 @@ class Importer(
             Iso9660.probe(src) -> importIso(src, name, depth)
             // a whole-disk image (GPT or MBR partition table), e.g. an eMMC/SD dump (AEmulator-Plus)
             isDiskImage(src) -> importDiskImage(src, name)
-            SparseSource.probe(src) || Ext4Reader.probe(src) || SuperImage.probe(src) || ErofsReader.probe(src) || UbiFsReader.probe(src) -> importImage(src, "system")
+            SparseSource.probe(src) || Ext4Reader.probe(src) || SuperImage.probe(src) || ErofsReader.probe(src) || UbiFsReader.probe(src) || SquashFsImage.probe(src) -> importImage(src, "system")
             // (the content first: forum rootfs ".tar" files are gzip-compressed)
             isTar(h) || !isCompressed(h) && name.endsWith(".tar", true) || name.endsWith(".md5", true) || name.endsWith(".win", true) ->
                 importTarStream(streamOf(src), name, depth, src)
@@ -524,7 +524,7 @@ class Importer(
     /** the content probes [importImage] dispatches on: an entry is a partition image iff one of them hits */
     private fun isFsImage(src: RandomSource): Boolean =
         SparseSource.probe(src) || Ext4Reader.probe(src) || SuperImage.probe(src) || Yaffs2Image.probe(src) ||
-            FatImage.probe(src) || ErofsReader.probe(src) || UbiFsReader.probe(src)
+            FatImage.probe(src) || ErofsReader.probe(src) || UbiFsReader.probe(src) || SquashFsImage.probe(src)
 
     /** A partition image of any supported file system: sparse → ext4, super.img (dynamic partitions), YAFFS2, FAT/RFS. */
     private fun importImage(src0: RandomSource, mount: String) {
@@ -552,6 +552,12 @@ class Importer(
                 log("UBIFS $mount: ${ubi.summary}")
                 importTree(ubi, mount, "UBIFS")
                 ubi.warnings.forEach { log("UBIFS $mount: $it") }
+            }
+            SquashFsImage.probe(src) -> {
+                // the reader works on a whole file: the image is written out, walked, and deleted (AEmulator-Plus)
+                val f = spill(streamOf(src), "system.sfs")
+                try { importTree(SquashFsImage(f, tmp) { log(it) }, mount, "SquashFS") }
+                finally { f.delete() }
             }
             else -> throw IOException("unknown file system in the $mount image")
         }

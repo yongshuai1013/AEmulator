@@ -1,5 +1,6 @@
 package app.aemu.importer
 
+import app.aemu.importer.tools.SquashFs
 import org.apache.commons.compress.compressors.lz4.BlockLZ4CompressorInputStream
 import java.io.ByteArrayInputStream
 import java.io.DataInputStream
@@ -348,6 +349,48 @@ class Yaffs2Image(private val src: RandomSource) : TreeSource {
             src.read(loc.first, bb)
         }
         return ByteArrayInputStream(out)
+    }
+}
+
+/**
+ * SquashFS images (the system.sfs of Android-x86 live CDs; SquashFS system partitions of 1.x–4.x firmware):
+ * read by the SquashFS reader of importer/tools (SquashFs, from AEmulator-Plus), which works on a whole file,
+ * so the image is handed over as one. The reader streams a file out before the walk may hand it on, so every
+ * file is buffered through [scratch] one at a time and deleted right after the walk consumed it.
+ */
+class SquashFsImage(private val image: File, private val scratch: File, private val log: (String) -> Unit = {}) : TreeSource {
+
+    companion object {
+        /** SquashFS superblock magic at 0: "hsqs" (little-endian image) or "sqsh" (big-endian one). */
+        fun probe(src: RandomSource): Boolean {
+            if (src.size < 4) return false
+            val d = ByteBuffer.allocate(4)
+            src.read(0, d)
+            val b = d.array()
+            return b[0] == 'h'.code.toByte() && b[1] == 's'.code.toByte() && b[2] == 'q'.code.toByte() && b[3] == 's'.code.toByte() ||
+                b[0] == 's'.code.toByte() && b[1] == 'q'.code.toByte() && b[2] == 's'.code.toByte() && b[3] == 'h'.code.toByte()
+        }
+    }
+
+    override fun walk(visit: (String, Boolean, String?, Int, Long, (() -> InputStream)?) -> Unit) {
+        var tmpFile: File? = null
+        var tmpMode = 0
+        var tmpSize = 0L
+        SquashFs.walkSquashFs(image, { log(it) }, object : SquashFs.SquashVisitor {
+            override fun dir(path: String, mode: Int) = visit(path, true, null, mode, 0, null)
+            override fun link(path: String, target: String) = visit(path, false, target, 0x1ff, 0, null)
+            override fun file(path: String, mode: Int, size: Long): java.io.OutputStream {
+                tmpMode = mode; tmpSize = size
+                val f = File(scratch, "squash-${System.nanoTime()}")
+                tmpFile = f
+                return f.outputStream().buffered(1 shl 20)
+            }
+            override fun fileEnd(path: String) {
+                val f = tmpFile ?: return
+                try { visit(path, false, null, tmpMode, tmpSize) { f.inputStream() } }
+                finally { f.delete(); tmpFile = null }
+            }
+        })
     }
 }
 
