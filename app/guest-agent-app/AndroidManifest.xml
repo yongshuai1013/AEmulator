@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The guest agent's inbox app: lists what the host streamed into the guest's AEmuImport folder and
-     hands a tapped APK to the guest's own package installer. Installed by the host at boot complete
-     (AgentSupport.APK_COPY); the package id is AgentSupport.APP_PACKAGE. -->
+<!-- The guest agent's app: the Root Manager (the launcher entry — status, the hide list, the self
+     test, all asked of the agent service) and the import inbox (what the host streamed into the
+     guest's AEmuImport folder, handed to the guest's own package installer). Installed by the host at
+     boot complete (AgentSupport.APK_COPY); the package id is AgentSupport.APP_PACKAGE. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="app.aemu.agent"
-    android:versionCode="1"
-    android:versionName="1.0">
+    android:versionCode="2"
+    android:versionName="1.1">
 
     <uses-sdk android:minSdkVersion="14" android:targetSdkVersion="23" />
 
@@ -13,12 +14,16 @@
         android:label="AEmu Import"
         android:theme="@android:style/Theme.Holo">
         <activity
-            android:name=".InboxActivity"
+            android:name=".ManagerActivity"
+            android:label="AEmu Root Manager"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity
+            android:name=".InboxActivity"
+            android:exported="true" />
     </application>
 </manifest>

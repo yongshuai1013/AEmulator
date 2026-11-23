@@ -1,6 +1,7 @@
 #!/bin/sh
-# Builds src/main/assets/engines/kk/aemu-agent.apk: the guest agent's inbox app (AndroidManifest.xml +
-# InboxActivity), without Gradle, like tools/guesttest. Signed with a self-generated keystore next to
+# Builds src/main/assets/engines/kk/aemu-agent.apk: the guest agent's app (AndroidManifest.xml +
+# ManagerActivity — the Root Manager — InboxActivity and AgentClient), without Gradle, like
+# tools/guesttest. Signed with a self-generated keystore next to
 # this script (agent.keystore, gitignored like every keystore here): the app is ours alone, installed by
 # the host through pm, and its updates are recognised by package + length, not by signature continuity
 # with anything else.
