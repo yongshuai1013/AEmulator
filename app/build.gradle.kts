@@ -92,7 +92,9 @@ android {
     }
 
     // skinAssets/skins: the device skin themes bundled with the app (AEmulator-Plus #32, see VmThemes.skins)
-    sourceSets["main"].assets.setSrcDirs(listOf(engineOut, file("src/main/skinAssets")))
+    // catalogAssets/romcatalog: the bundled ROM catalog snapshot (AEmulator-Plus #34), the offline fallback
+    // behind the live index in the aemu-rom-index repo (see ui/RomCatalogModel.kt)
+    sourceSets["main"].assets.setSrcDirs(listOf(engineOut, file("src/main/skinAssets"), file("src/main/catalogAssets")))
 
     packaging {
         // исполняемые файлы движка лежат как lib*.so и должны распаковываться на диск

@@ -395,6 +395,27 @@
     <string name="lib3d_spec_model">Model</string>
     <string name="lpm_start">Start in charging-only mode</string>
     <string name="open_vm">Open</string>
+    <string name="catalog_title">ROM catalog</string>
+    <string name="catalog_online">Live index</string>
+    <string name="catalog_cached">Offline — cached index</string>
+    <string name="catalog_snapshot">Offline — bundled index</string>
+    <string name="catalog_error">Could not load the catalog. Check the connection and retry.</string>
+    <string name="catalog_retry">Retry</string>
+    <string name="catalog_refresh">Refresh</string>
+    <string name="catalog_back">Back</string>
+    <string name="catalog_download_import">Download &amp; import</string>
+    <string name="catalog_downloading">Downloading…</string>
+    <string name="catalog_verifying">Verifying checksum…</string>
+    <string name="catalog_download_failed">Download failed: %1$s</string>
+    <string name="catalog_hash_mismatch">Checksum mismatch — the downloaded file was discarded.</string>
+    <string name="catalog_source">Source: archive.org / %1$s</string>
+    <string name="catalog_open_source">Open source page</string>
+    <string name="catalog_format_sdk">SDK image package</string>
+    <string name="catalog_format_factory">Factory image set</string>
+    <string name="catalog_format_ota">OTA / ROM package</string>
+    <string name="catalog_format_odin">Odin package</string>
+    <string name="catalog_device">Device: %1$s</string>
+    <string name="catalog_size">Size: %1$s</string>
     <string name="as_library_3d">3D firmware library</string>
     <string name="as_library_3d_sub">Show imported firmwares and containers as 3D phones you swipe through, instead of the card list. Off by default.</string>
 </resources>
