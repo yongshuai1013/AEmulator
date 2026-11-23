@@ -134,12 +134,14 @@ struct camera_device {
     char *params;
 };
 
+#define MSG_ERROR 0x001
 #define MSG_SHUTTER 0x002
 #define MSG_FOCUS 0x004
 #define MSG_PREVIEW_FRAME 0x010
 #define MSG_RAW_IMAGE 0x080
 #define MSG_COMPRESSED_IMAGE 0x100
 #define MSG_RAW_IMAGE_NOTIFY 0x200
+#define CAMERA_ERROR_UNKNOWN 1   /* the ext1 of a MSG_ERROR notify when nothing more specific is known */
 #define FORMAT_RGBA_8888 1
 #define USAGE_SW_WRITE_OFTEN 0x30
 
@@ -285,6 +287,16 @@ static int read_full(int fd, void *buf, unsigned long n) {
     while (n) { long k = read(fd, p, n); if (k <= 0) return -1; p += k; n -= (unsigned long)k; }
     return 0;
 }
+static int drain(int fd, unsigned long len) {
+    unsigned char t[512];
+    while (len) { unsigned long k = len < sizeof(t) ? len : sizeof(t); if (read_full(fd, t, k) < 0) return -1; len -= k; }
+    return 0;
+}
+/* A picture that cannot be delivered must not leave the framework waiting for it forever:
+ * CAMERA_MSG_ERROR is how a HAL1 device says the capture failed, and the application recovers. */
+static void notify_error(struct camera_device *d) {
+    if ((d->msgs & MSG_ERROR) && d->notify) d->notify(MSG_ERROR, CAMERA_ERROR_UNKNOWN, 0, d->user);
+}
 
 static void show(struct camera_device *d, const unsigned char *rgba, int w, int h) {
     struct preview_ops *win = d->window;
@@ -381,9 +393,23 @@ static void *reader(void *arg) {
                 }
                 if (m && m->release) m->release(m);
             }
-        } else if (type == 2 && len > 0 && len < (16u << 20)) {
+        } else if (type == 2) {
+            /* a picture from the host. Its arrival is the event the whole still path turns on, so it is
+             * probed whatever its length: a zero length is the host's encode failure arriving, and a
+             * picture that cannot be delivered is answered with CAMERA_MSG_ERROR instead of silence */
+            probe(d, "picture", (long)len);
+            if (len == 0 || len >= (16u << 20)) {
+                if (len && drain(d->fd, len) < 0) break;
+                notify_error(d);
+                continue;
+            }
             struct camera_memory *m = d->get_memory ? d->get_memory(-1, len, 1, d->user) : 0;
-            if (!m || !m->data) { unsigned char t[512]; while (len) { unsigned long k = len < sizeof(t) ? len : sizeof(t); if (read_full(d->fd, t, k) < 0) break; len -= k; } continue; }
+            if (!m || !m->data) {
+                probe(d, "picture no_memory", -1);
+                if (drain(d->fd, len) < 0) break;
+                notify_error(d);
+                continue;
+            }
             if (read_full(d->fd, m->data, len) < 0) { if (m->release) m->release(m); break; }
             d->previewing = 0;   /* a picture stops the preview, the application starts it again */
             if ((d->msgs & MSG_SHUTTER) && d->notify) d->notify(MSG_SHUTTER, 0, 0, d->user);

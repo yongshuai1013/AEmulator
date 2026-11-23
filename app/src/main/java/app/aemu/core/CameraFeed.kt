@@ -129,9 +129,18 @@ class CameraFeed(private val ctx: Context, private val paths: VmPaths, private v
                 if (shot) {
                     shot = false
                     val jpg = ByteArrayOutputStream(200_000)
-                    YuvImage(nv21, ImageFormat.NV21, W, H, null).compressToJpeg(Rect(0, 0, W, H), 92, jpg)
+                    val encoded = YuvImage(nv21, ImageFormat.NV21, W, H, null).compressToJpeg(Rect(0, 0, W, H), 92, jpg)
                     streaming = false   // a picture stops the preview until the guest starts it again (its "start"
-                    send(2, jpg.toByteArray(), jpg.size())     // may come right after the picture, so this goes first)
+                    if (encoded && jpg.size() > 0) {            // may come right after the picture, so this goes first)
+                        val bytes = jpg.toByteArray()
+                        log("camera: shot sent as type 2, ${bytes.size} bytes of jpeg")
+                        send(2, bytes, bytes.size)
+                    } else {
+                        // a failed encode used to go out as a length-0 type 2, which the HAL dropped
+                        // without a word and the guest waited for the picture forever; it is now
+                        // neither sent nor silent — this line is where the failure shows up
+                        log("camera: shot encode failed (ok=$encoded, ${jpg.size()} bytes), no type 2 sent")
+                    }
                     return
                 }
                 toRgba()
