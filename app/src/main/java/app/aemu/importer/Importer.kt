@@ -9,6 +9,7 @@ import app.aemu.core.TreeFixer
 import app.aemu.core.VmPaths
 import app.aemu.core.RecoveryImage
 import app.aemu.importer.tools.SquashFs
+import app.aemu.importer.tools.WimReader
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.archivers.sevenz.SevenZFile
@@ -139,6 +140,8 @@ class Importer(
             HuaweiApp.probe(h) -> importHuaweiApp(src, name, strict = depth == 0)
             // Acer flash package (*.bin / *.nb0): table of named images, YAFFS2 rootfs + system (AEmulator-Plus)
             AcerBin.probe(h) -> importAcerBin(src, name, strict = depth == 0)
+            // aow.wim on its own (the Android subsystem image of a Windows 10 Mobile servicing package) (AEmulator-Plus)
+            WimReader.probe(h) -> importWimStandalone(src, name)
             SparseSource.probe(src) || Ext4Reader.probe(src) || SuperImage.probe(src) || ErofsReader.probe(src) || UbiFsReader.probe(src) || SquashFsImage.probe(src) -> importImage(src, "system")
             // (the content first: forum rootfs ".tar" files are gzip-compressed)
             isTar(h) || !isCompressed(h) && name.endsWith(".tar", true) || name.endsWith(".md5", true) || name.endsWith(".win", true) ->
@@ -986,6 +989,83 @@ class Importer(
         if (bad > 0) log("huawei $label: $bad block(s) of the system image fail their CRC, the download may be damaged")
         importImage(slice(systemPacket), "system")
         for (p in fsParts) if (p !== systemPacket) log("huawei $label: skipped partition id 0x%02x (%d KB)".format(p.id, p.size shr 10))
+    }
+
+    private fun importWimStandalone(src: RandomSource, name: String) {
+        val f = spill(streamOf(src), name)
+        try {
+            if (!importWimFile(f, name))
+                throw IOException("no Android system partition found in file")
+        } finally { f.delete() }
+    }
+
+    /**
+     * The image of a WIM that holds an Android root file system, laid out like a system-as-root partition: the top level
+     * (init*.rc, sepolicy, sbin/ ...) is the guest root and /system is a folder in it — the same shape the rootfs-tar
+     * route produces, so the tree is laid out at the root as it is.
+     *
+     * An Astoria image is made on NTFS, which has no Unix modes and no symlinks, so each file carries a named data
+     * stream "aow" (u32 mode, u32 uid, u32 gid, zero padding; the mode's type bits say regular file, directory or
+     * symlink) and a symlink's own data is its target with Windows separators ("\system\bin\mksh").
+     * Returns false when no image in the WIM looks like Android.
+     * (Adapted from AEmulator-Plus.)
+     */
+    private fun importWimFile(f: File, name: String): Boolean {
+        WimReader(f).use { wim ->
+            var idx = 0
+            for (i in 1..wim.imageCount()) {
+                var android = false
+                wim.walk(i, WimReader.Visitor { e -> if (e.path == "system/build.prop" || e.path == "system/framework") android = true })
+                if (android) { idx = i; break }
+            }
+            if (idx == 0) { log("wim $name: no Android system image in it"); return false }
+            log("wim $name: image $idx of ${wim.imageCount()} is Android")
+            onProgress("Reading image system (WIM)", -1f)
+            var n = 0
+            wim.walk(idx, WimReader.Visitor { e ->
+                if (cancelled) throw IOException("cancelled")
+                val rel = e.path
+                val top = rel.substringBefore('/')
+                // the VM creates /dev, /proc and /sys itself
+                if (top == "dev" || top == "proc" || top == "sys") return@Visitor
+                val aow = e.named["aow"]?.takeIf { it.size in 4..4096 }?.let { runCatching { wim.read(it) }.getOrNull() }
+                val unixMode = if (aow != null && aow.size >= 4)
+                    (aow[0].toInt() and 255) or ((aow[1].toInt() and 255) shl 8) or ((aow[2].toInt() and 255) shl 16) or ((aow[3].toInt() and 255) shl 24)
+                else -1
+                val type = if (unixMode >= 0) unixMode and 0xF000 else 0
+                val dest = File(root, rel)
+                if (!dest.canonicalPath.startsWith(root.canonicalPath)) return@Visitor
+                when {
+                    e.isDir -> dest.mkdirs()
+                    type == 0xA000 -> {
+                        val target = wimLinkTarget(String(wim.read(e.data), Charsets.UTF_8))
+                        if (target != null) symlinks.add(target to "/$rel") else log("wim: symlink $rel has no usable target, skipped")
+                    }
+                    type == 0 || type == 0x8000 -> {
+                        // the services are started by the emulator itself: the firmware's init, adbd and ueventd are not used
+                        if (rel == "init" || rel == "charger" || rel.startsWith("sbin/ueventd") || rel.startsWith("sbin/adbd")) return@Visitor
+                        dest.parentFile?.mkdirs()
+                        if (isLink(dest)) dest.delete()
+                        wim.open(e.data).use { i -> dest.outputStream().buffered(1 shl 20).use { o -> bytes += i.copyTo(o, 1 shl 16) } }
+                        applyMode(dest, if (unixMode >= 0) unixMode and 0xfff else 0x1a4)
+                        files++
+                    }
+                    else -> {}   // device nodes, fifos, sockets: nothing to make on the host
+                }
+                if (++n % 150 == 0) onProgress("system: ${rel.substringAfterLast('/')}", -1f)
+            })
+            gotSystem = true
+            log("WIM system: $n objects (root file system in the image)")
+        }
+        return true
+    }
+
+    /** Symlink target of an Astoria image: Windows separators, absolute paths and "..", normalised to a clean path. */
+    private fun wimLinkTarget(raw: String): String? {
+        val t = raw.replace('\\', '/').trimEnd('\u0000', '\r', '\n', ' ')
+        if (t.isEmpty()) return null
+        val norm = runCatching { java.nio.file.Paths.get(t).normalize().toString() }.getOrNull()
+        return norm?.ifEmpty { null }
     }
 
     /**
