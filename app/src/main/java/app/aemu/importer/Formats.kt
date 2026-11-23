@@ -597,6 +597,22 @@ class ExtentSource(private val src: RandomSource, private val extents: List<Pair
     }
 }
 
+/** A contiguous window of another source: [size] bytes starting at [base] in [src] (AEmulator-Plus). */
+class SliceSource(private val src: RandomSource, private val base: Long, override val size: Long) : RandomSource {
+    override fun read(pos: Long, dst: ByteBuffer) {
+        var p = pos
+        while (dst.hasRemaining()) {
+            if (p >= size) { while (dst.hasRemaining()) dst.put(0); return }
+            val n = minOf(dst.remaining().toLong(), size - p).toInt()
+            val lim = dst.limit()
+            dst.limit(dst.position() + n)
+            src.read(base + p, dst)
+            dst.limit(lim)
+            p += n
+        }
+    }
+}
+
 /**
  * Android A/B OTA payload.bin (CrAU). Extracts partitions (system, vendor, etc.) without external tools.
  */

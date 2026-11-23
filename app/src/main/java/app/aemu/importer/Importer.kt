@@ -135,6 +135,8 @@ class Importer(
             Iso9660.probe(src) -> importIso(src, name, depth)
             // a whole-disk image (GPT or MBR partition table), e.g. an eMMC/SD dump (AEmulator-Plus)
             isDiskImage(src) -> importDiskImage(src, name)
+            // Acer flash package (*.bin / *.nb0): table of named images, YAFFS2 rootfs + system (AEmulator-Plus)
+            AcerBin.probe(h) -> importAcerBin(src, name, strict = depth == 0)
             SparseSource.probe(src) || Ext4Reader.probe(src) || SuperImage.probe(src) || ErofsReader.probe(src) || UbiFsReader.probe(src) || SquashFsImage.probe(src) -> importImage(src, "system")
             // (the content first: forum rootfs ".tar" files are gzip-compressed)
             isTar(h) || !isCompressed(h) && name.endsWith(".tar", true) || name.endsWith(".md5", true) || name.endsWith(".win", true) ->
@@ -344,6 +346,12 @@ class Importer(
                 RecoveryFromBoot.isScriptFile(base) && e.size in 1..(1L shl 20) ->
                     zip.getInputStream(e).use { rfbScript = String(it.readBytes(), Charsets.UTF_8) }
                 RecoveryFromBoot.isBonusFile(base) && e.size in 1..(8L shl 20) -> zip.getInputStream(e).use { rfbBonus = it.readBytes() }
+                // Acer flash package packed in the archive (*.nb0 / *.bin): the table decides (AEmulator-Plus)
+                (base.endsWith(".nb0", true) || base.endsWith(".bin", true)) && e.size > AcerBin.MIN_SIZE ->
+                    withEntrySource(zip, e) { s ->
+                        val hb = ByteBuffer.allocate(1100); s.read(0, hb)
+                        if (AcerBin.probe(hb.array())) importAcerBin(s, base, strict = false)
+                    }
             }
             done += maxOf(0L, e.size)
             onProgress("Extracting: $base", 0.9f * done / total)
@@ -662,6 +670,7 @@ class Importer(
     }
 
     private val MAX_RAMDISK = 64L * 1024 * 1024
+    private val MAX_RAMDISK_FILE = 32L * 1024 * 1024
 
     /**
      * ISO 9660 image of Android-x86 (live CD / installer, also Bliss OS, PrimeOS ...). The ISO is only a container:
@@ -830,6 +839,124 @@ class Importer(
 
     private fun hasRecoveryBinary(img: ByteArray): Boolean =
         runCatching { BootImage.ramdisk(img)?.any { it.name.removePrefix("./") == "sbin/recovery" } == true }.getOrDefault(false)
+
+    /** True if the file system on [s] holds a /system tree (build.prop or the framework at its root). */
+    private fun looksLikeSystem(s: RandomSource): Boolean = when {
+        Yaffs2Image.probe(s) -> yaffs2HoldsSystem(s)
+        Ext4Reader.probe(s) -> runCatching {
+            val fs = Ext4Reader(s); fs.lookup("build.prop") != null || fs.lookup("framework") != null
+        }.getOrDefault(false)
+        else -> false
+    }
+
+    /**
+     * Acer flash package (see [AcerBin]). The importer takes
+     *  - `system.img`, the YAFFS2 /system partition (any other image only if no system.img is there and its tree looks like /system),
+     *  - `rootfs.img`, the YAFFS2 root file system, as the ramdisk (init*.rc, default.prop, sbin/...), because the
+     *    kernel is flashed on its own and there is no boot.img,
+     *  - an "ANDROID!" boot / recovery image if a (later) package carries one.
+     * Boot loader pieces, kernel, modem, userdata, hidden/modules, factory-test rootfs and the YAFFS2 recovery
+     * root file system are skipped.
+     * [strict]: the file was chosen directly, so a package without a system partition is an error.
+     * (Adapted from AEmulator-Plus; the YAFFS2 side runs on this importer's Yaffs2Image, and the extra 32-bit word
+     * Acer puts in front of every NAND image is tried as a shifted window — see [fsSlice].)
+     */
+    private fun importAcerBin(src: RandomSource, name: String, strict: Boolean) {
+        val label = name.replace('\\', '/').substringAfterLast('/')
+        val entries = try { AcerBin.entries(src) } catch (ex: IOException) {
+            if (strict) throw ex
+            log("skipped $label: ${ex.message}"); return
+        }
+        val profile = AcerBin.profile(src, entries)
+        log("acer $label: ${entries.size} images" +
+            (profile["PROJECT"]?.let { ", project $it" } ?: "") + (profile["PLATFORM"]?.let { ", platform $it" } ?: "") +
+            (profile["MODEL"]?.let { ", model $it" } ?: ""))
+        fun slice(e: AcerBin.Entry): RandomSource = SliceSource(src, e.offset, e.size)
+        fun head(e: AcerBin.Entry, n: Int): ByteArray {
+            val b = ByteBuffer.allocate(minOf(n.toLong(), e.size).toInt()); slice(e).read(0, b); return b.array()
+        }
+        // the file system images start with one extra 32-bit word in front of the first page (so the last page is
+        // 4 bytes short): when no file system is found at the entry itself, the image is tried shifted by that word
+        fun fsSlice(e: AcerBin.Entry): RandomSource {
+            val s = slice(e)
+            if (isFsImage(s)) return s
+            if (e.size > 4) {
+                val shifted = SliceSource(src, e.offset + 4, e.size - 4)
+                if (isFsImage(shifted)) return shifted
+            }
+            return s
+        }
+
+        // boot / recovery images in Android format (the Gingerbread-era E1xx packages have none)
+        for (e in entries) {
+            if (cancelled) throw IOException("cancelled")
+            if (e.size < 4096 || e.size > 64_000_000) continue
+            if (String(head(e, 8), Charsets.ISO_8859_1) != "ANDROID!") continue
+            val data = readAllFrom(slice(e))
+            if (hasRecoveryBinary(data)) { if (recovery == null) recovery = data } else takeBoot(data)
+        }
+
+        // ramdisk: the root file system image
+        if (ramdisk == null) entries.firstOrNull { AcerBin.isRootfs(it.base) && it.size > 0 }?.let {
+            takeYaffs2Ramdisk(fsSlice(it), "$label ${it.base}")
+        }
+
+        // system partition: system.img, otherwise the file system image whose tree looks like /system
+        val systemEntry = entries.firstOrNull { it.base.matches(SYSTEM_IMAGE) && it.size > 0 } ?: run {
+            val fsEntries = entries.filter { e ->
+                if (e.size < (4L shl 20) || AcerBin.isRootfs(e.base) || e.base.contains("ftm", true)) return@filter false
+                val hh = head(e, 8)
+                if (String(hh, Charsets.ISO_8859_1) == "ANDROID!" || (hh[0].toInt() == 0x7f && hh[1] == 'E'.code.toByte())) return@filter false
+                isFsImage(fsSlice(e))
+            }
+            fsEntries.firstOrNull { looksLikeSystem(fsSlice(it)) }
+        }
+        if (systemEntry == null || gotSystem) {
+            val what = if (gotSystem) "system already imported" else "no system partition"
+            if (strict && !gotSystem) throw IOException("\"$label\" has no system partition (not a full Acer firmware package?)")
+            log("acer $label: $what")
+            return
+        }
+        importImage(fsSlice(systemEntry), "system")
+        for (e in entries) {
+            if (e === systemEntry) continue
+            if (e.base.endsWith(".img", true) && e.size >= 4096)
+                log("acer $label: skipped ${e.base} (${e.size shr 10} KB)")
+        }
+    }
+
+    /**
+     * Root file system image (YAFFS2) as ramdisk: the same list of files finishTree takes from a boot.img ramdisk.
+     * Without an init.rc the image is not a root file system and is ignored. (AEmulator-Plus)
+     */
+    private fun takeYaffs2Ramdisk(src: RandomSource, label: String) {
+        if (ramdisk != null) return
+        try {
+            val fs = Yaffs2Image(src)
+            val out = ArrayList<BootImage.CpioEntry>()
+            var total = 0L
+            fs.walk { path, isDir, link, mode, size, data ->
+                val perm = if (mode and 0xfff != 0) mode and 0xfff else 0x1ed
+                when {
+                    isDir -> out.add(BootImage.CpioEntry(path, 0x4000 or perm, ByteArray(0)))
+                    link != null -> out.add(BootImage.CpioEntry(path, 0xA000 or 0x1ff, link.toByteArray()))
+                    data != null -> {
+                        if (size > MAX_RAMDISK_FILE) { log("ramdisk $label: skipped $path (${size shr 20} MB)"); return@walk }
+                        val bytes = data().use { it.readBytes() }
+                        total += bytes.size
+                        if (total > MAX_RAMDISK) throw IOException("ramdisk too large")
+                        out.add(BootImage.CpioEntry(path, 0x8000 or perm, bytes))
+                    }
+                }
+            }
+            if (out.none { it.name == "init.rc" }) { log("ramdisk $label: no init.rc, not a root file system"); return }
+            ramdisk = out
+            log("boot: ramdisk from YAFFS2 $label, ${out.size} entries")
+        } catch (ex: IOException) {
+            if (cancelled) throw ex
+            log("ramdisk $label: ${ex.message}, skipped")
+        }
+    }
 
     /** True if the YAFFS2 volume has /build.prop at its root: a raw /system partition. */
     private fun yaffs2HoldsSystem(src: RandomSource): Boolean = try {
