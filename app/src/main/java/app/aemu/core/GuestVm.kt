@@ -41,6 +41,10 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     /** the guest Wi-Fi service is up for this run: its network replaces the Ethernet stand-in */
     @Volatile private var wifiOn = false
 
+    /** host Bluetooth bridge (AEmulator-Plus #18) can serve this image: the 4.4 engine, API 9–25, not a recovery boot */
+    private val bluetoothSupported get() = engine == Engine.KK && img.api in 9..25 && !recoveryMode
+    private val bluetooth = BluetoothBridge(ctx, paths, { settings.bluetooth && bluetoothSupported }, ::log)
+
     @Volatile var state = State.STOPPED
         private set
     @Volatile var bootAt = 0L
@@ -157,6 +161,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         try {
             if (recoveryMode) doRecovery() else doBoot()
         } catch (t: Throwable) {
+            bluetooth.stop()
             failure = t.message ?: t.toString()
             log("✖ boot aborted: $failure")
             setState(State.FAILED)
@@ -580,6 +585,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         input.serve()
         if (engine != Engine.N64) vibration.serve()   // 64-bit guests get vibration through Sensors
         frames.serve()
+        if (s.bluetooth && bluetoothSupported) bluetooth.serve()
         if (s.radio) ril.serve() else log("radio: emulation disabled in settings")
         vold.serve()
         // у vold производителей бывают дополнительные сокеты (Samsung: usbstorage, enc_report) — отвечаем «ладно»
@@ -711,8 +717,16 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             if (svc.name == "zygote" && img.api >= 9 && engine != Engine.GB && File(paths.root, "system/framework/aemu-stubs.jar").isFile) {
                 // 2.3–4.1 look up "bluetooth" instead; without it BluetoothAdapter is null and the vendor's Bluetooth apps crash
                 val btName = if (img.api >= 17) "bluetooth_manager" else "bluetooth"
+                // Android 4.4 (API 19) with the host bridge on: the real bridge client from aemu-bt.jar;
+                // every other case keeps the placeholder above (AEmulator-Plus #18)
+                val btJar = File(paths.root, "system/framework/aemu-bt.jar")
+                val bridgeJar = settings.bluetooth && bluetoothSupported && img.api == 19 && btJar.isFile
+                if (settings.bluetooth && bluetoothSupported && img.api == 19 && !btJar.isFile)
+                    log("bluetooth: aemu-bt.jar is not installed (build guest-bt/build.sh), the guest keeps the placeholder")
+                synchronized(procs) { procs.remove("aemu-bt") }?.let { runCatching { it.destroyForcibly() } }
                 startService(GuestService("aemu-bt", listOf("/system/bin/app_process",
-                    "-Djava.class.path=/system/framework/aemu-stubs.jar", "/system/bin", "app.aemu.stub.BtStub", btName), optional = true))
+                    "-Djava.class.path=/system/framework/${if (bridgeJar) "aemu-bt.jar" else "aemu-stubs.jar"}", "/system/bin",
+                    if (bridgeJar) "app.aemu.stub.BtService" else "app.aemu.stub.BtStub", btName), optional = true))
             }
             // (well before zygote: apexd of 10+ looks for vold first and only then registers its own service, which the
             // package manager requires)
@@ -1360,8 +1374,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         File("/proc").listFiles()?.forEach { d ->
             val pid = d.name.toIntOrNull() ?: return@forEach
             val cmd = runCatching { String(File(d, "cmdline").readBytes(), Charsets.ISO_8859_1) }.getOrNull() ?: return@forEach
-            // app_process с aemu-stubs.jar / aemu-wifi.jar — наши службы (bluetooth_manager, Wi-Fi), не приложения зиготы
-            if (cmd.contains(marker) && cmd.contains("/system/bin/app_process") && !cmd.contains("aemu-stubs.jar") && !cmd.contains("aemu-wifi.jar")) {
+            // app_process с aemu-stubs.jar / aemu-wifi.jar / aemu-bt.jar — наши службы (bluetooth_manager, Wi-Fi), не приложения зиготы
+            if (cmd.contains(marker) && cmd.contains("/system/bin/app_process") && !cmd.contains("aemu-stubs.jar") && !cmd.contains("aemu-wifi.jar") && !cmd.contains("aemu-bt.jar")) {
                 runCatching { AProcess.sendSignal(pid, 9) }; n++
             } else if (orphanOfThisImage(d)) {
                 // 7.0+: a zygote child rewrites its whole command line ("system_server"), so the path is gone from it;
@@ -1407,6 +1421,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         log("stop: begin cameraStop"); camera.stop(); log("stop: done cameraStop")
         log("stop: begin vibrationStop"); vibration.stop(); log("stop: done vibrationStop")
         log("stop: begin batteryStop"); battery.stop(); log("stop: done batteryStop")
+        log("stop: begin bluetoothStop"); bluetooth.stop(); log("stop: done bluetoothStop")
         log("stop: begin GlHostStop"); GlHost.stop(); log("stop: done GlHostStop")
         extraStubs.forEachIndexed { i, s -> log("stop: begin extraStub[$i]Stop"); s.stop(); log("stop: done extraStub[$i]Stop") }; extraStubs.clear()
         log("stop: begin lmkStop"); lmk?.stop(); lmk = null; log("stop: done lmkStop")

@@ -736,6 +736,7 @@ class TreeFixer(
                 "gralloc.default.so" to "system/lib/hw/gralloc.default.so",
                 "aemu-stubs.jar" to "system/framework/aemu-stubs.jar",
                 "aemu-wifi.jar" to "system/framework/aemu-wifi.jar",
+                "aemu-bt.jar" to "system/framework/aemu-bt.jar",
             )
             Engine.GB -> listOf(
                 "libashmemshim.so" to "system/lib/libashmemshim.so",
