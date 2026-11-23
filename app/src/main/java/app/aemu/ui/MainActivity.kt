@@ -198,10 +198,10 @@ fun Library(model: LibraryModel) {
     fun deleteFolder(id: String) { arranger.update(arranger.layout().deleteFolder(id)); arranger.commit() }
     // 3D library is an opt-in app setting; re-read it when returning from Settings
     val lifecycleOwner = LocalLifecycleOwner.current
-    var view3d by remember { mutableStateOf(AppPrefs.library3d(ctx)) }
+    var view3d by remember { mutableStateOf(app.aemu.AppPrefs.library3d(ctx)) }
     DisposableEffect(lifecycleOwner) {
         val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
-            if (e == Lifecycle.Event.ON_RESUME) view3d = AppPrefs.library3d(ctx)
+            if (e == Lifecycle.Event.ON_RESUME) view3d = app.aemu.AppPrefs.library3d(ctx)
         }
         lifecycleOwner.lifecycle.addObserver(obs)
         onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
