@@ -133,6 +133,9 @@ dependencies {
     implementation("org.apache.commons:commons-compress:1.28.0")
     implementation("org.brotli:dec:0.1.2")
     implementation("com.github.junrar:junrar:7.5.5")
+    // UBIFS data decompression (UbiFsReader, from AEmulator-Plus): zstd frames and LZO1X blocks
+    implementation("com.github.luben:zstd-jni:1.5.7-4@aar")
+    implementation("org.anarres.lzo:lzo-commons:1.0.6")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
 }

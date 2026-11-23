@@ -116,7 +116,11 @@ class Importer(
             PacFile.probe(h) -> if (ch != null) importPac(src, ch) else throw IOException("pac without random access")
             PayloadReader.probe(h) -> importPayload(src)
             SinImage.probe(h) || SinImage.probeOld(h) && name.endsWith(".sin", true) -> importSin(streamOf(src), name.substringAfterLast('/'))
-            SparseSource.probe(src) || Ext4Reader.probe(src) || SuperImage.probe(src) || ErofsReader.probe(src) -> importImage(src, "system")
+            // one partition of a raw NAND dump: the name (mtd<N>.img) says nothing, the content decides (AEmulator-Plus)
+            NandDump.isMtdName(name.substringAfterLast('/')) -> importMtdDump(src, name)
+            // a whole-disk image (GPT or MBR partition table), e.g. an eMMC/SD dump (AEmulator-Plus)
+            isDiskImage(src) -> importDiskImage(src, name)
+            SparseSource.probe(src) || Ext4Reader.probe(src) || SuperImage.probe(src) || ErofsReader.probe(src) || UbiFsReader.probe(src) -> importImage(src, "system")
             // (the content first: forum rootfs ".tar" files are gzip-compressed)
             isTar(h) || !isCompressed(h) && name.endsWith(".tar", true) || name.endsWith(".md5", true) || name.endsWith(".win", true) ->
                 importTarStream(streamOf(src), name, depth, src)
@@ -260,6 +264,12 @@ class Importer(
                         val st = if (base.endsWith("gz")) GZIPInputStream(s, 1 shl 16) else s
                         importTarStream(st, base, depth + 1)
                     }
+                }
+                // one partition of a raw NAND dump (mtd<N>.img): the content decides what it is (AEmulator-Plus)
+                NandDump.isMtdName(base) && e.size > 0 -> withEntrySource(zip, e) { importMtdDump(it, base) }
+                // a whole-disk image (GPT/MBR) packed in the archive: the name only nominates it, the table decides
+                PartitionNames.isDiskImageName(base) && e.size > (16L shl 20) -> withEntrySource(zip, e) { s ->
+                    if (isDiskImage(s)) importDiskImage(s, base) else log("$base: not a GPT/MBR disk image, skipped")
                 }
             }
             done += maxOf(0L, e.size)
@@ -485,6 +495,12 @@ class Importer(
             Yaffs2Image.probe(src) -> importTree(Yaffs2Image(src), mount, "YAFFS2")
             FatImage.probe(src) -> importTree(FatImage(src), mount, "FAT/RFS")
             ErofsReader.probe(src) -> importTree(ErofsImage(src), mount, "EROFS")
+            UbiFsReader.probe(src) -> {
+                val ubi = UbiTreeSource(src) { if (cancelled) throw IOException("cancelled") }
+                log("UBIFS $mount: ${ubi.summary}")
+                importTree(ubi, mount, "UBIFS")
+                ubi.warnings.forEach { log("UBIFS $mount: $it") }
+            }
             else -> throw IOException("unknown file system in the $mount image")
         }
     }
@@ -511,6 +527,125 @@ class Importer(
         }
         if (mount == "system") { gotSystem = true; hoistSystemAsRoot() }
         log("image $mount ($kind): $n objects")
+    }
+
+    // ------------------------------------------------------------------ целые диски и NAND-дампы (AEmulator-Plus)
+
+    /** True when [src] starts with a whole-disk partition table (GPT at LBA 1, or a classic MBR). The 1 MB floor keeps plain partition images and boot sectors out. */
+    private fun isDiskImage(src: RandomSource): Boolean {
+        if (src.size <= (1L shl 20)) return false
+        val head = ByteBuffer.allocate(8200)
+        src.read(0, head)
+        return GptDisk.probe(head.array()) || MbrDisk.probe(head.array())
+    }
+
+    private fun importDiskImage(src: RandomSource, name: String) {
+        val head = ByteBuffer.allocate(8200)
+        src.read(0, head)
+        if (!GptDisk.probe(head.array()) && MbrDisk.probe(head.array())) importMbrDisk(src, name) else importGptDisk(src, name)
+    }
+
+    /** A full eMMC/UFS dump with a GUID partition table: every partition the importer consumes is cut out and handed to the usual pipeline. */
+    private fun importGptDisk(src: RandomSource, name: String) {
+        val first = ByteBuffer.allocate(8200)
+        src.read(0, first)
+        val need = GptDisk.headSize(first.array(), first.capacity()) ?: throw IOException("$name: unreadable GPT")
+        val head = ByteArray(need)
+        src.read(0, ByteBuffer.wrap(head))
+        val picks = GptDisk.pick(GptDisk.parse(head) ?: throw IOException("$name: unreadable GPT"))
+        log("GPT disk $name: ${picks.joinToString { it.second.name }}")
+        for ((kind, part) in picks) {
+            val slice = ExtentSource(src, listOf(part.start to part.size))
+            when (kind) {
+                GptDisk.Kind.BOOT -> runCatching {
+                    if (part.size <= (256L shl 20)) takeBoot(readAllFrom(slice)) else log("gpt: boot partition ${part.name} too large, skipped")
+                }.onFailure { log("gpt boot: ${it.message}") }
+                GptDisk.Kind.VENDOR_BOOT -> log("gpt: vendor_boot partition skipped (vendor ramdisk overlay is not supported yet)")
+                GptDisk.Kind.RECOVERY -> if (recovery == null && part.size in 1..64_000_000) recovery = readAllFrom(slice)
+                GptDisk.Kind.OEM -> runCatching { importImage(slice, "oem") }.onFailure { log("gpt oem: ${it.message}") }
+                GptDisk.Kind.SYSTEM -> importImage(slice, "system")
+                GptDisk.Kind.SUPER -> importImage(slice, "system")
+                GptDisk.Kind.VENDOR -> runCatching { importImage(slice, "vendor") }.onFailure { log("gpt vendor: ${it.message}") }
+                GptDisk.Kind.GAPPS -> runCatching { importImage(slice, "gapps") }.onFailure { log("gpt gapps: ${it.message}") }
+                GptDisk.Kind.EXTRA -> PartitionNames.extraMount(part.name + ".img")?.let { mount ->
+                    runCatching { importImage(slice, mount) }.onFailure { log("gpt ${part.name}: ${it.message}") }
+                }
+            }
+        }
+    }
+
+    /** A raw disk dump with a classic MBR (development boards, old tablets): partitions have no names, their file system label and content give the roles. */
+    private fun importMbrDisk(src: RandomSource, name: String) {
+        val parts = MbrDisk.parse(src).filter { !MbrDisk.isExtendedPart(it) && it.size > 0 && it.start < src.size }
+        fun slice(p: MbrDisk.Part) = ExtentSource(src, listOf(p.start to minOf(p.size, src.size - p.start)))
+        fun ident(p: MbrDisk.Part) = MbrDisk.identify(ByteBuffer.allocate(MbrDisk.IDENT_BYTES).also { src.read(p.start, it) }.array())
+        val found = ArrayList<Pair<MbrDisk.Role, MbrDisk.Part>>()
+        var rawBoot = false
+        for ((i, p) in parts.withIndex()) {
+            val role = MbrDisk.roleOf(ident(p), slice(p).size, i == 0, rawBoot) ?: continue
+            if (role == MbrDisk.Role.BOOT_RAW) rawBoot = true
+            found.add(role to p)
+        }
+        if (found.none { it.first == MbrDisk.Role.SYSTEM }) {
+            // no label said "system": an ext partition that is not user data and holds a system tree is it
+            for (p in parts) {
+                if (found.any { it.second === p }) continue
+                val id = ident(p)
+                if (id.fs != MbrDisk.Fs.EXT || MbrDisk.isDataLabel(id.label)) continue
+                val holds = runCatching { Ext4Reader(slice(p)).let { it.lookup("build.prop") != null || it.lookup("framework") != null } }.getOrDefault(false)
+                if (holds) { found.add(MbrDisk.Role.SYSTEM to p); break }
+            }
+        }
+        val picks = MbrDisk.pick(found)
+        log("MBR disk $name: ${picks.joinToString { it.first.name.lowercase() }}")
+        for ((role, p) in picks) {
+            when (role) {
+                MbrDisk.Role.BOOT_RAW -> runCatching { takeBoot(readAllFrom(slice(p))) }.onFailure { log("mbr boot: ${it.message}") }
+                MbrDisk.Role.BOOT_FAT -> log("mbr: FAT boot partition skipped (U-Boot boot assembly is not supported yet)")
+                MbrDisk.Role.SYSTEM -> importImage(slice(p), "system")
+                MbrDisk.Role.VENDOR -> runCatching { importImage(slice(p), "vendor") }.onFailure { log("mbr vendor: ${it.message}") }
+                MbrDisk.Role.OEM -> runCatching { importImage(slice(p), "oem") }.onFailure { log("mbr oem: ${it.message}") }
+            }
+        }
+    }
+
+    /**
+     * One partition of a raw NAND dump (mtd0.img, mtd1.img ...). The name says nothing about what it holds, so the content decides:
+     * erased flash is skipped, a YAFFS2 volume with build.prop at its root is the system, a kernel with a ramdisk is the boot
+     * (or the recovery, when its ramdisk carries /sbin/recovery); dumps that keep the spare area are read without it.
+     */
+    private fun importMtdDump(src: RandomSource, name: String) {
+        val base = name.replace('\\', '/').substringAfterLast('/')
+        if (src.size < 4096) { log("$base: too small to be a partition, skipped"); return }
+        if (NandDump.isBlank(src)) { log("$base: erased flash, skipped"); return }
+        if (Yaffs2Image.probe(src) && yaffs2HoldsSystem(src)) {
+            log("$base: YAFFS2 system partition")
+            importImage(src, "system")
+            return
+        }
+        if (src.size <= NandDump.MAX_BOOT_BYTES) {
+            val raw = readAllFrom(src)
+            for (image in NandDump.candidates(raw)) {
+                val rd = runCatching { BootImage.ramdisk(image) }.getOrNull()
+                if (rd.isNullOrEmpty() || rd.none { e -> e.name.removePrefix("./").let { it == "init.rc" || it == "sbin/recovery" } }) continue
+                if (hasRecoveryBinary(image)) { if (recovery == null) recovery = image } else takeBoot(image)
+                return
+            }
+        }
+        log("$base: not a boot, recovery or system partition, skipped")
+    }
+
+    private fun hasRecoveryBinary(img: ByteArray): Boolean =
+        runCatching { BootImage.ramdisk(img)?.any { it.name.removePrefix("./") == "sbin/recovery" } == true }.getOrDefault(false)
+
+    /** True if the YAFFS2 volume has /build.prop at its root: a raw /system partition. */
+    private fun yaffs2HoldsSystem(src: RandomSource): Boolean = try {
+        var found = false
+        Yaffs2Image(src).walk { path, isDir, _, _, _, _ -> if (path == "build.prop" && !isDir) found = true }
+        found
+    } catch (t: Throwable) {
+        if (cancelled) throw t
+        false
     }
 
     /** Sony SIN v3: unpacked into a sparse temporary image, then read like any partition image. */
