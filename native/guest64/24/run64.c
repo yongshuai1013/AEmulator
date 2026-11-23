@@ -936,7 +936,14 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     case NR_getsockopt: {
         if (is_nl_fd((int)a[0])) return 0;
         if (g_vm && a[1] == 1 && a[2] == 31 /* SO_PEERSEC */) return vm_peersec(a[0], (char *)a[3], (u32 *)a[4]);   // Added for AEmulator Plus (2026-11-21): Zygisk, see vmount.h
-        return S5(nr, a[0], a[1], a[2], a[3], a[4]);
+        long r = S5(nr, a[0], a[1], a[2], a[3], a[4]);
+        // SO_PEERCRED: every guest program runs under the app's uid on the phone. The 5.x zygote lets only root and
+        // system name the uid of a new process ("App UIDs may not specify uid's or gid's"), so the peer reads as root.
+        if (r == 0 && a[1] == 1 && a[2] == 17 && a[3] && a[4] && *(u32 *)a[4] >= 12) {
+            u32 *cred = (u32 *)a[3];            // pid, uid, gid
+            if (cred[1] == g_real_uid) { cred[1] = 0; cred[2] = 0; }
+        }
+        return r;
     }
     case NR_sendto: {
         if (is_nl_fd((int)a[0])) {
