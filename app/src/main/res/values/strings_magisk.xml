@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AEmulator Plus: Magisk root for the native engine (MagiskCore.kt). English only for now; untranslated locales fall back to these. -->
+<resources>
+    <string name="vm_magisk_title">Root (Magisk)</string>
+    <string name="vm_magisk_sub">Starts Magisk\'s daemon at boot, puts su on the PATH and runs module scripts and module files (Zygisk: switch it on in the Magisk app). Applies at the next full boot. Experimental.</string>
+    <string name="vm_magisk_installed">Magisk %1$s (%2$d) is installed in this VM.</string>
+    <string name="vm_magisk_install">Install Magisk (choose the APK)</string>
+    <string name="vm_magisk_replace">Replace Magisk (choose another APK)</string>
+    <string name="vm_magisk_remove">Remove Magisk</string>
+    <string name="vm_magisk_working">Installing Magisk… Stop all VMs first.</string>
+    <string name="vm_magisk_done">Magisk %1$s installed. Turn Root on and start the VM; the Magisk app installs itself once the system is up.</string>
+    <string name="vm_magisk_removed">Magisk removed. Modules and magisk.db were kept.</string>
+</resources>
