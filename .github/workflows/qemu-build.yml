@@ -1,0 +1,47 @@
+name: qemu-build
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Translator target
+        type: choice
+        options: [arm, i386, both]
+        default: arm
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.target == 'both' && '["arm","i386"]' || format('["{0}"]', inputs.target)) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache Alpine chroot (rootfs, QEMU tarball, patched tree, build dir)
+        uses: actions/cache@v4
+        with:
+          path: /var/tmp/alp-aemulator-v3.20
+          key: qemu-chroot-${{ matrix.target }}-${{ hashFiles('qemu/patches/**', 'qemu/src/**', 'qemu/build-qemu.sh') }}
+          restore-keys: |
+            qemu-chroot-${{ matrix.target }}-
+      - name: Build translator (${{ matrix.target }})
+        run: sudo TARGET=${{ matrix.target }} ./qemu/build-qemu.sh
+      - name: Show build outputs
+        run: |
+          ls -l qemu/build/
+          file qemu/build/qemu-*-android
+          qemu/build/qemu-*-android --version | head -1
+      - name: Unmount chroot and hand ownership to the runner (for cache save)
+        if: always()
+        run: |
+          ALP=/var/tmp/alp-aemulator-v3.20
+          sudo umount "$ALP/proc" 2>/dev/null || true
+          sudo umount "$ALP/dev" 2>/dev/null || true
+          sudo chown -R "$USER" "$ALP" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qemu-${{ matrix.target }}
+          path: |
+            qemu/build/qemu-*-android
+            qemu/build/qemu-*-android-dbg
+            qemu/build/BUILD-MANIFEST.txt
