@@ -136,6 +136,23 @@
     <string name="vs_sim_iccid_sub">The SIM serial the modem reports. Blank: derived from the operator code and the IMEI. Applies at the next boot</string>
     <string name="vs_network">Reported network</string>
     <string name="vs_network_sub">What the status bar shows: 2G to LTE. Applies at the next boot</string>
+    <string name="vs_wifi">Wi-Fi network</string>
+    <string name="vs_wifi_sub">Shows the host\'s internet to the VM as a connected Wi-Fi network instead of Ethernet. Android 2.3 and 4.0–17 (8–17: experimental). Applies at the next boot.</string>
+    <string name="vs_wifi_ssid">Network name (SSID)</string>
+    <string name="vs_wifi_ssid_sub">Up to 32 bytes</string>
+    <string name="vs_wifi_ssid_error">The network name cannot be empty</string>
+    <string name="vs_wifi_password">Password</string>
+    <string name="vs_wifi_password_sub">Leave empty for an open network. WPA2 needs 8–63 characters.</string>
+    <string name="vs_wifi_password_error">Use 8–63 characters, or leave empty for an open network</string>
+    <string name="vs_wifi_show">Show</string>
+    <string name="vs_wifi_hide">Hide</string>
+    <string name="vs_wifi_signal">Signal strength</string>
+    <string name="vs_wifi_signal_sub">Bars the Wi-Fi icon shows</string>
+    <string name="vs_wifi_neighbors">Nearby networks</string>
+    <string name="vs_wifi_neighbors_sub">Shows a few other networks in the WiFi network list. (locked, they cannot be joined)</string>
+    <string name="vs_wifi_mirror">Mirror the phone\'s Wi-Fi</string>
+    <string name="vs_wifi_mirror_sub">The guest shows the network the phone is connected to — its real name, address, signal and nearby networks — instead of the name above. Needs the location permission; without it the name above is used</string>
+    <string name="vs_wifi_mirror_noperm">Location permission not granted: the guest will show the name above, not the phone\'s network</string>
     <string name="vs_advanced">Advanced</string>
     <string name="vs_qemu_args">Extra qemu options</string>
     <string name="vs_qemu_args_sub">Example: -d unimp DHD_TBFLUSH=2 (NAME=value becomes an environment variable)</string>

@@ -45,14 +45,22 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import android.Manifest
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import app.aemu.core.CarrierPresets
 import app.aemu.core.CpuInfo
 import app.aemu.core.Engine
 import app.aemu.core.GuestImage
+import app.aemu.core.HostWifi
 import app.aemu.core.NetworkType
 import app.aemu.core.StorageSpoof
 import app.aemu.core.StorageType
 import app.aemu.core.VmSettings
+import app.aemu.core.WifiEmu
 import kotlin.math.roundToInt
 
 private data class Res(val label: String, val w: Int, val h: Int, val dpi: Int)
@@ -160,6 +168,12 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
                 NetworkTypePicker(s.networkType, img.api) { s = s.copy(networkType = it) }
             }
 
+            val wifiOffered = WifiEmu.offered(img.copy(settings = s))
+            if (wifiOffered) {
+                Toggle(stringResource(R.string.vs_wifi), stringResource(R.string.vs_wifi_sub), s.wifi) { s = s.copy(wifi = it) }
+                if (s.wifi) WifiFields(s) { s = it }
+            }
+
             Spacer(Modifier.height(8.dp))
             Text(stringResource(R.string.vs_advanced), style = MaterialTheme.typography.titleMedium)
             OutlinedTextField(value = s.qemuArgs, onValueChange = { s = s.copy(qemuArgs = it) },
@@ -194,7 +208,8 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             Toggle(stringResource(R.string.vs_single), stringResource(R.string.vs_single_sub), s.mtMode == 4) { s = s.copy(mtMode = if (it) 4 else 0) }
 
             Spacer(Modifier.height(16.dp))
-            Button(onClick = { onSave(s) }, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text(stringResource(R.string.save)) }
+            val wifiOk = !(s.wifi && wifiOffered) || (WifiEmu.cleanSsid(s.wifiSsid).isNotEmpty() && WifiEmu.passwordValid(s.wifiPassword))
+            Button(enabled = wifiOk, onClick = { onSave(s) }, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text(stringResource(R.string.save)) }
             Spacer(Modifier.height(16.dp))
         }
     }
@@ -369,6 +384,55 @@ private fun NumField(label: String, value: Int, modifier: Modifier, set: (Int) -
 }
 
 /** Recovery of this firmware: stock one from the import, or a custom recovery.img (TWRP, OrangeFox, CWM…). */
+/** Name and optional password of the emulated Wi-Fi network (blank password = open network). (AEmulator Plus) */
+@Composable
+private fun WifiFields(s: VmSettings, set: (VmSettings) -> Unit) {
+    var show by remember { mutableStateOf(false) }
+    OutlinedTextField(value = s.wifiSsid, onValueChange = { set(s.copy(wifiSsid = WifiEmu.cleanSsid(it))) },
+        label = { Text(stringResource(R.string.vs_wifi_ssid)) }, singleLine = true,
+        isError = s.wifiSsid.isEmpty(),
+        supportingText = { Text(stringResource(if (s.wifiSsid.isEmpty()) R.string.vs_wifi_ssid_error else R.string.vs_wifi_ssid_sub)) },
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+    OutlinedTextField(value = s.wifiPassword, onValueChange = { set(s.copy(wifiPassword = WifiEmu.cleanPassword(it))) },
+        label = { Text(stringResource(R.string.vs_wifi_password)) }, singleLine = true,
+        isError = !WifiEmu.passwordValid(s.wifiPassword),
+        supportingText = { Text(stringResource(if (WifiEmu.passwordValid(s.wifiPassword)) R.string.vs_wifi_password_sub else R.string.vs_wifi_password_error)) },
+        visualTransformation = if (show) VisualTransformation.None else PasswordVisualTransformation(),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+        trailingIcon = { TextButton(onClick = { show = !show }) { Text(stringResource(if (show) R.string.vs_wifi_hide else R.string.vs_wifi_show)) } },
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+    var open by remember { mutableStateOf(false) }
+    fun bars(n: Int) = "▂▄▆█".take(n) + "·".repeat(WifiEmu.MAX_BARS - n)
+    ListItem(
+        headlineContent = { Text(stringResource(R.string.vs_wifi_signal)) },
+        supportingContent = { Text(stringResource(R.string.vs_wifi_signal_sub)) },
+        trailingContent = {
+            Box {
+                TextButton(onClick = { open = true }) { Text(bars(s.wifiSignal)) }
+                DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                    for (n in WifiEmu.MAX_BARS downTo 1) DropdownMenuItem(text = { Text(bars(n)) }, onClick = { open = false; set(s.copy(wifiSignal = n)) })
+                }
+            }
+        },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        modifier = Modifier.fillMaxWidth(),
+    )
+    Toggle(stringResource(R.string.vs_wifi_neighbors), stringResource(R.string.vs_wifi_neighbors_sub), s.wifiNeighbors) { set(s.copy(wifiNeighbors = it)) }
+    // this fork's addition: the phone's own connection instead of the typed network, when it can be read
+    val ctx = LocalContext.current
+    var asked by remember { mutableStateOf(0) }
+    val granted = remember(asked) { HostWifi.hasPermission(ctx) }
+    val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { asked++ }
+    Toggle(stringResource(R.string.vs_wifi_mirror), stringResource(R.string.vs_wifi_mirror_sub), s.wifiMirrorHost) { on ->
+        set(s.copy(wifiMirrorHost = on))
+        if (on && !HostWifi.hasPermission(ctx)) ask.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+    }
+    if (s.wifiMirrorHost && !granted) {
+        Text(stringResource(R.string.vs_wifi_mirror_noperm), style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 4.dp))
+    }
+}
+
 @Composable
 private fun RecoverySection(img: GuestImage) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
