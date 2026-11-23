@@ -1321,12 +1321,27 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         log("stopping system")
         if (recoveryMode) log("stop: skipping guest sync (recovery mode)")
         else runCatching { guestRunner.run(listOf("/system/bin/sync"), 5_000) }
-        killAll()
-        adb.stop(); props.stop(); input.stop(); frames.stop(); ril.stop(); vold.stop(); audio.stop(); net.stop(); dns.stop(); events.stop(); logd.stop(); lights.stop(); sensors.stop(); mic.stop(); camera.stop(); GlHost.stop()
-        extraStubs.forEach { it.stop() }; extraStubs.clear()
-        lmk?.stop(); lmk = null
-        Keeper.release(ctx)
-        setState(State.STOPPED)
+        log("stop: begin killAll"); killAll(); log("stop: done killAll")
+        log("stop: begin adbStop"); adb.stop(); log("stop: done adbStop")
+        log("stop: begin propsStop"); props.stop(); log("stop: done propsStop")
+        log("stop: begin inputStop"); input.stop(); log("stop: done inputStop")
+        log("stop: begin framesStop"); frames.stop(); log("stop: done framesStop")
+        log("stop: begin rilStop"); ril.stop(); log("stop: done rilStop")
+        log("stop: begin voldStop"); vold.stop(); log("stop: done voldStop")
+        log("stop: begin audioStop"); audio.stop(); log("stop: done audioStop")
+        log("stop: begin netStop"); net.stop(); log("stop: done netStop")
+        log("stop: begin dnsStop"); dns.stop(); log("stop: done dnsStop")
+        log("stop: begin eventsStop"); events.stop(); log("stop: done eventsStop")
+        log("stop: begin logdStop"); logd.stop(); log("stop: done logdStop")
+        log("stop: begin lightsStop"); lights.stop(); log("stop: done lightsStop")
+        log("stop: begin sensorsStop"); sensors.stop(); log("stop: done sensorsStop")
+        log("stop: begin micStop"); mic.stop(); log("stop: done micStop")
+        log("stop: begin cameraStop"); camera.stop(); log("stop: done cameraStop")
+        log("stop: begin GlHostStop"); GlHost.stop(); log("stop: done GlHostStop")
+        extraStubs.forEachIndexed { i, s -> log("stop: begin extraStub[$i]Stop"); s.stop(); log("stop: done extraStub[$i]Stop") }; extraStubs.clear()
+        log("stop: begin lmkStop"); lmk?.stop(); lmk = null; log("stop: done lmkStop")
+        log("stop: begin KeeperRelease"); Keeper.release(ctx); log("stop: done KeeperRelease")
+        log("stop: begin setStateStopped"); setState(State.STOPPED); log("stop: done setStateStopped")
     }
 
     private fun killAll() {
