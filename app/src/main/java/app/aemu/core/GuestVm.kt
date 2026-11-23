@@ -96,6 +96,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     /** ADB over the LAN, switched on from the VM menu */
     val adb = AdbServer(this)
     val input = InputService(paths, ::log)
+    /** guest vibration requests over /dev/aemu_vibrator, played on the phone's motor (AEmulator Plus;
+     *  served on the legacy engines only — 64-bit guests vibrate through [sensors]) */
+    private val vibration = VibrationBridge(ctx, paths, { settings.vibration }, ::log)
     // 2.x пишет в /dev/eac через AudioHardwareGeneric на 44,1 кГц, HAL 4.x движка — на 48 кГц
     val audio = AudioOut(paths, ::log, if (img.api < 14) 44100 else AudioOut.RATE,
         if (TreeFixer.isMtkAudio(paths.root)) "dev/aemu_pcm" else "dev/eac")
@@ -560,6 +563,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         input.mtMode = s.mtMode
         input.wide = engine == Engine.N64
         input.serve()
+        if (engine != Engine.N64) vibration.serve()   // 64-bit guests get vibration through Sensors
         frames.serve()
         if (s.radio) ril.serve() else log("radio: emulation disabled in settings")
         vold.serve()
@@ -1349,6 +1353,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         log("stop: begin sensorsStop"); sensors.stop(); log("stop: done sensorsStop")
         log("stop: begin micStop"); mic.stop(); log("stop: done micStop")
         log("stop: begin cameraStop"); camera.stop(); log("stop: done cameraStop")
+        log("stop: begin vibrationStop"); vibration.stop(); log("stop: done vibrationStop")
         log("stop: begin batteryStop"); battery.stop(); log("stop: done batteryStop")
         log("stop: begin GlHostStop"); GlHost.stop(); log("stop: done GlHostStop")
         extraStubs.forEachIndexed { i, s -> log("stop: begin extraStub[$i]Stop"); s.stop(); log("stop: done extraStub[$i]Stop") }; extraStubs.clear()

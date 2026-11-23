@@ -63,6 +63,8 @@ data class VmSettings(
     val basebandOverride: String = "",
     /** the guest's battery follows the phone's real level and charging state (AEmulator Plus) */
     val hostBattery: Boolean = true,
+    /** the guest may vibrate the phone through the vibrator bridge (AEmulator Plus; legacy engines) */
+    val vibration: Boolean = true,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -75,6 +77,7 @@ data class VmSettings(
         .put("operatorName", operatorName).put("operatorNumeric", operatorNumeric)
         .put("basebandOverride", basebandOverride)
         .put("hostBattery", hostBattery)
+        .put("vibration", vibration)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -131,6 +134,7 @@ data class VmSettings(
                 operatorNumeric = o.optString("operatorNumeric", ""),
                 basebandOverride = o.optString("basebandOverride", ""),
                 hostBattery = o.optBoolean("hostBattery", true),
+                vibration = o.optBoolean("vibration", true),
             )
         }
     }
