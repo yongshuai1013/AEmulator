@@ -153,6 +153,9 @@
     <string name="vs_wifi_mirror">Mirror the phone\'s Wi-Fi</string>
     <string name="vs_wifi_mirror_sub">The guest shows the network the phone is connected to — its real name, address, signal and nearby networks — instead of the name above. Needs the location permission; without it the name above is used</string>
     <string name="vs_wifi_mirror_noperm">Location permission not granted: the guest will show the name above, not the phone\'s network</string>
+    <string name="vs_bluetooth">Bluetooth</string>
+    <string name="vs_bluetooth_sub">The guest uses the phone\'s own Bluetooth: scan, pairing, RFCOMM and BLE GATT through the host adapter. Android 4.4 guests; the phone\'s Bluetooth must be on and the guest can only follow it. Applies at the next boot.</string>
+    <string name="vs_bluetooth_noperm">Bluetooth permission not granted: the bridge stays off and the guest keeps Bluetooth off</string>
     <string name="vs_advanced">Advanced</string>
     <string name="vs_qemu_args">Extra qemu options</string>
     <string name="vs_qemu_args_sub">Example: -d unimp DHD_TBFLUSH=2 (NAME=value becomes an environment variable)</string>

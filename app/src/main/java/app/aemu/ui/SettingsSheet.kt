@@ -51,6 +51,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import app.aemu.core.BluetoothPermissions
 import app.aemu.core.CarrierPresets
 import app.aemu.core.CpuInfo
 import app.aemu.core.Engine
@@ -173,6 +174,7 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
                 Toggle(stringResource(R.string.vs_wifi), stringResource(R.string.vs_wifi_sub), s.wifi) { s = s.copy(wifi = it) }
                 if (s.wifi) WifiFields(s) { s = it }
             }
+            if (img.api in 9..25) BluetoothRow(s) { s = it }
 
             Spacer(Modifier.height(8.dp))
             Text(stringResource(R.string.vs_advanced), style = MaterialTheme.typography.titleMedium)
@@ -429,6 +431,23 @@ private fun WifiFields(s: VmSettings, set: (VmSettings) -> Unit) {
     }
     if (s.wifiMirrorHost && !granted) {
         Text(stringResource(R.string.vs_wifi_mirror_noperm), style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 4.dp))
+    }
+}
+
+/** Host Bluetooth bridge (AEmulator-Plus #18): the toggle plus the runtime permissions the bridge needs. */
+@Composable
+private fun BluetoothRow(s: VmSettings, set: (VmSettings) -> Unit) {
+    val ctx = LocalContext.current
+    var asked by remember { mutableStateOf(0) }
+    val missing = remember(asked) { BluetoothPermissions.missing(ctx) }
+    val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { asked++ }
+    Toggle(stringResource(R.string.vs_bluetooth), stringResource(R.string.vs_bluetooth_sub), s.bluetooth) { on ->
+        set(s.copy(bluetooth = on))
+        if (on) BluetoothPermissions.missing(ctx).takeIf { it.isNotEmpty() }?.let { ask.launch(it.toTypedArray()) }
+    }
+    if (s.bluetooth && missing.isNotEmpty()) {
+        Text(stringResource(R.string.vs_bluetooth_noperm), style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 4.dp))
     }
 }
