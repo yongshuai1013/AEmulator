@@ -83,6 +83,22 @@ data class VmSettings(
     val simNumber: String = "",
     /** the SIM's serial (EF_ICCID); blank = derived from the operator code and the IMEI, as before (AEmulator Plus) */
     val simIccid: String = "",
+    /** Emulated Wi-Fi: the guest sees a connected Wi-Fi network [wifiSsid] that carries the host's internet; applies at the next full VM boot (AEmulator Plus) */
+    val wifi: Boolean = false,
+    /** name of the emulated Wi-Fi network */
+    val wifiSsid: String = WifiEmu.DEFAULT_SSID,
+    /** passphrase of the emulated network; blank = an open network */
+    val wifiPassword: String = "",
+    /** Bars the emulated Wi-Fi shows, 1..4 (see [WifiEmu.rssiFor]) (AEmulator Plus) */
+    val wifiSignal: Int = WifiEmu.MAX_BARS,
+    /** the emulated Wi-Fi also shows a few invented neighbouring networks (AEmulator Plus) */
+    val wifiNeighbors: Boolean = true,
+    /**
+     * the emulated Wi-Fi mirrors the phone's own connection (its real name, address, signal and scan)
+     * instead of the name above, when the phone is connected and the permission is there; otherwise the
+     * name above is used. This fork's addition; Plus has no mirror.
+     */
+    val wifiMirrorHost: Boolean = true,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -103,6 +119,9 @@ data class VmSettings(
         .put("simPresent", simPresent)
         .put("simNumber", simNumber)
         .put("simIccid", simIccid)
+        .put("wifi", wifi).put("wifiSsid", wifiSsid).put("wifiPassword", wifiPassword)
+        .put("wifiSignal", wifiSignal).put("wifiNeighbors", wifiNeighbors)
+        .put("wifiMirrorHost", wifiMirrorHost)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -184,6 +203,12 @@ data class VmSettings(
                 simPresent = o.optBoolean("simPresent", true),
                 simNumber = cleanSimNumber(o.optString("simNumber", "")),
                 simIccid = cleanSimIccid(o.optString("simIccid", "")),
+                wifi = o.optBoolean("wifi", d.wifi),
+                wifiSsid = WifiEmu.cleanSsid(o.optString("wifiSsid", d.wifiSsid)).ifEmpty { WifiEmu.DEFAULT_SSID },
+                wifiPassword = WifiEmu.cleanPassword(o.optString("wifiPassword", "")),
+                wifiSignal = o.optInt("wifiSignal", d.wifiSignal).coerceIn(1, WifiEmu.MAX_BARS),
+                wifiNeighbors = o.optBoolean("wifiNeighbors", d.wifiNeighbors),
+                wifiMirrorHost = o.optBoolean("wifiMirrorHost", d.wifiMirrorHost),
             )
         }
     }
