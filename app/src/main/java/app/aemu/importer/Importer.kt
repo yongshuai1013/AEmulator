@@ -8,6 +8,7 @@ import app.aemu.core.ImageStore
 import app.aemu.core.TreeFixer
 import app.aemu.core.VmPaths
 import app.aemu.core.RecoveryImage
+import app.aemu.importer.tools.SquashFs
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.archivers.sevenz.SevenZFile
@@ -125,6 +126,9 @@ class Importer(
             SinImage.probe(h) || SinImage.probeOld(h) && name.endsWith(".sin", true) -> importSin(streamOf(src), name.substringAfterLast('/'))
             // one partition of a raw NAND dump: the name (mtd<N>.img) says nothing, the content decides (AEmulator-Plus)
             NandDump.isMtdName(name.substringAfterLast('/')) -> importMtdDump(src, name)
+            // ISO 9660 CD image (Android-x86 live CD and its descendants): ramdisk.img + system.sfs / system.img inside.
+            // Checked before the disk probe: an isohybrid image may carry a partition table of its own. (AEmulator-Plus)
+            Iso9660.probe(src) -> importIso(src, name, depth)
             // a whole-disk image (GPT or MBR partition table), e.g. an eMMC/SD dump (AEmulator-Plus)
             isDiskImage(src) -> importDiskImage(src, name)
             SparseSource.probe(src) || Ext4Reader.probe(src) || SuperImage.probe(src) || ErofsReader.probe(src) || UbiFsReader.probe(src) -> importImage(src, "system")
@@ -591,6 +595,83 @@ class Importer(
         val head = ByteBuffer.allocate(8200)
         src.read(0, head)
         if (!GptDisk.probe(head.array()) && MbrDisk.probe(head.array())) importMbrDisk(src, name) else importGptDisk(src, name)
+    }
+
+    private val MAX_RAMDISK = 64L * 1024 * 1024
+
+    /**
+     * ISO 9660 image of Android-x86 (live CD / installer, also Bliss OS, PrimeOS ...). The ISO is only a container:
+     *  - `ramdisk.img` is the Android root file system (gzip'ed cpio with init, init*.rc, sbin/ ...): it becomes the
+     *    VM's ramdisk, like the ramdisk of a boot.img;
+     *  - `system.sfs` is a SquashFS that holds one file, `system.img` (an ext4 image): that image is cut out of it
+     *    and imported as the system partition. A plain `system.img` in the ISO is imported directly;
+     *  - `kernel` (a bzImage the guest never runs: the translator runs the firmware's programs), `initrd.img` (the live
+     *    boot script) and `install.img` (the installer) are not needed.
+     * Files of a folder (an `android-x.y/` directory on the CD) are found too; the one nearest to the root wins.
+     * (AEmulator-Plus)
+     */
+    private fun importIso(src: RandomSource, name: String, depth: Int) {
+        val iso = Iso9660(src)
+        val files = iso.entries(checkCancelled = { if (cancelled) throw IOException("cancelled") }).filter { !it.isDir }
+        fun find(vararg names: String) = files.filter { f -> names.any { f.name.equals(it, true) } }
+            .minByOrNull { it.path.count { c -> c == '/' } }
+        val sfs = find("system.sfs")
+        val plain = find("system.img")
+        if (sfs == null && plain == null) {
+            throw IOException("no Android system found in the ISO image (expected system.sfs or system.img)")
+        }
+        log("iso: ${files.size} files; system from ${(sfs ?: plain)!!.path}")
+        // the root file system first: it is small, and tells at once if the ISO is not an Android one after all
+        find("ramdisk.img")?.takeIf { ramdisk == null }?.let { rd ->
+            if (rd.size > MAX_RAMDISK) log("iso: ${rd.path} is too large for a ramdisk, skipped")
+            else {
+                val list = runCatching { BootImage.decompress(readAllFrom(iso.open(rd)))?.let { BootImage.cpio(it) } }.getOrNull()
+                if (!list.isNullOrEmpty() && list.any { it.name == "init.rc" }) { ramdisk = list; log("boot: ramdisk ${rd.path}, ${list.size} files") }
+                else log("iso: ${rd.path} is not a ramdisk with init.rc, skipped")
+            }
+        }
+        if (sfs == null) {
+            val s = iso.open(plain!!)
+            onProgress("Reading image system (ISO 9660)", -1f)
+            importImage(if (SparseSource.probe(s)) SparseSource(listOf(s)) else s, "system")
+            return
+        }
+        // SquashFS needs a file. It is deleted as soon as system.img is out of it: both at once would double the disk peak.
+        onProgress("Reading image system (SquashFS)", -1f)
+        val sfsFile = spill(streamOf(iso.open(sfs)), "system.sfs")
+        var imgFile: File? = null
+        try {
+            var image: File? = null
+            SquashFs.walkSquashFs(sfsFile, { log(it) }, object : SquashFs.SquashVisitor {
+                override fun dir(path: String, mode: Int) {}
+                override fun link(path: String, target: String) {}
+                override fun file(path: String, mode: Int, size: Long): java.io.OutputStream? {
+                    if (cancelled) throw IOException("cancelled")
+                    if (image != null || !path.substringAfterLast('/').equals("system.img", true)) return null
+                    if (tmp.usableSpace < size + 64L * 1024 * 1024)
+                        throw IOException("Not enough space to unpack firmware")
+                    return File(tmp, "${System.nanoTime()}-system.img").also { image = it }.outputStream().buffered(1 shl 20)
+                }
+                override fun fileEnd(path: String) {}
+            })
+            val img = image
+            if (img == null) {
+                // no system.img inside: the SquashFS is the /system tree itself
+                log("iso: system.sfs holds no system.img, read as a file tree")
+                FileChannel.open(sfsFile.toPath(), StandardOpenOption.READ).use { c -> importImage(ChannelSource(c), "system") }
+                return
+            }
+            imgFile = img
+            sfsFile.delete()
+            log("iso: system.img, ${img.length() shr 20} MB, from system.sfs")
+            FileChannel.open(img.toPath(), StandardOpenOption.READ).use { c ->
+                val s = ChannelSource(c)
+                importImage(if (SparseSource.probe(s)) SparseSource(listOf(s)) else s, "system")
+            }
+        } finally {
+            sfsFile.delete()
+            imgFile?.delete()
+        }
     }
 
     /** A full eMMC/UFS dump with a GUID partition table: every partition the importer consumes is cut out and handed to the usual pipeline. */
