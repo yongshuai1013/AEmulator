@@ -20,3 +20,9 @@ EXPORT void HAL_openCameraHardware(void **result, int id) {
     (void)id;
     *result = 0;
 }
+
+/* Android 1.6/2.x: libcameraservice of that era links this one factory instead of the 2.3 trio
+ * above — same answer, in the era's shape (the caller passes the place for the returned
+ * sp<CameraHardwareInterface>; a Froyo build also passes a camera id in the next register,
+ * which is ignored). */
+EXPORT void openCameraHardware(void **result) { *result = 0; }
