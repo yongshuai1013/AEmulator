@@ -49,6 +49,19 @@ object AppPrefs {
     fun dynamicColor(ctx: Context): Boolean = sp(ctx).getBoolean("dynamic", false)
     fun setDynamicColor(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean("dynamic", v).apply()
 
+    /**
+     * The navigation bar style from before VM screen themes (AEmulator-Plus #32), read from host-ui.json like
+     * upstream. This fork never shipped the toggles, so the file is normally absent and both styles are off:
+     * the pre-theme fallback in VmThemes.selected() is then the Original look this app has always had.
+     */
+    data class HostUiOptions(val holoNavbar: Boolean = false, val sunsetNavbar: Boolean = false)
+
+    fun hostUiOptions(ctx: Context): HostUiOptions = runCatching {
+        val file = android.util.AtomicFile(java.io.File(ctx.filesDir, "host-ui.json"))
+        val json = org.json.JSONObject(file.openRead().bufferedReader().use { it.readText() })
+        HostUiOptions(json.optBoolean("holoNavbar", false), json.optBoolean("sunsetNavbar", false))
+    }.getOrDefault(HostUiOptions())
+
     fun autoCheckUpdates(ctx: Context): Boolean = sp(ctx).getBoolean("auto_check_updates", true)
     fun setAutoCheckUpdates(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean("auto_check_updates", v).apply()
 
