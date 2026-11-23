@@ -146,11 +146,17 @@ static int host_dev(const char *n) {
 
 // Guest path → host path. Relative paths stay as they are (the working directory is already inside the root).
 // Returns the path to use, or 0 with *err set.
-static const char *xl(const char *p, char *buf, int *err) {
+// Added for AEmulator Plus (2026-11-21): mounts and device nodes, see vmount.h. rw = 0 translates without the mount table.
+static int g_vm;                                            // <root>/dev/.aemu-vmount exists: this VM has real mounts
+static void vm_rewrite(char *n, u64 cap);
+static const char *xl_x(const char *p, char *buf, int *err, int rw);
+static const char *xl(const char *p, char *buf, int *err) { return xl_x(p, buf, err, 1); }
+static const char *xl_x(const char *p, char *buf, int *err, int rw) {
     if (!p) return p;
     if (p[0] != '/') return p;
     char *n = buf + g_rootlen;              // normalised straight into its place after the root
     if ((*err = norm(p, n, PATH_MAX - g_rootlen))) return 0;
+    if (rw && g_vm) vm_rewrite(n, PATH_MAX - g_rootlen);       // what is mounted at this path (vmount.h)
     if ((pre(n, "/proc") && (n[5] == '/' || !n[5])) || (pre(n, "/sys") && (n[4] == '/' || !n[4]))) {
         // the image's own files win (fake sysfs, /proc/mounts); the rest is the phone's. No SELinux for the guest,
         // and none of the phone's suspend controls (reading its wakeup_count blocks the guest's power manager).
@@ -800,7 +806,9 @@ static long trap(long nr, long *a, void *uc) {
 
 #define PB(i) ((*pbp ? *pbp : (*pbp = pb_get())) + (i) * PATH_MAX)
 
-static long trap2(long nr, long *a, void *uc, char **pbp) {
+#include "../vmount.h"
+
+static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     int err = 0;
     switch (nr) {
     case 233 /* madvise */: {
@@ -979,7 +987,8 @@ static long trap2(long nr, long *a, void *uc, char **pbp) {
     case NR_statx: {
         char *b1 = PB(0);
         NEEDX(1);
-        return S5(nr, a[0], h1, a[2], a[3], a[4]);
+        // Added for AEmulator Plus (2026-11-21): the emulated root keeps the owner bits (vmount.h, vm_mode_fix)
+        return S5(nr, a[0], h1, vm_mode_fix(nr, a[0], h1, a[2]), a[3], a[4]);
     }
     case NR_fchown: own_put(7 /*fsetxattr*/, a[0], a[1], a[2]); return 0;
     case NR_fchownat: {
@@ -992,6 +1001,10 @@ static long trap2(long nr, long *a, void *uc, char **pbp) {
     }
     case NR_readlinkat: {
         if (P(1)) {
+            if (g_vm) {      // Added for AEmulator Plus (2026-11-21): /proc/<pid>/exe of another guest process, see vmount.h
+                char *ex = PB(1);
+                if (vm_proc_exe(P(1), ex)) { u64 n = slen(ex); if (n > (u64)a[3]) n = (u64)a[3]; memcpy((void *)a[2], ex, n); return (long)n; }
+            }
             if (seq(P(1), "/proc/self/exe") && g_exe[0]) {
                 u64 n = slen(g_exe); if (n > (u64)a[3]) n = (u64)a[3];
                 memcpy((void *)a[2], g_exe, n); return (long)n;
@@ -1172,7 +1185,7 @@ static long trap2(long nr, long *a, void *uc, char **pbp) {
             }
         }
         return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
-    case NR_mount: case NR_umount2: case NR_chroot: case NR_capset: case NR_setgroups: case NR_unshare: return 0;
+    case NR_mount: case NR_umount2: case NR_chroot: case NR_capset: case NR_setgroups: case NR_unshare: case 268 /* setns */: return 0;
     case NR_prctl: return 0;                    // only PR_CAPBSET_DROP gets here
     case 107: {                                 // timer_create: the *_ALARM clocks need CAP_WAKE_ALARM (the Bluetooth
         long clk = a[0] == 8 ? 0 : a[0] == 9 ? 7 : a[0];   // stack of 10 stops on a refusal); the plain ones tick the same
@@ -1354,6 +1367,7 @@ static long trap2(long nr, long *a, void *uc, char **pbp) {
     }
     case NR_getsockopt: {
         if (is_nl_fd((int)a[0])) return 0;
+        if (g_vm && a[1] == 1 && a[2] == 31 /* SO_PEERSEC */) return vm_peersec(a[0], (char *)a[3], (u32 *)a[4]);   // Added for AEmulator Plus (2026-11-21): Zygisk, see vmount.h
         long r = S5(nr, a[0], a[1], a[2], a[3], a[4]);
         // SO_PEERCRED: every guest process is the host app's uid. The peer left the ids the guest gave it in
         // <root>/dev/.aemu-ids/<pid> (zygote of 13: "Only system UID is allowed to connect to Zygote").
@@ -1619,6 +1633,9 @@ static void install_filter(void) {
     f[n++] = JEQ(NR_renameat2, L_TRAP, 0);
     f[n++] = JEQ(NR_statx, L_TRAP, 0);
     f[n++] = JEQ(NR_uname, L_TRAP, 0);
+    if (g_vm) f[n++] = JEQ(268 /* setns */, L_TRAP, 0);
+    // Added for AEmulator Plus (2026-11-21): directory reads, to show a device node (a whiteout) as one (vmount.h)
+    if (g_vm) f[n++] = JEQ(61 /* getdents64 */, L_TRAP, 0);
     f[n++] = JEQ(280 /* bpf */, L_TRAP, 0);
     f[n++] = JEQ(261 /* prlimit64 */, L_TRAP, 0);
     f[n++] = JEQ(164 /* setrlimit */, L_TRAP, 0);
@@ -1730,6 +1747,7 @@ void aemu_main(u64 *sp) {
     const char *r = env_get(envp, "AEMU64_ROOT");
     if (!r || !r[0] || slen(r) >= sizeof g_root) die("AEMU64_ROOT is not set", "");
     memcpy(g_root, r, slen(r) + 1); g_rootlen = slen(g_root);
+    vm_init();                                                   // (vmount.h)
     if ((r = env_get(envp, "AEMU64_PROPS")) && slen(r) < sizeof g_props) memcpy(g_props, r, slen(r) + 1);
     if ((r = env_get(envp, "AEMU64_UTS_RELEASE")) && slen(r) < sizeof g_uts_rel) memcpy(g_uts_rel, r, slen(r) + 1);
     if ((r = env_get(envp, "AEMU64_UTS_VERSION")) && slen(r) < sizeof g_uts_ver) memcpy(g_uts_ver, r, slen(r) + 1);
@@ -1800,6 +1818,7 @@ void aemu_main(u64 *sp) {
                     seq(g_exe, "/system/bin/keystore2");    // (it checks every call against the policy the same way)
     }
 
+    vm_exe_put();    // Added for AEmulator Plus (2026-11-21): /proc/<pid>/exe of this process for the others (vmount.h)
     // sockets init would have made for the service: AEMU64_SOCK_<name>=<host path>,<octal mode>[,seqpacket|dgram]
     static char sockenv[12][80]; int nsock = 0;
     for (char **e = envp; *e; e++) {
