@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import app.aemu.core.GuestImage
 import app.aemu.core.ImageStore
+import app.aemu.core.VmArchiveStorage
 import app.aemu.core.VmSettings
 import app.aemu.importer.Importer
 import kotlinx.coroutines.Dispatchers
@@ -57,12 +58,19 @@ class LibraryModel(app: Application) : AndroidViewModel(app) {
                 log = { s -> log.add(s); _import.value = _import.value.copy(log = log.takeLast(50)) })
             importer = imp
             try {
-                // умолчания из настроек приложения поверх того, что подобрал анализатор (экран, частоты)
-                val raw = imp.import(uri, name)
-                val d = app.aemu.AppPrefs.defaults(ctx)
-                val img = raw.copy(settings = raw.settings.copy(gpu = d.gpu, jit = d.jit, netProxy = d.netProxy,
-                    showNavBar = d.showNavBar, keepScreenOn = d.keepScreenOn, showLed = d.showLed))
-                if (img != raw) ImageStore.save(ctx, img)
+                // a .aessvm archive restores a whole machine as-is (its own settings, no app defaults on top);
+                // anything else is firmware for the importer
+                val img = if (name.endsWith(".aessvm", ignoreCase = true)) {
+                    VmArchiveStorage.restore(ctx, uri) { entry -> _import.value = _import.value.copy(step = entry) }
+                } else {
+                    // умолчания из настроек приложения поверх того, что подобрал анализатор (экран, частоты)
+                    val raw = imp.import(uri, name)
+                    val d = app.aemu.AppPrefs.defaults(ctx)
+                    val adjusted = raw.copy(settings = raw.settings.copy(gpu = d.gpu, jit = d.jit, netProxy = d.netProxy,
+                        showNavBar = d.showNavBar, keepScreenOn = d.keepScreenOn, showLed = d.showLed))
+                    if (adjusted != raw) ImageStore.save(ctx, adjusted)
+                    adjusted
+                }
                 _import.value = _import.value.copy(active = false, done = img, step = "Done", progress = 1f)
             } catch (t: Throwable) {
                 _import.value = _import.value.copy(active = false, error = t.message ?: t.toString())
