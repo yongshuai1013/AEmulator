@@ -131,6 +131,8 @@
     <string name="vs_operator_reset">Reset to default</string>
     <string name="vs_sim_present">SIM card inserted</string>
     <string name="vs_sim_present_sub">Off: the slot is empty — no SIM status, no registration, emergency calls only. Applies at the next boot</string>
+    <string name="vs_sim_number">Phone number (SIM)</string>
+    <string name="vs_sim_number_sub">The number stored on the SIM, shown in About phone status. Blank: the card carries no number. Applies at the next boot</string>
     <string name="vs_network">Reported network</string>
     <string name="vs_network_sub">What the status bar shows: 2G to LTE. Applies at the next boot</string>
     <string name="vs_advanced">Advanced</string>

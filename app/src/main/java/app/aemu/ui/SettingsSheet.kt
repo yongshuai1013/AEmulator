@@ -146,6 +146,12 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
                 }
                 OperatorSection(s) { s = it }
                 Toggle(stringResource(R.string.vs_sim_present), stringResource(R.string.vs_sim_present_sub), s.simPresent) { s = s.copy(simPresent = it) }
+                if (s.simPresent) {
+                    OutlinedTextField(value = s.simNumber, onValueChange = { v -> s = s.copy(simNumber = VmSettings.cleanSimNumber(v)) },
+                        label = { Text(stringResource(R.string.vs_sim_number)) }, supportingText = { Text(stringResource(R.string.vs_sim_number_sub)) },
+                        singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+                }
                 NetworkTypePicker(s.networkType, img.api) { s = s.copy(networkType = it) }
             }
 

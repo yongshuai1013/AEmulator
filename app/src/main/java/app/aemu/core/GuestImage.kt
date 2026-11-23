@@ -79,6 +79,8 @@ data class VmSettings(
     val storageType: String = "",
     /** SIM card inserted in the fake modem; off = empty slot, the guest shows "No SIM card" (AEmulator Plus) */
     val simPresent: Boolean = true,
+    /** the SIM's own phone number (EF_MSISDN); blank = the card carries no number (AEmulator Plus) */
+    val simNumber: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -97,6 +99,7 @@ data class VmSettings(
         .put("storageGb", storageGb)
         .put("storageType", storageType)
         .put("simPresent", simPresent)
+        .put("simNumber", simNumber)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -119,6 +122,12 @@ data class VmSettings(
         const val HARDWARE_MAX = 32
         fun cleanHardware(v: String): String =
             v.filter { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '_' || it == '-' || it == '.' }.take(HARDWARE_MAX)
+
+        /** Phone number as stored on the SIM: digits with an optional leading +, at most 15 digits (AEmulator Plus). */
+        fun cleanSimNumber(v: String): String {
+            val digits = v.filter(Char::isDigit).take(15)
+            return if (v.trimStart().startsWith("+") && digits.isNotEmpty()) "+$digits" else digits
+        }
 
         /** Random Luhn-valid IMEI with a test TAC prefix. */
         fun randomImei(): String {
@@ -167,6 +176,7 @@ data class VmSettings(
                 storageGb = StorageSpoof.sanitizeGb(o.optInt("storageGb", 0)),
                 storageType = StorageType.parse(o.optString("storageType", ""))?.id ?: "",
                 simPresent = o.optBoolean("simPresent", true),
+                simNumber = cleanSimNumber(o.optString("simNumber", "")),
             )
         }
     }

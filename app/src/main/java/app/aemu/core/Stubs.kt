@@ -35,6 +35,8 @@ class RilStub(
     private val operatorNumericSetting: String = "",
     /** SIM card in the slot; false = empty slot, the guest shows "No SIM card" (AEmulator Plus) */
     private val simPresentSetting: Boolean = true,
+    /** the SIM's own phone number from the image settings; blank = the card carries no number (AEmulator Plus) */
+    private val simNumberSetting: String = "",
     /** radio technology from the image settings (a NetworkType value); UMTS = what this modem always reported */
     networkTypeSetting: Int = NetworkType.UMTS,
 ) {
@@ -244,19 +246,48 @@ class RilStub(
     }
 
     /**
-     * SIM file access. Only EF_ICCID is answered: from 5.1 SubscriptionController creates the SIM's subscription
-     * from its ICCID, and without one the system shows "No SIM card" (no SMS, no mobile network). Everything else
-     * stays "file not found" (no contacts, SMS or settings stored on the SIM).
+     * SIM file access. EF_ICCID is answered: from 5.1 SubscriptionController creates the SIM's subscription
+     * from its ICCID, and without one the system shows "No SIM card" (no SMS, no mobile network). EF_MSISDN
+     * is answered while the image settings carry a phone number. Everything else stays "file not found"
+     * (no contacts, SMS or settings stored on the SIM).
      */
     private fun simIo(b: ByteBuffer): ByteArray {
         val notFound = le(0x6A) + le(0x82) + str(null)
         val command = runCatching { b.getInt() }.getOrDefault(0)
         val file = runCatching { b.getInt() }.getOrDefault(0)
+        if (file == EF_MSISDN) return simMsisdn(b, command, notFound)
         if (file != EF_ICCID) return notFound
         return when (command) {
             SIM_GET_RESPONSE -> le(0x90) + le(0) + str("0000000a2fe204000fa0aa01020000")   // transparent EF, 10 bytes
             SIM_READ_BINARY -> le(0x90) + le(0) + str(iccid())
             else -> notFound
+        }
+    }
+
+    /**
+     * EF_MSISDN, the SIM's own phone number (AEmulator Plus): a single record, read with READ_RECORD
+     * after GET_RESPONSE. The parcel continues with the path string and p1/p2/p3 after the file id.
+     * Without a number in the settings the file stays "not found", as before.
+     */
+    private fun simMsisdn(b: ByteBuffer, command: Int, notFound: ByteArray): ByteArray {
+        if (simNumberSetting.isBlank()) return notFound
+        val bad = le(0x6A) + le(0x86) + str(null)
+        val (p1, p2, p3) = runCatching {
+            val pathLen = b.getInt()
+            if (pathLen >= 0) {
+                val byteCount = (pathLen + 1) * 2
+                b.position(b.position() + (byteCount + 3) / 4 * 4)
+            }
+            Triple(b.getInt(), b.getInt(), b.getInt())
+        }.getOrDefault(Triple(0, 0, 0))
+        val record = SimFiles.efMsisdn(simNumberSetting)
+        return when (command) {
+            // the 15-byte 2G header of a record file: size, file id, record type, record length twice
+            SIM_GET_RESPONSE -> le(0x90) + le(0) + str("0000%04X%04X04000000000102%02X%02X"
+                .format(record.size, EF_MSISDN, 1, record.size))
+            SIM_READ_RECORD -> if (p1 == 1 && p2 == 4 && p3 == record.size)
+                le(0x90) + le(0) + str(record.joinToString("") { "%02X".format(it.toInt() and 0xff) }) else bad
+            else -> bad
         }
     }
 
@@ -375,7 +406,9 @@ class RilStub(
         private const val UNSOL_CALL_RING = 1018
         private const val UNSOL_RESPONSE_NEW_SMS = 1003
         private const val EF_ICCID = 0x2FE2
+        private const val EF_MSISDN = 0x6F40
         private const val SIM_READ_BINARY = 176
+        private const val SIM_READ_RECORD = 178
         private const val SIM_GET_RESPONSE = 192
         private const val CALL_ACTIVE = 0
         private const val CALL_INCOMING = 4
