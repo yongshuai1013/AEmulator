@@ -1,3 +1,5 @@
+# built by CI from app/guest-wifi sources (see the workflow), never committed
+/app/src/main/assets/engines/kk/aemu-wifi.jar
 *.apk
 *_apktool/
 *_jadx/
