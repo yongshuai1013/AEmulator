@@ -256,13 +256,18 @@ class Importer(
         try {
             com.github.junrar.Archive(whole).use { a ->
                 val nested = ArrayList<Pair<File, String>>()
+                // the same buried loose tree as in a zip (a fastboot repack): the headers are all
+                // known up front, so the prefix comes off exactly like there
+                val treePrefix = looseTreePrefix(a.fileHeaders.filter { !it.isDirectory }.map { it.fileName.replace('\\', '/') })
+                if (treePrefix.isNotEmpty()) log("loose system tree at \"$treePrefix\"")
                 for (fh in a.fileHeaders) {
                     if (cancelled) throw IOException("cancelled")
                     if (fh.isDirectory) continue
                     val n = fh.fileName.replace('\\', '/')
+                    val tn = n.removePrefix(treePrefix)
                     val base = n.substringAfterLast('/')
                     when {
-                        n.startsWith("system/") -> { a.getInputStream(fh).use { writeFile(n, it, null) }; gotSystem = true }
+                        (treePrefix.isEmpty() || n.startsWith(treePrefix)) && tn.startsWith("system/") -> { a.getInputStream(fh).use { writeFile(tn, it, null) }; gotSystem = true }
                         base.equals("boot.img", true) -> a.getInputStream(fh).use { takeBoot(it.readBytes()) }
                         base.equals("recovery.img", true) && fh.fullUnpackSize < 64_000_000 -> a.getInputStream(fh).use { recovery = it.readBytes() }
                         base.matches(SYSTEM_IMAGE) || base.matches(Regex("(?i).*\\.(zip|7z|tar|md5|tgz|gz|xz|pac|ftf|sin)")) && fh.fullUnpackSize > 20_000_000 ->
@@ -324,20 +329,25 @@ class Importer(
         val wrap = entries.firstOrNull { it.name.endsWith("META-INF/com/google/android/updater-script") }
             ?.name?.substringBefore("META-INF/")?.takeIf { it.isNotEmpty() && it.count { c -> c == '/' } == 1 } ?: ""
         if (wrap.isNotEmpty()) log("archive with wrapper folder \"${wrap.trimEnd('/')}\"")
-        val names = entries.map { it.name.removePrefix(wrap) }.toSet()
+        // a loose system tree may sit deeper than the root (a fastboot repack buries it under the
+        // package folder); its prefix comes off the names before the claim below, like the wrapper
+        val stripped = entries.map { it.name.replace('\\', '/').removePrefix(wrap) }
+        val treePrefix = looseTreePrefix(stripped)
+        if (treePrefix.isNotEmpty()) log("loose system tree at \"$treePrefix\"")
         val datBr = entries.firstOrNull { it.name.matches(Regex("(.*/)?system\\.new\\.dat(\\.br)?")) }
         val sparseChunks = entries.filter { it.name.matches(Regex("(.*/)?system\\.img_sparsechunk\\.\\d+")) }.sortedBy { it.name.substringAfterLast('.').toInt() }
         for (e in entries) {
             if (cancelled) throw IOException("cancelled")
             val n = e.name.replace('\\', '/').removePrefix(wrap)
+            val tn = n.removePrefix(treePrefix)
             val base = n.substringAfterLast('/')
             noteRadioFile(base)
             noteBootloaderFile(base)
             when {
                 e.isDirectory -> {}
                 n.contains("__MACOSX/") || base.startsWith("._") -> {}
-                n.startsWith("system/") -> {
-                    zip.getInputStream(e).use { writeFile(n, it, e.unixMode.takeIf { m -> m != 0 }) }
+                (treePrefix.isEmpty() || n.startsWith(treePrefix)) && tn.startsWith("system/") -> {
+                    zip.getInputStream(e).use { writeFile(tn, it, e.unixMode.takeIf { m -> m != 0 }) }
                     gotSystem = true
                 }
                 base.equals("boot.img", true) -> zip.getInputStream(e).use { takeBoot(it.readBytes()) }
@@ -430,7 +440,7 @@ class Importer(
             runCatching { importEdl(zip, entries, rawProgramEntries) }
                 .onFailure { if (cancelled) throw it; log("EDL: ${it.message ?: it.javaClass.simpleName}") }
         }
-        if (!names.any { it.startsWith("system/") } && !gotSystem) log("no system found in archive $name")
+        if (!stripped.any { (treePrefix.isEmpty() || it.startsWith(treePrefix)) && it.removePrefix(treePrefix).startsWith("system/") } && !gotSystem) log("no system found in archive $name")
     }
 
     /**
