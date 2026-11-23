@@ -150,6 +150,14 @@ class VmActivity : ComponentActivity() {
     private val grabThread by lazy { android.os.HandlerThread("frame-grab").apply { start() } }
     private var grabScratch: android.graphics.Bitmap? = null
     private lateinit var box: FrameLayout
+    private lateinit var rootFrame: FrameLayout
+    private lateinit var frameView: android.widget.ImageView
+    /** VM screen theme (core/VmTheme.kt): the bar look, the frame and the device skin around the guest */
+    private var vmTheme by mutableStateOf(app.aemu.core.VmThemes.BUILT_IN[0])
+    /** false until the user picks a theme in the app settings: until then the screen keeps its legacy look */
+    private var themeChosen by mutableStateOf(false)
+    private var skinLayout by mutableStateOf<app.aemu.core.DeviceSkin.Layout?>(null)
+    private var skinPic: Pair<Int, Int>? = null
     private var state by mutableStateOf(GuestVm.State.STOPPED)
     /** the guest's notification LED and where the guest screen starts (the LED sits just above it) */
     private var led by mutableStateOf<app.aemu.core.Lights.Led?>(null)
@@ -185,7 +193,9 @@ class VmActivity : ComponentActivity() {
 
         val (gw, gh) = if (vm.engine == Engine.GB) 480 to 800 else s.width to s.height
         val root = FrameLayout(this).apply { setBackgroundColor(0xff000000.toInt()) }
+        rootFrame = root
         box = FrameLayout(this)
+        frameView = android.widget.ImageView(this).apply { visibility = View.GONE }
         surfaceView = SurfaceView(this)
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(h: SurfaceHolder) { vm.surface = h.surface }
@@ -208,6 +218,7 @@ class VmActivity : ComponentActivity() {
         guest.passthrough = useBridge
         box.addView(surfaceView, FrameLayout.LayoutParams(-1, -1))
         box.addView(guest, FrameLayout.LayoutParams(-1, -1))
+        root.addView(frameView, FrameLayout.LayoutParams(-1, -1))
         root.addView(box, FrameLayout.LayoutParams(0, 0))
         val overlay = ComposeView(this).apply { setContent { AemuTheme(forceDark = true) { Overlay() } } }
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
@@ -229,20 +240,57 @@ class VmActivity : ComponentActivity() {
             val aw = r - l
             val ah = b - t - navPx - safeTop - safeBottom
             if (aw <= 0 || ah <= 0) return@addOnLayoutChangeListener
+            // a device skin fills the area instead: the guest sits in the picture's screen, the picture itself is
+            // placed by DeviceSkin.layout; a skin with its own keys hides the bar, so its area keeps the bar's room
+            val pic = skinPic
+            val themeNow = vmTheme
+            if (pic != null && themeNow.isSkin) {
+                val areaH = if (themeNow.skinKeys.isNotEmpty()) b - t - safeTop - safeBottom else ah
+                if (areaH <= 0) return@addOnLayoutChangeListener
+                val lay = app.aemu.core.DeviceSkin.layout(aw, areaH, pic.first, pic.second,
+                    themeNow.skinScreen!!, themeNow.skinKeys, gw, gh)
+                val flp = frameView.layoutParams as FrameLayout.LayoutParams
+                if (flp.width != lay.image.width || flp.height != lay.image.height ||
+                    flp.leftMargin != lay.image.left || flp.topMargin != safeTop + lay.image.top) {
+                    flp.width = lay.image.width; flp.height = lay.image.height
+                    flp.gravity = Gravity.TOP or Gravity.LEFT
+                    flp.leftMargin = lay.image.left; flp.topMargin = safeTop + lay.image.top
+                    v.post { frameView.layoutParams = flp }
+                }
+                val slp = box.layoutParams as FrameLayout.LayoutParams
+                val top = safeTop + lay.guest.top
+                if (guestTopPx != top) guestTopPx = top
+                if (slp.width != lay.guest.width || slp.height != lay.guest.height ||
+                    slp.leftMargin != lay.guest.left || slp.topMargin != top) {
+                    slp.width = lay.guest.width; slp.height = lay.guest.height
+                    slp.gravity = Gravity.TOP or Gravity.LEFT
+                    slp.leftMargin = lay.guest.left; slp.topMargin = top
+                    v.post { box.layoutParams = slp }
+                }
+                // the overlay draws the skin's keys and LED in root coordinates: the area boxes shift by safeTop
+                val shifted = lay.copy(
+                    keys = lay.keys.map { (btn, bx) -> btn to bx.copy(top = bx.top + safeTop) },
+                    led = lay.led?.let { it.first to it.second + safeTop })
+                if (skinLayout != shifted) skinLayout = shifted
+                return@addOnLayoutChangeListener
+            }
+            if (skinLayout != null) skinLayout = null
             val scale = minOf(aw.toFloat() / gw, ah.toFloat() / gh)
             val w = (gw * scale).toInt()
             val h = (gh * scale).toInt()
             val lp = box.layoutParams as FrameLayout.LayoutParams
             val top = safeTop + (ah - h) / 2
             if (guestTopPx != top) guestTopPx = top
-            if (lp.width != w || lp.height != h || lp.topMargin != top) {
+            if (lp.width != w || lp.height != h || lp.topMargin != top || lp.leftMargin != 0) {
                 lp.width = w; lp.height = h
                 lp.gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP
                 lp.topMargin = top
+                lp.leftMargin = 0
                 v.post { box.layoutParams = lp }
             }
         }
 
+        applyVmTheme()
         vm.onFrame = { guest.rings++; guest.poke() }
         state = vm.state
         logLines.addAll(vm.lines().takeLast(3000))
@@ -329,7 +377,47 @@ class VmActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        applyVmTheme()
         if (::vm.isInitialized) vm.sensors.resume(true)
+    }
+
+    /**
+     * Reads the selected VM screen theme (core/VmTheme.kt): the frame colour or picture behind the guest and the
+     * guest's rounded corners are set here, the bar follows [vmTheme] in the overlay, a skin re lays out the guest
+     * in the layout listener. Until the user picks a theme in the app settings nothing here touches the screen:
+     * it keeps exactly the look it always had (the choice lives in its own file, read on resume like upstream).
+     */
+    private fun applyVmTheme() {
+        if (!::box.isInitialized || !::frameView.isInitialized) return
+        val chosen = java.io.File(app.aemu.core.VmThemes.dir(this), "selected").isFile
+        themeChosen = chosen
+        val t = runCatching { app.aemu.core.VmThemes.selected(this) }.getOrDefault(app.aemu.core.VmThemes.BUILT_IN[0])
+        vmTheme = t
+        if (!chosen) { skinPic = null; return }
+        rootFrame.setBackgroundColor(t.frameColor)
+        val bmp = app.aemu.core.VmThemes.imageFile(this, t)?.let { f ->
+            runCatching {
+                // decoded no larger than about twice the screen: a phone photo would otherwise take tens of MB
+                val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                android.graphics.BitmapFactory.decodeFile(f.path, o)
+                val target = resources.displayMetrics.widthPixels.coerceAtLeast(1) * 2
+                var sample = 1
+                while (o.outWidth / (sample * 2) >= target) sample *= 2
+                android.graphics.BitmapFactory.decodeFile(f.path, android.graphics.BitmapFactory.Options().apply { inSampleSize = sample })
+            }.getOrNull()
+        }
+        frameView.setImageBitmap(bmp)
+        frameView.visibility = if (bmp != null) View.VISIBLE else View.GONE
+        frameView.scaleType = if (t.isSkin) android.widget.ImageView.ScaleType.FIT_XY else android.widget.ImageView.ScaleType.CENTER_CROP
+        skinPic = if (t.isSkin && bmp != null) bmp.width to bmp.height else null
+        if (skinPic == null) skinLayout = null
+        val r = t.screenCorner * resources.displayMetrics.density
+        box.outlineProvider = object : android.view.ViewOutlineProvider() {
+            override fun getOutline(v: View, o: android.graphics.Outline) { o.setRoundRect(0, 0, v.width, v.height, r) }
+        }
+        box.clipToOutline = r > 0f
+        box.invalidateOutline()
+        rootFrame.requestLayout()
     }
 
     override fun onPause() {
@@ -689,7 +777,11 @@ class VmActivity : ComponentActivity() {
             val rtl = androidx.compose.ui.platform.LocalLayoutDirection.current == androidx.compose.ui.unit.LayoutDirection.Rtl
             fun clamp(o: Offset) = Offset(if (rtl) o.x.coerceIn(0f, maxX) else o.x.coerceIn(-maxX, 0f), o.y.coerceIn(0f, maxY))
             LaunchedEffect(maxX, maxY) { menuOffset = clamp(menuOffset) }
-            led?.takeIf { it.lit && showLed }?.let { LedIndicator(it, Modifier.align(Alignment.TopCenter)) }
+            led?.takeIf { it.lit && showLed }?.let { l ->
+                val at = if (themeChosen) skinLayout?.led else null
+                if (at != null) LedIndicator(l, Modifier.align(Alignment.TopStart), at)
+                else LedIndicator(l, Modifier.align(Alignment.TopCenter))
+            }
             // карточка загрузки
             AnimatedVisibility(
                 visible = state != GuestVm.State.RUNNING && !showLog && !(drawing && state == GuestVm.State.BOOTING),
@@ -800,39 +892,71 @@ class VmActivity : ComponentActivity() {
                 Dlg.NONE -> {}
             }
 
+            // a device skin with its own hardware keys: the keys are zones on the picture, the bar is hidden
+            val skinKeysShown = themeChosen && vmTheme.isSkin && skinLayout?.keys?.isNotEmpty() == true
+            if (skinKeysShown) {
+                for ((button, area) in skinLayout!!.keys) SkinKeyZone(button, area)
+            }
             // панель кнопок Android
-            if (vm.settings.showNavBar && !showLog && !showTerm) {
-                NavBar(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = if (vm.settings.navSize == 0) 3.dp else 6.dp))
+            if (vm.settings.showNavBar && !showLog && !showTerm && !skinKeysShown) {
+                NavBar(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = if (vm.settings.navSize == 0) 3.dp else 6.dp),
+                    if (themeChosen) vmTheme else null)
             }
         }
     }
 
-    /** The bar of guest buttons: the user's own set, each held down in the guest for as long as it is held here. */
+    /**
+     * The bar of guest buttons: the user's own set, each held down in the guest for as long as it is held here.
+     * With a VM screen [theme] picked, the bar takes its colours, shape and key drawings; with none (null) it is
+     * exactly the bar this app has always drawn.
+     */
     @Composable
-    private fun NavBar(modifier: Modifier) {
+    private fun NavBar(modifier: Modifier, theme: app.aemu.core.VmTheme?) {
         val compact = vm.settings.navSize == 0
         val keys = remember { vm.settings.navKeys.split(',').filter { it in app.aemu.core.VmSettings.NAV_ALL } }
         if (keys.isEmpty()) return
-        Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.92f), modifier = modifier) {
-            Row(Modifier.padding(horizontal = if (compact) 6.dp else 10.dp, vertical = if (compact) 2.dp else 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 4.dp)) {
-                for (k in keys) NavKey(k, if (compact) 36.dp else 48.dp)
+        if (theme == null) {
+            Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.92f), modifier = modifier) {
+                Row(Modifier.padding(horizontal = if (compact) 6.dp else 10.dp, vertical = if (compact) 2.dp else 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 4.dp)) {
+                    for (k in keys) NavKey(k, if (compact) 36.dp else 48.dp, null)
+                }
+            }
+            return
+        }
+        val flat = !theme.roundedBar
+        Surface(shape = if (flat) androidx.compose.ui.graphics.RectangleShape else CircleShape,
+            color = theme.barColor?.let { Color(it) } ?: MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.92f),
+            modifier = if (flat) modifier.fillMaxWidth() else modifier) {
+            Row(Modifier.padding(horizontal = if (compact) 6.dp else 10.dp, vertical = if (compact) 2.dp else 6.dp)
+                    .then(if (flat) Modifier.fillMaxWidth() else Modifier),
+                horizontalArrangement = if (flat) Arrangement.spacedBy(if (compact) 6.dp else 4.dp, Alignment.CenterHorizontally)
+                    else Arrangement.spacedBy(if (compact) 6.dp else 4.dp)) {
+                for (k in keys) NavKey(k, if (compact) 36.dp else 48.dp, theme)
             }
         }
     }
 
     @Composable
-    private fun NavKey(k: String, size: androidx.compose.ui.unit.Dp) {
+    private fun NavKey(k: String, size: androidx.compose.ui.unit.Dp, theme: app.aemu.core.VmTheme?) {
         var pressed by remember { mutableStateOf(false) }
         val bg by androidx.compose.animation.animateColorAsState(
             if (pressed) MaterialTheme.colorScheme.primary.copy(alpha = 0.28f) else Color.Transparent, label = "key")
+        // the theme's press feedback (ui/HoloNavigation.kt of AEmulator-Plus): a radial glow or a filled rounded box
+        val pressMod = when {
+            theme == null -> Modifier.background(bg, CircleShape)
+            !pressed -> Modifier
+            theme.pressGlow -> Modifier.background(androidx.compose.ui.graphics.Brush.radialGradient(
+                listOf(Color(theme.pressColor), Color(theme.pressColor).copy(alpha = Color(theme.pressColor).alpha * 0.28f), Color.Transparent)), CircleShape)
+            else -> Modifier.background(Color(theme.pressColor), androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+        }
         val code = when (k) {
             "back" -> InputService.KEY_BACK; "home" -> InputService.KEY_HOME; "menu" -> InputService.KEY_MENU
             "search" -> InputService.KEY_SEARCH; "volup" -> InputService.KEY_VOLUMEUP; "voldown" -> InputService.KEY_VOLUMEDOWN
             "power" -> InputService.KEY_POWER; else -> 0
         }
         val step = with(androidx.compose.ui.platform.LocalDensity.current) { 18.dp.toPx() }
-        Box(Modifier.size(size).background(bg, CircleShape).pointerInput(k) {
+        Box(Modifier.size(size).then(pressMod).pointerInput(k) {
             awaitEachGesture {
                 val down = awaitFirstDown()
                 pressed = true
@@ -869,19 +993,80 @@ class VmActivity : ComponentActivity() {
             }
         }, contentAlignment = Alignment.Center) {
             val d = navKeyLabel(k)
-            val m = Modifier.size(if (size < 40.dp) 20.dp else 24.dp)
-            when (k) {
-                "back" -> Icon(Icons.AutoMirrored.Rounded.ArrowBack, d, m)
-                "home" -> Icon(Icons.Rounded.Circle, d, m)
-                "recents" -> Icon(Icons.Rounded.CropSquare, d, m)
-                "menu" -> Icon(Icons.Rounded.Menu, d, m)
-                "search" -> Icon(Icons.Rounded.Search, d, m)
-                "volup" -> Icon(Icons.Rounded.VolumeUp, d, m)
-                "voldown" -> Icon(Icons.Rounded.VolumeDown, d, m)
-                "power" -> Icon(Icons.Rounded.PowerSettingsNew, d, m)
-                else -> Icon(Icons.Rounded.Gamepad, d, m)
+            val baseSize = if (size < 40.dp) 20.dp else 24.dp
+            if (theme != null && theme.glyphs != app.aemu.core.GlyphSet.MATERIAL) {
+                // an Android era's line drawings (ui/NavGlyphs.kt)
+                androidx.compose.foundation.Canvas(Modifier.size(baseSize * theme.iconScale)) {
+                    NavGlyphs.draw(this, navButtonOf(k), theme, pressed)
+                }
+            } else {
+                val m = Modifier.size(baseSize * (theme?.iconScale ?: 1f))
+                val tint = theme?.iconColor?.let { Color(it) } ?: androidx.compose.material3.LocalContentColor.current
+                when (k) {
+                    "back" -> Icon(Icons.AutoMirrored.Rounded.ArrowBack, d, m, tint = tint)
+                    "home" -> Icon(Icons.Rounded.Circle, d, m, tint = tint)
+                    "recents" -> Icon(Icons.Rounded.CropSquare, d, m, tint = tint)
+                    "menu" -> Icon(Icons.Rounded.Menu, d, m, tint = tint)
+                    "search" -> Icon(Icons.Rounded.Search, d, m, tint = tint)
+                    "volup" -> Icon(Icons.Rounded.VolumeUp, d, m, tint = tint)
+                    "voldown" -> Icon(Icons.Rounded.VolumeDown, d, m, tint = tint)
+                    "power" -> Icon(Icons.Rounded.PowerSettingsNew, d, m, tint = tint)
+                    else -> Icon(Icons.Rounded.Gamepad, d, m, tint = tint)
+                }
             }
         }
+    }
+
+    /** This bar's string keys as theme glyph buttons (core/NavButton.kt); the D-pad draws as the centre key. */
+    private fun navButtonOf(k: String): app.aemu.core.NavButton = when (k) {
+        "back" -> app.aemu.core.NavButton.BACK
+        "home" -> app.aemu.core.NavButton.HOME
+        "recents" -> app.aemu.core.NavButton.RECENTS
+        "menu" -> app.aemu.core.NavButton.MENU
+        "search" -> app.aemu.core.NavButton.SEARCH
+        "volup" -> app.aemu.core.NavButton.VOLUME_UP
+        "voldown" -> app.aemu.core.NavButton.VOLUME_DOWN
+        "power" -> app.aemu.core.NavButton.POWER
+        else -> app.aemu.core.NavButton.CENTER
+    }
+
+    /**
+     * A hardware key drawn on the device skin: touching that part of the picture presses the key in the guest and
+     * holds it for as long as it is held here, like the bar's keys. [area] is in root pixels, as the layout
+     * listener computed it from DeviceSkin.layout.
+     */
+    @Composable
+    private fun SkinKeyZone(button: app.aemu.core.NavButton, area: app.aemu.core.DeviceSkin.Box) {
+        val code = when (button) {
+            app.aemu.core.NavButton.BACK -> InputService.KEY_BACK
+            app.aemu.core.NavButton.MENU -> InputService.KEY_MENU
+            app.aemu.core.NavButton.SEARCH -> InputService.KEY_SEARCH
+            app.aemu.core.NavButton.VOLUME_UP -> InputService.KEY_VOLUMEUP
+            app.aemu.core.NavButton.VOLUME_DOWN -> InputService.KEY_VOLUMEDOWN
+            app.aemu.core.NavButton.POWER -> InputService.KEY_POWER
+            app.aemu.core.NavButton.CENTER -> InputService.KEY_CENTER
+            else -> 0
+        }
+        val density = androidx.compose.ui.platform.LocalDensity.current
+        Box(Modifier.offset { androidx.compose.ui.unit.IntOffset(area.left, area.top) }
+            .size(with(density) { area.width.toDp() }, with(density) { area.height.toDp() })
+            .pointerInput(button) {
+                awaitEachGesture {
+                    val down = awaitFirstDown()
+                    down.consume()
+                    if (button == app.aemu.core.NavButton.HOME) vm.input.home(true)
+                    else if (code != 0) vm.input.key(code, true)
+                    while (true) {
+                        val e = awaitPointerEvent()
+                        val c = e.changes.firstOrNull { it.id == down.id } ?: break
+                        c.consume()
+                        if (!c.pressed) break
+                    }
+                    if (button == app.aemu.core.NavButton.HOME) vm.input.home(false)
+                    else if (code != 0) vm.input.key(code, false)
+                    else if (button == app.aemu.core.NavButton.RECENTS) vm.input.recents(vm.img.api, vm.img.skin)
+                }
+            })
     }
 
     /**
@@ -889,7 +1074,7 @@ class VmActivity : ComponentActivity() {
      * a dot. Blinks with the guest's on/off times.
      */
     @Composable
-    private fun LedIndicator(l: app.aemu.core.Lights.Led, modifier: Modifier) {
+    private fun LedIndicator(l: app.aemu.core.Lights.Led, modifier: Modifier, skinLed: Pair<Int, Int>? = null) {
         var on by remember(l) { mutableStateOf(true) }
         LaunchedEffect(l) {
             if (l.onMs > 0 && l.offMs > 0) while (true) { on = true; delay(l.onMs.toLong()); on = false; delay(l.offMs.toLong()) }
@@ -900,9 +1085,14 @@ class VmActivity : ComponentActivity() {
         val sony = vm.img.skin.contains("Xperia", true) || vm.img.brand.contains("Sony", true)
         val density = androidx.compose.ui.platform.LocalDensity.current
         val y = with(density) { (guestTopPx.toDp() - 10.dp).coerceAtLeast(4.dp) }
+        // on a device skin the LED sits where the skin puts it (centre of the dot/strip on the point), not above the guest
+        val placed = if (skinLed != null) modifier.offset(
+            x = with(density) { skinLed.first.toDp() } - if (sony) 80.dp else 7.dp,
+            y = with(density) { skinLed.second.toDp() } - if (sony) 3.dp else 7.dp)
+            else modifier.offset(y = y)
         if (sony) {
             Box(
-                modifier.offset(y = y)
+                placed
                     .width(160.dp)
                     .height(6.dp)
                     .alpha(alpha)
@@ -921,7 +1111,7 @@ class VmActivity : ComponentActivity() {
             )
         } else {
             Box(
-                modifier.offset(y = y).size(14.dp)
+                placed.size(14.dp)
                     .alpha(alpha)
                     .background(androidx.compose.ui.graphics.Brush.radialGradient(listOf(c, c.copy(alpha = 0.55f), Color.Transparent)), CircleShape)
             )

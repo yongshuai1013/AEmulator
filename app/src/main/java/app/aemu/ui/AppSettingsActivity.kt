@@ -236,6 +236,7 @@ private fun AppSettings(onBack: () -> Unit, onRestyle: () -> Unit) {
                             dynamic = it; AppPrefs.setDynamicColor(ctx, it)
                         }
                     }
+                    VmThemeRow()
                 }
             }
 
