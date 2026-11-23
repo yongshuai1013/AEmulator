@@ -8,6 +8,7 @@ import app.aemu.core.ImageStore
 import app.aemu.core.TreeFixer
 import app.aemu.core.VmPaths
 import app.aemu.core.RecoveryImage
+import app.aemu.importer.tools.FirmwareToolset
 import app.aemu.importer.tools.SquashFs
 import app.aemu.importer.tools.WimReader
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
@@ -154,6 +155,10 @@ class Importer(
             String(h, 0, 8, Charsets.ISO_8859_1) == "ANDROID!" -> takeBoot(readAllFrom(src))
             // raw images without a recognisable header at 0 (YAFFS2 dumps, Samsung RFS)
             Yaffs2Image.probe(src) || FatImage.probe(src) -> importImage(src, "system")
+            // LG firmware: TOT/BIN (AP magics), bare DZ and legacy MSTXMETX DZ, a plain KDZ-named cabinet, the oldest KDZ
+            // (an RC4-encrypted CAB whose key is the file size, so it has to be recognised from random-looking bytes) and
+            // anything named *.kdz, whose table the toolset validates before unpacking. (AEmulator-Plus)
+            isLgFirmware(h, name, src) -> importLgToolset(src, name, depth)
             else -> throw IOException("unknown file format \"$name\"")
         }
     }
@@ -989,6 +994,54 @@ class Importer(
         if (bad > 0) log("huawei $label: $bad block(s) of the system image fail their CRC, the download may be damaged")
         importImage(slice(systemPacket), "system")
         for (p in fsParts) if (p !== systemPacket) log("huawei $label: skipped partition id 0x%02x (%d KB)".format(p.id, p.size shr 10))
+    }
+
+    /** LG container shapes recognisable from the head bytes or the name; the toolset re-validates the file itself. */
+    private fun isLgFirmware(h: ByteArray, name: String, src: RandomSource): Boolean {
+        if (h.size >= 4) {
+            val m = (h[0].toLong() and 255) or ((h[1].toLong() and 255) shl 8) or ((h[2].toLong() and 255) shl 16) or ((h[3].toLong() and 255) shl 24)
+            if (m == 0xAA55EC44L || m == 0xAA55A5A5L || m == 0xAA55DD44L) return true   // LG BIN / TOT AP headers
+            if (m == 0x74189632L) return true                                          // DZ chunk file (32 96 18 74)
+        }
+        if (h.size >= 8 && String(h, 0, 8, Charsets.US_ASCII) == "MSTXMETX") return true   // legacy DZ
+        if (FirmwareToolset.isEncryptedKdz(h, src.size)) return true
+        val lower = name.lowercase()
+        if (lower.endsWith(".kdz")) return true
+        if (lower.endsWith(".cab") && h.size >= 4 && h[0] == 'M'.code.toByte() && h[1] == 'S'.code.toByte() &&
+            h[2] == 'C'.code.toByte() && h[3] == 'F'.code.toByte()) return true        // a KDZ decrypted to its cabinet
+        return false
+    }
+
+    /**
+     * LG KDZ / DZ / TOT / BIN via [FirmwareToolset] (the LG extractors only; the toolset's other formats stay with the
+     * routes above). The unpacked partition images are fed back by role: boot and recovery directly, the rest through
+     * [handle] so the usual content probes classify them. (Adapted from AEmulator-Plus.)
+     */
+    private fun importLgToolset(src: RandomSource, name: String, depth: Int) {
+        if (depth >= MAX_DEPTH) throw IOException("archive nested too deeply")
+        val f = spill(streamOf(src), name)
+        val work = File(tmp, "lg-${System.nanoTime()}").apply { mkdirs() }
+        try {
+            onProgress("Reading $name", -1f)
+            val artifacts = try {
+                FirmwareToolset.extract(f, work, FirmwareToolset.DEFAULT_WANT) { msg -> log(msg) }
+            } catch (e: IOException) { throw e } catch (e: Exception) { throw IOException(e.message ?: "LG firmware unpack failed", e) }
+            val usable = artifacts.filter { it.file.isFile }
+            if (usable.isEmpty()) throw IOException("unknown file format \"$name\"")
+            for (a in usable) {
+                if (cancelled) throw IOException("cancelled")
+                val base = a.file.name.lowercase()
+                when {
+                    a.role == FirmwareToolset.Role.BOOT -> takeBoot(readAllFrom(FileSource(a.file)))
+                    a.role == FirmwareToolset.Role.RECOVERY ->
+                        if (a.file.length() < 64_000_000) recovery = readAllFrom(FileSource(a.file))
+                    base.startsWith("vendor") -> runCatching { importImage(FileSource(a.file), "vendor") }
+                    base.contains("product") || base.contains("system_ext") || base.contains("odm") ||
+                        base.contains("modem") || base.contains("oem") -> log("lg: skipped ${a.file.name}")
+                    else -> handle(FileSource(a.file), a.file.name, depth + 1)
+                }
+            }
+        } finally { f.delete(); work.deleteRecursively() }
     }
 
     private fun importWimStandalone(src: RandomSource, name: String) {

@@ -294,6 +294,16 @@ final class Squash3 implements Closeable {
     /** Visits every folder, link and regular file (the root folder itself is not reported), like the 4.x reader. */
     void walk(SquashFs.SquashVisitor v) throws Exception { walk(v, rootRef, "", new HashSet<Long>()); }
 
+    /** Bridge for FirmwareToolset's own SquashFS walker, whose visitor type is its own nested one (AEmulator adaptation). */
+    void walk(FirmwareToolset.SquashVisitor v) throws Exception {
+        walk(new SquashFs.SquashVisitor() {
+            public void dir(String path, int mode) throws Exception { v.dir(path, mode); }
+            public void link(String path, String target) throws Exception { v.link(path, target); }
+            public java.io.OutputStream file(String path, int mode, long size) throws Exception { return v.file(path, mode, size); }
+            public void fileEnd(String path) throws Exception { v.fileEnd(path); }
+        });
+    }
+
     private void walk(SquashFs.SquashVisitor v, long ref, String rel, Set<Long> seen) throws Exception {
         Inode in = inode(ref);
         if (in.type == 1) {

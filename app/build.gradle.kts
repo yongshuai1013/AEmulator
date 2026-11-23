@@ -139,6 +139,8 @@ dependencies {
     // UBIFS data decompression (UbiFsReader, from AEmulator-Plus): zstd frames and LZO1X blocks
     implementation("com.github.luben:zstd-jni:1.5.7-4@aar")
     implementation("org.anarres.lzo:lzo-commons:1.0.6")
+    // FirmwareToolset (from AEmulator-Plus): the OFP extractor opens its inner zip through zip4j
+    implementation("net.lingala.zip4j:zip4j:2.11.5")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
 }
