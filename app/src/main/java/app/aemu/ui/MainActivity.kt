@@ -105,6 +105,7 @@ const val ACTION_BOOT = "app.aemu.BOOT"
 
 class MainActivity : ComponentActivity() {
     private val model: LibraryModel by viewModels()
+    private val catalogModel: RomCatalogModel by viewModels()
 
     /** Language this activity was created with: a change means its string resources are stale and need context recreation. */
     private var style = ""
@@ -120,7 +121,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         askPermissions()
         handleView(intent)
-        setContent { AemuTheme { Library(model) } }
+        setContent { AemuTheme { Library(model, catalogModel) } }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -163,7 +164,15 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun Library(model: LibraryModel) {
+fun Library(model: LibraryModel, catalogModel: RomCatalogModel) {
+    // the ROM catalog is a separate page over the library (#34); a verified download returns
+    // here as a plain file import, with the usual import card showing progress
+    var catalog by remember { mutableStateOf(false) }
+    if (catalog) {
+        RomCatalogScreen(catalogModel, onBack = { catalog = false },
+            onImportFile = { f -> catalog = false; model.import(android.net.Uri.fromFile(f)) })
+        return
+    }
     val images by model.images.collectAsState()
     val imp by model.import.collectAsState()
     val ctx = LocalContext.current
@@ -258,7 +267,7 @@ fun Library(model: LibraryModel) {
         floatingActionButton = {
             HomeFab(expanded = addMenu, onToggle = { addMenu = it },
                 onImport = { pick.launch(arrayOf("*/*")) }, onLibrary = { library = true },
-                onNewFolder = { openNewFolder() })
+                onNewFolder = { openNewFolder() }, onCatalog = { catalog = true })
         },
     ) { pad ->
         val full: androidx.compose.foundation.lazy.grid.LazyGridItemSpanScope.() -> androidx.compose.foundation.lazy.grid.GridItemSpan =

@@ -25,6 +25,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.CreateNewFolder
 import androidx.compose.material.icons.rounded.Delete
@@ -179,7 +180,7 @@ fun MachineCard(
 
 /** "+": an M3 Expressive FAB menu — import a firmware file, or open the firmware library. */
 @Composable
-fun HomeFab(expanded: Boolean, onToggle: (Boolean) -> Unit, onImport: () -> Unit, onLibrary: () -> Unit, onNewFolder: () -> Unit) {
+fun HomeFab(expanded: Boolean, onToggle: (Boolean) -> Unit, onImport: () -> Unit, onLibrary: () -> Unit, onNewFolder: () -> Unit, onCatalog: () -> Unit) {
     FloatingActionButtonMenu(
         expanded = expanded,
         button = {
@@ -193,6 +194,8 @@ fun HomeFab(expanded: Boolean, onToggle: (Boolean) -> Unit, onImport: () -> Unit
             text = { Text(stringResource(R.string.add_import)) })
         FloatingActionButtonMenuItem(onClick = { onToggle(false); onLibrary() }, icon = { Icon(Icons.Rounded.Inventory2, null) },
             text = { Text(stringResource(R.string.lib_title)) })
+        FloatingActionButtonMenuItem(onClick = { onToggle(false); onCatalog() }, icon = { Icon(Icons.Rounded.CloudDownload, null) },
+            text = { Text(stringResource(R.string.catalog_title)) })
         FloatingActionButtonMenuItem(onClick = { onToggle(false); onNewFolder() }, icon = { Icon(Icons.Rounded.CreateNewFolder, null) },
             text = { Text(stringResource(R.string.folder_new)) })
     }
