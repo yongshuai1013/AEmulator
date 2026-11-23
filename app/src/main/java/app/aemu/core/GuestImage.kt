@@ -99,6 +99,8 @@ data class VmSettings(
      * name above is used. This fork's addition; Plus has no mirror.
      */
     val wifiMirrorHost: Boolean = true,
+    /** Experimental host Bluetooth passthrough (scan, RFCOMM, GATT); applies at the next full VM boot. */
+    val bluetooth: Boolean = false,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -122,6 +124,7 @@ data class VmSettings(
         .put("wifi", wifi).put("wifiSsid", wifiSsid).put("wifiPassword", wifiPassword)
         .put("wifiSignal", wifiSignal).put("wifiNeighbors", wifiNeighbors)
         .put("wifiMirrorHost", wifiMirrorHost)
+        .put("bluetooth", bluetooth)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -209,6 +212,7 @@ data class VmSettings(
                 wifiSignal = o.optInt("wifiSignal", d.wifiSignal).coerceIn(1, WifiEmu.MAX_BARS),
                 wifiNeighbors = o.optBoolean("wifiNeighbors", d.wifiNeighbors),
                 wifiMirrorHost = o.optBoolean("wifiMirrorHost", d.wifiMirrorHost),
+                bluetooth = o.optBoolean("bluetooth", d.bluetooth),
             )
         }
     }
