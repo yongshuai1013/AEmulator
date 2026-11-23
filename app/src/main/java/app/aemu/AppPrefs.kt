@@ -66,6 +66,9 @@ object AppPrefs {
     fun libraryLayout(ctx: Context): String? = sp(ctx).getString("library_layout", null)
     fun setLibraryLayout(ctx: Context, v: String) = sp(ctx).edit().putString("library_layout", v).apply()
 
+    fun library3d(ctx: Context): Boolean = sp(ctx).getBoolean("library_3d", false)
+    fun setLibrary3d(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean("library_3d", v).apply()
+
     fun autoCheckUpdates(ctx: Context): Boolean = sp(ctx).getBoolean("auto_check_updates", true)
     fun setAutoCheckUpdates(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean("auto_check_updates", v).apply()
 

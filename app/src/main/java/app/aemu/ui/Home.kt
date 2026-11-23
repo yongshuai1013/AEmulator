@@ -26,9 +26,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.CreateNewFolder
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.FileOpen
+import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Inventory2
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -108,6 +110,7 @@ fun MachineCard(
     onNewMachine: () -> Unit,
     onReset: () -> Unit,
     onDelete: () -> Unit,
+    onMoveToFolder: (() -> Unit)? = null,
 ) {
     val ctx = LocalContext.current
     val press = remember { MutableInteractionSource() }
@@ -137,6 +140,8 @@ fun MachineCard(
                         onClick = { menu = false; onRename() })
                     DropdownMenuItem(text = { Text(stringResource(R.string.new_machine)) }, leadingIcon = { Icon(Icons.Rounded.ContentCopy, null) },
                         onClick = { menu = false; onNewMachine() })
+                    if (onMoveToFolder != null) DropdownMenuItem(text = { Text(stringResource(R.string.folder_move)) }, leadingIcon = { Icon(Icons.Rounded.FolderOpen, null) },
+                        onClick = { menu = false; onMoveToFolder() })
                     HorizontalDivider()
                     DropdownMenuItem(text = { Text(stringResource(R.string.reset_data)) }, leadingIcon = { Icon(Icons.Rounded.RestartAlt, null) },
                         onClick = { menu = false; onReset() })
@@ -174,7 +179,7 @@ fun MachineCard(
 
 /** "+": an M3 Expressive FAB menu — import a firmware file, or open the firmware library. */
 @Composable
-fun HomeFab(expanded: Boolean, onToggle: (Boolean) -> Unit, onImport: () -> Unit, onLibrary: () -> Unit) {
+fun HomeFab(expanded: Boolean, onToggle: (Boolean) -> Unit, onImport: () -> Unit, onLibrary: () -> Unit, onNewFolder: () -> Unit) {
     FloatingActionButtonMenu(
         expanded = expanded,
         button = {
@@ -188,6 +193,8 @@ fun HomeFab(expanded: Boolean, onToggle: (Boolean) -> Unit, onImport: () -> Unit
             text = { Text(stringResource(R.string.add_import)) })
         FloatingActionButtonMenuItem(onClick = { onToggle(false); onLibrary() }, icon = { Icon(Icons.Rounded.Inventory2, null) },
             text = { Text(stringResource(R.string.lib_title)) })
+        FloatingActionButtonMenuItem(onClick = { onToggle(false); onNewFolder() }, icon = { Icon(Icons.Rounded.CreateNewFolder, null) },
+            text = { Text(stringResource(R.string.folder_new)) })
     }
 }
 

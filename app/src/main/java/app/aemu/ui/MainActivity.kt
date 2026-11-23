@@ -34,7 +34,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.rounded.FileOpen
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.border
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -69,6 +71,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -76,6 +79,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import app.aemu.BuildConfig
@@ -169,6 +176,36 @@ fun Library(model: LibraryModel) {
     var addMenu by remember { mutableStateOf(false) }
     var library by remember { mutableStateOf(false) }
     var containerFrom by remember { mutableStateOf<GuestImage?>(null) }
+    // the user's arrangement of the library (order + folders, AEmulator-Plus #33); the grid below is its consumer
+    val arranger = remember { LibraryArranger(ctx) }
+    arranger.images = images
+    arranger.systemsFirst = false
+    val drag = remember { LibraryDragState() }
+    val dragKey = drag.key
+    val rows = arranger.rows(collapse = if (dragKey != null && arranger.layout().isFolder(dragKey)) dragKey else null)
+    val haptic = LocalHapticFeedback.current
+    val folderEdge = MaterialTheme.colorScheme.secondary.copy(alpha = 0.55f)
+    var moveFor by remember { mutableStateOf<GuestImage?>(null) }
+    var newFolderOpen by remember { mutableStateOf(false) }
+    var newFolderRom by remember { mutableStateOf<String?>(null) }
+    var renameFolderId by remember { mutableStateOf<String?>(null) }
+    fun openNewFolder(rom: String? = null) { newFolderRom = rom; newFolderOpen = true }
+    fun toggleFolder(id: String) {
+        val l = arranger.layout()
+        val f = l.folders[id] ?: return
+        arranger.update(l.setOpen(id, !f.open)); arranger.commit()
+    }
+    fun deleteFolder(id: String) { arranger.update(arranger.layout().deleteFolder(id)); arranger.commit() }
+    // 3D library is an opt-in app setting; re-read it when returning from Settings
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var view3d by remember { mutableStateOf(AppPrefs.library3d(ctx)) }
+    DisposableEffect(lifecycleOwner) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
+            if (e == Lifecycle.Event.ON_RESUME) view3d = AppPrefs.library3d(ctx)
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
     val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
     val scope = rememberCoroutineScope()
@@ -220,14 +257,20 @@ fun Library(model: LibraryModel) {
         },
         floatingActionButton = {
             HomeFab(expanded = addMenu, onToggle = { addMenu = it },
-                onImport = { pick.launch(arrayOf("*/*")) }, onLibrary = { library = true })
+                onImport = { pick.launch(arrayOf("*/*")) }, onLibrary = { library = true },
+                onNewFolder = { openNewFolder() })
         },
     ) { pad ->
         val full: androidx.compose.foundation.lazy.grid.LazyGridItemSpanScope.() -> androidx.compose.foundation.lazy.grid.GridItemSpan =
             { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }
+        val gridState = rememberLazyGridState()
+        val controller = remember(gridState, arranger, drag) { LibraryDragController(drag, gridState.dragHost(), arranger) }
+        LibraryDragAutoScroll(controller)
         androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
+            state = gridState,
             columns = androidx.compose.foundation.lazy.grid.GridCells.Adaptive(148.dp),
-            modifier = Modifier.fillMaxSize().padding(pad),
+            modifier = Modifier.fillMaxSize().padding(pad)
+                .libraryDragGesture(controller) { haptic.performHapticFeedback(HapticFeedbackType.LongPress) },
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 120.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -239,19 +282,36 @@ fun Library(model: LibraryModel) {
                 }
             }
             if (images.isEmpty() && !imp.active) item(span = full) { EmptyState(onHelp = { help = true }) }
-            items(images.size, key = { images[it].id }) { i ->
-                val img = images[i]
-                MachineCard(
-                    img,
-                    baseName = images.firstOrNull { it.id == img.baseId }?.name,
-                    modifier = Modifier.animateItem(),
-                    onStart = { VmActivity.start(ctx, img.id) },
-                    onSettings = { settingsFor = img },
-                    onRename = { renameFor = img },
-                    onNewMachine = { containerFrom = img },
-                    onReset = { resetFor = img },
-                    onDelete = { deleteFor = img },
-                )
+            items(rows.size, key = { rows[it].key },
+                span = { i -> if (rows[i] is FolderRow) androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) else androidx.compose.foundation.lazy.grid.GridItemSpan(1) }) { i ->
+                when (val row = rows[i]) {
+                    is FolderRow -> FolderHeader(
+                        row.folder,
+                        hovered = drag.hoverFolder == row.id,
+                        modifier = (if (drag.key == row.id) Modifier else Modifier.animateItem())
+                            .libraryDragVisual(controller, row.id, lockX = false),
+                        onToggle = { toggleFolder(row.id) },
+                        onRename = { renameFolderId = row.id },
+                        onDelete = { deleteFolder(row.id) },
+                    )
+                    is RomRow -> {
+                        val img = row.img
+                        MachineCard(
+                            img,
+                            baseName = images.firstOrNull { it.id == img.baseId }?.name,
+                            modifier = (if (drag.key == img.id) Modifier else Modifier.animateItem())
+                                .libraryDragVisual(controller, img.id, lockX = false)
+                                .then(if (row.folderId != null) Modifier.border(2.dp, folderEdge, MaterialTheme.shapes.extraLarge) else Modifier),
+                            onStart = { VmActivity.start(ctx, img.id) },
+                            onSettings = { settingsFor = img },
+                            onRename = { renameFor = img },
+                            onNewMachine = { containerFrom = img },
+                            onReset = { resetFor = img },
+                            onDelete = { deleteFor = img },
+                            onMoveToFolder = { moveFor = img },
+                        )
+                    }
+                }
             }
         }
     }
@@ -293,6 +353,27 @@ AlertDialog(
             confirmButton = { Button(onClick = { model.rename(img, name.trim().ifEmpty { img.name }); renameFor = null }) { Text(stringResource(R.string.save)) } },
             dismissButton = { TextButton(onClick = { renameFor = null }) { Text(stringResource(R.string.cancel)) } },
         )
+    }
+    if (newFolderOpen) FolderNameDialog(R.string.folder_new, "", onDismiss = { newFolderOpen = false; newFolderRom = null },
+        onConfirm = { name ->
+            arranger.update(arranger.layout().createFolder(LibLayout.newFolderId(), name, newFolderRom)); arranger.commit()
+            newFolderOpen = false; newFolderRom = null
+        })
+    renameFolderId?.let { id ->
+        arranger.layout().folders[id]?.let { f ->
+            FolderNameDialog(R.string.folder_rename, f.name, onDismiss = { renameFolderId = null },
+                onConfirm = { name -> arranger.update(arranger.layout().renameFolder(id, name)); arranger.commit(); renameFolderId = null })
+        }
+    }
+    moveFor?.let { img ->
+        MoveToFolderDialog(img, arranger.layout(), onDismiss = { moveFor = null },
+            onPick = { folder ->
+                val l = arranger.layout()
+                // a folder you move something into opens, so the ROM does not seem to vanish
+                arranger.update(if (folder == null) l.takeOut(img.id) else l.setOpen(folder, true).moveRomToFolder(img.id, folder))
+                arranger.commit(); moveFor = null
+            },
+            onNew = { openNewFolder(img.id); moveFor = null })
     }
     if (help) HelpDialog(onDismiss = { help = false })
     if (library) LibrarySheet(images.filter { it.baseId.isEmpty() }, onDismiss = { library = false },
