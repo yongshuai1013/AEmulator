@@ -1470,6 +1470,13 @@ class TreeFixer(
             "usb/type" to "USB", "usb/online" to "0",
         )
         for ((rel, v) in bat) File(base, rel).let { if (!it.isFile) { it.parentFile?.mkdirs(); it.writeText(v + "\n") } }
+        // storage identity (AEmulator Plus): a chosen eMMC/UFS type gets its /sys block nodes.
+        // Only when a type is set — with none, the firmware's own nodes stay exactly as extracted.
+        val storageType = StorageSpoof.StorageType.parse(settings.storageType)
+        if (storageType != null) {
+            for (dir in StorageSpoof.OWNED_DIRS) File(root, dir).deleteRecursively()
+            for ((path, text) in StorageSpoof.sysfs(storageType)) File(root, path).let { it.parentFile?.mkdirs(); it.writeText(text) }
+        }
         healthdRelativeSysfs(base)
         personalityNoop()
         parkNfc()

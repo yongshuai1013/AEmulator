@@ -111,6 +111,12 @@
     <string name="vs_height">Height</string>
     <string name="vs_dpi">DPI</string>
     <string name="vs_ram">Guest RAM</string>
+    <string name="vs_storage">Storage</string>
+    <string name="vs_storage_auto">Phone\'s own disk</string>
+    <string name="vs_storage_sub">Size the guest reports. Free space is always the phone\'s real free space, and used = size − free, so the guest can never be told it may store more than the phone can hold. Takes effect after a full VM restart.</string>
+    <string name="vs_storage_type">Storage type</string>
+    <string name="vs_storage_type_auto">Default</string>
+    <string name="vs_storage_type_sub">eMMC or UFS as the guest sees it (properties and /sys block nodes).</string>
     <string name="vs_ram_auto">Automatic</string>
     <string name="vs_radio_title">Radio</string>
     <string name="vs_radio">Emulate radio module</string>

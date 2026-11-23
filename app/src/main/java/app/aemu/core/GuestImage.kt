@@ -73,6 +73,10 @@ data class VmSettings(
      * own default is EDGE; the field and picker are theirs).
      */
     val networkType: Int = NetworkType.UMTS,
+    /** storage size the guest is told it has, in GiB; 0 = the phone's own disk, unspoofed (AEmulator Plus) */
+    val storageGb: Int = 0,
+    /** storage technology the guest sees (an id of StorageSpoof.StorageType); blank = the firmware's own (AEmulator Plus) */
+    val storageType: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -88,6 +92,8 @@ data class VmSettings(
         .put("vibration", vibration)
         .put("hardware", hardware)
         .put("networkType", networkType)
+        .put("storageGb", storageGb)
+        .put("storageType", storageType)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -155,6 +161,8 @@ data class VmSettings(
                 vibration = o.optBoolean("vibration", true),
                 hardware = cleanHardware(o.optString("hardware", "")),
                 networkType = NetworkType.normalize(o.optInt("networkType", NetworkType.UMTS)),
+                storageGb = StorageSpoof.sanitizeGb(o.optInt("storageGb", 0)),
+                storageType = StorageSpoof.StorageType.parse(o.optString("storageType", ""))?.id ?: "",
             )
         }
     }

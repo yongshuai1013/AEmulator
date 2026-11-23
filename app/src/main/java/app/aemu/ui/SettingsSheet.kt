@@ -49,7 +49,9 @@ import app.aemu.core.CpuInfo
 import app.aemu.core.Engine
 import app.aemu.core.GuestImage
 import app.aemu.core.NetworkType
+import app.aemu.core.StorageSpoof
 import app.aemu.core.VmSettings
+import kotlin.math.roundToInt
 
 private data class Res(val label: String, val w: Int, val h: Int, val dpi: Int)
 
@@ -125,6 +127,7 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
                 },
                 colors = ListItemDefaults.colors(containerColor = Color.Transparent),
             )
+            StoragePicker(s.storageGb, s.storageType, { s = s.copy(storageGb = it) }, { s = s.copy(storageType = it) })
             Toggle(stringResource(R.string.vs_lowram), stringResource(R.string.vs_lowram_sub), s.lowRam) { s = s.copy(lowRam = it) }
             Toggle(stringResource(R.string.vs_proxy), stringResource(R.string.vs_proxy_sub), s.netProxy) { s = s.copy(netProxy = it) }
             Toggle(stringResource(R.string.vs_vibration), stringResource(R.string.vs_vibration_sub), s.vibration) { s = s.copy(vibration = it) }
@@ -257,6 +260,46 @@ private fun NetworkTypePicker(tech: Int, api: Int, set: (Int) -> Unit) {
                     }
                 }
             }
+        },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        modifier = Modifier.fillMaxWidth(),
+    )
+}
+
+/** Storage size the guest is told it has, and the eMMC/UFS identity it sees (AEmulator Plus's picker). */
+@Composable
+private fun StoragePicker(gb: Int, type: String, setGb: (Int) -> Unit, setType: (String) -> Unit) {
+    val steps = listOf(0) + StorageSpoof.PRESETS_GB
+    var open by remember { mutableStateOf(false) }
+    ListItem(
+        headlineContent = { Text(stringResource(R.string.vs_storage)) },
+        supportingContent = {
+            Column {
+                Text(stringResource(R.string.vs_storage_sub))
+                Slider(value = steps.indexOf(StorageSpoof.sanitizeGb(gb)).toFloat(),
+                    onValueChange = { setGb(steps[it.roundToInt().coerceIn(0, steps.lastIndex)]) },
+                    valueRange = 0f..steps.lastIndex.toFloat(), steps = steps.size - 2,
+                    modifier = Modifier.fillMaxWidth())
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(stringResource(R.string.vs_storage_type), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                    Box {
+                        TextButton(onClick = { open = true }) {
+                            Text(StorageSpoof.StorageType.parse(type)?.label ?: stringResource(R.string.vs_storage_type_auto))
+                        }
+                        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                            DropdownMenuItem(text = { Text(stringResource(R.string.vs_storage_type_auto)) }, onClick = { open = false; setType("") })
+                            StorageSpoof.StorageType.entries.forEach { e ->
+                                DropdownMenuItem(text = { Text(e.label) }, onClick = { open = false; setType(e.id) })
+                            }
+                        }
+                    }
+                }
+                Text(stringResource(R.string.vs_storage_type_sub), style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        },
+        trailingContent = {
+            Text(if (gb > 0) "$gb GB" else stringResource(R.string.vs_storage_auto), style = MaterialTheme.typography.bodyMedium)
         },
         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
         modifier = Modifier.fillMaxWidth(),

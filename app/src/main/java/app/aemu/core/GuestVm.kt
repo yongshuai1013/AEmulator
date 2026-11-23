@@ -421,6 +421,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             overrides["ro.hardware"] = it
             log("props: ro.hardware=$it (from settings)")
         }
+        // storage technology the guest sees (AEmulator Plus): the boot-device properties follow the setting
+        StorageSpoof.props(StorageSpoof.StorageType.parse(s.storageType)).forEach { (k, v) -> overrides[k] = v }
         overrides["ro.sf.lcd_density"] = s.density.toString()
         overrides["qemu.sf.lcd_density"] = s.density.toString()
         // MIUI 10 forces the density of the phone's own panel from this one (440 on a 540-pixel screen)
@@ -606,6 +608,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         mic.start()
         camera.start()
         battery.start()
+        // the storage size the guest is told (AEmulator Plus): the size node the shim reads; 64-bit engine only
+        if (engine == Engine.N64) StorageSpoof.writeNode(paths.root, s.storageGb)
         if (img.api >= 21) logd.start()
         if (img.api >= 14) runCatching { dns.ensure() }
         // the RAM the guest is told it has (its /proc/meminfo, scaled by the kernel): the framework sizes its background by it
