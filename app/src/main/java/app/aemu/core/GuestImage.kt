@@ -113,6 +113,8 @@ data class VmSettings(
     val wifiMirrorHost: Boolean = true,
     /** Experimental host Bluetooth passthrough (scan, RFCOMM, GATT); applies at the next full VM boot. */
     val bluetooth: Boolean = false,
+    /** Magisk root (arm64 guests on the native engine): the host starts the daemon at boot, see MagiskCore; applies at the next full VM boot (AEmulator Plus) */
+    val magisk: Boolean = false,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -139,6 +141,7 @@ data class VmSettings(
         .put("wifiSignal", wifiSignal).put("wifiNeighbors", wifiNeighbors)
         .put("wifiMirrorHost", wifiMirrorHost)
         .put("bluetooth", bluetooth)
+        .put("magisk", magisk)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -229,6 +232,7 @@ data class VmSettings(
                 wifiNeighbors = o.optBoolean("wifiNeighbors", d.wifiNeighbors),
                 wifiMirrorHost = o.optBoolean("wifiMirrorHost", d.wifiMirrorHost),
                 bluetooth = o.optBoolean("bluetooth", d.bluetooth),
+                magisk = o.optBoolean("magisk", d.magisk),
             )
         }
     }

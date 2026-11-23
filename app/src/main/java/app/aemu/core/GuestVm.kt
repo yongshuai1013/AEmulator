@@ -712,6 +712,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         WifiEmu.write(paths.root, settings, wifi, mirror)
         wifiOn = wifi
         if (wifi) log("wifi: emulated network \"${mirror?.ssid ?: settings.wifiSsid}\" (${if (WifiEmu.secured(settings)) "WPA2" else "open"})" + (if (mirror != null) ", mirroring the phone's connection" else ""))
+        // Magisk (VmSettings.magisk): init's post-fs-data stage, run by the host before the first service starts
+        if (!stopping) magiskPostFsData()
         var glDone = false
         // (debugging, see Kernel64.syncLog: only the first N services are started, then the guest is left as it is)
         val stopAfter = if (engine == Engine.N64 && kernel.syncLog) runCatching { File(paths.root, "dev/.aemu-stop-after").readText().trim().toInt() }.getOrNull() else null
@@ -788,6 +790,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }
         if (!glDone) glUp()
         log("system started: ${alive().joinToString()}")
+        magiskService()
         watchdog()
     }
 
@@ -1049,6 +1052,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             everBooted = true
             log("★ system booted in ${(bootDoneAt - bootAt) / 1000} s")
             setState(State.RUNNING)
+            Thread { magiskBootComplete() }.start()
             Thread { afterBoot() }.start()
         }
     }
@@ -1371,6 +1375,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             synchronized(procs) { procs.remove("healthd") }?.let { runCatching { it.destroyForcibly() } }
             runCatching { startService(h) }
         }
+        // Zygisk: the daemon counts zygote restarts and takes itself out of the zygote after 3 crashes (init's "onrestart exec magisk --zygote-restart")
+        if (magiskOn) runCatching { log("magisk: zygote-restart -> ${magiskExec("--zygote-restart", 10_000)}") }
         runCatching { startService(z) }
         img.services.firstOrNull { it.name == "zygote_secondary" }?.let { z2 ->
             synchronized(procs) { procs.remove("zygote_secondary") }?.let { runCatching { it.destroyForcibly() } }
@@ -1508,6 +1514,138 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     }
 
     fun installApk(apkOnSdcard: String): String = guestShell("pm install -r $apkOnSdcard", 600_000)
+
+    // ---- Magisk (VmSettings.magisk, see MagiskCore): the host plays the part of init's boot stages ----------------
+
+    private val magiskOn: Boolean get() =
+        settings.magisk && engine == Engine.N64 && !recoveryMode &&
+            MagiskCore.info(paths.root) != null && MagiskCore.hasArm64Userland(paths.root)
+
+    /** Runs a magisk command the way init's "exec" would, without letting the daemon it may start keep our pipe open. */
+    private fun magiskExec(args: String, timeoutMs: Long): String =
+        guestShell("/${MagiskCore.TMP}/magisk $args </dev/null >/dev/null 2>&1; echo exit=$?", timeoutMs).trim()
+
+    private fun magiskLogTail(): String =
+        runCatching { File(paths.root, "cache/magisk.log").readLines().takeLast(12).joinToString(" | ") }.getOrDefault("")
+
+    /** Before the first service: the stand-in tmpfs and the su links, "magisk --post-fs-data" (starts the daemon, merges
+     * module updates, runs post-fs-data scripts), then the modules' files are copied into the tree. Never fails the boot. */
+    private fun magiskPostFsData() {
+        runCatching {
+            if (!magiskOn) {
+                // switched off or removed since the last boot: put the tree back
+                if (MagiskCore.leftovers(paths.root)) { MagiskCore.deactivate(paths.root, ::log); log("magisk: off, the tree is back to stock") }
+                return
+            }
+            MagiskCore.Overlay.revert(paths.root, ::log)
+            MagiskCore.prepareTmp(paths.root)
+            MagiskCore.linkSystem(paths.root, ::log)
+            log("magisk: post-fs-data -> ${magiskExec("--post-fs-data", 45_000)}")
+            MagiskCore.unlockTmp(paths.root)    // its magic mount leaves directories at mode 000
+            val version = guestShell("/${MagiskCore.TMP}/magisk -v; /${MagiskCore.TMP}/magisk -V", 15_000).trim().replace('\n', ' ')
+            log("magisk: daemon answers \"$version\"")
+            // Zygisk (docs/magisk.md): with it on in magisk.db the daemon's post-fs-data sets the native-bridge property to libzygisk.so;
+            // its magic mount is ignored by the shim, so Overlay.apply copies the magisk binary into /system/lib64 under that name
+            val zygiskLib = MagiskCore.zygiskLibName(guestShell("getprop ${MagiskCore.NATIVE_BRIDGE_PROP}", 15_000))
+            log(if (zygiskLib != null) "magisk: zygisk on ($zygiskLib)" else "magisk: zygisk off")
+            val n = MagiskCore.Overlay.apply(paths.root, zygiskLib, ::log)
+            if (n > 0) log("magisk: $n module file(s) copied into the system")
+            if (!version.any { it.isDigit() }) log("magisk: the daemon did not answer; /cache/magisk.log: ${magiskLogTail()}")
+        }.onFailure { log("magisk: post-fs-data stage failed: ${it.message}") }
+    }
+
+    /** init's late_start: service.d and the modules' service.sh. */
+    private fun magiskService() {
+        if (!magiskOn) return
+        Thread {
+            runCatching { log("magisk: service -> ${magiskExec("--service", 60_000)}"); MagiskCore.unlockTmp(paths.root); if (MagiskCore.fixDbMode(paths.root)) log("magisk: magisk.db was mode 000, gave the owner access") }
+                .onFailure { log("magisk: service stage failed: ${it.message}") }
+        }.start()
+    }
+
+    /** sys.boot_completed: boot-completed.d / the modules' boot-completed.sh, and the Magisk app if it is not installed yet. */
+    private fun magiskBootComplete() {
+        // The app install is queued by the import of the APK (MagiskCore.appInstallPending) and does not wait for Root to be on;
+        // the daemon's stage and the manager set-up only run with it.
+        if (engine != Engine.N64 || recoveryMode || MagiskCore.info(paths.root) == null || !MagiskCore.hasArm64Userland(paths.root)) return
+        val on = magiskOn
+        runCatching {
+            if (on) {
+                log("magisk: boot-complete -> ${magiskExec("--boot-complete", 60_000)}")
+                if (MagiskCore.fixDbMode(paths.root)) log("magisk: magisk.db was mode 000, gave the owner access")
+            }
+            val pending = MagiskCore.appInstallPending(paths.root)
+            val apk = File(paths.root, MagiskCore.APK_COPY)
+            if (pending || on) {
+                val have = guestShell("pm path ${MagiskCore.PACKAGE}", 60_000).contains("package:")
+                if (!apk.isFile) {
+                    if (pending) { MagiskCore.clearAppInstall(paths.root); log("magisk: queued app install dropped, the APK copy is gone") }
+                } else if (pending || !have) {
+                    val staged = File(paths.root, "data/local/tmp").apply { mkdirs() }.let { File(it, "aemu-magisk.apk") }
+                    java.nio.file.Files.copy(apk.toPath(), staged.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                    staged.setReadable(true, false)
+                    // the queue entry goes as soon as the install has been called (whatever pm answered, even if the call threw):
+                    // it is a one-shot request, not retried at every boot
+                    try {
+                        val out = installApk("/data/local/tmp/aemu-magisk.apk").trim()
+                        log("magisk: app install${if (pending) " (queued by the import)" else ""} -> ${out.take(300)}")
+                    } finally {
+                        staged.delete()
+                        if (pending) {
+                            MagiskCore.clearAppInstall(paths.root)
+                            log("magisk: queued app install removed (${if (MagiskCore.appInstallPending(paths.root)) "STILL THERE" else "gone"})")
+                        }
+                    }
+                }
+            }
+            if (on) {
+                MagiskCore.unlockTmp(paths.root)
+                magiskManagerSetup()
+            }
+        }.onFailure { log("magisk: boot-complete stage failed: ${it.message}") }
+    }
+
+    /**
+     * Makes the Magisk app recognisable as the manager, then proves that its su works.
+     *
+     * The daemon finds the manager by the owner of /data/user_de/0/<package> (not /data/data/<package>). The shim answers
+     * a stat with the owner the guest gave the file (a chown leaves it in an extended attribute) and with root for the
+     * rest, so a directory nobody chowned reads as uid 0 and the real app (10132 in the logs) is a stranger to the
+     * daemon: its su ended in "Accessed denied" (the check that ran right after boot showed it). Not verified on a device
+     * which of the two the user_de directory was; the steps below are safe either way and log what they found.
+     * So: copy the owner of the data directory onto the device-encrypted one, and test again. If su still answers
+     * "denied", write the app's uid into magisk.db as an allowed policy: the daemon reads that table whatever it
+     * thinks of the manager (a request from any other app still goes through the prompt, which needs the manager).
+     */
+    private fun magiskManagerSetup() {
+        val t = MagiskCore.TMP
+        val pkg = MagiskCore.PACKAGE
+        fun sh(cmd: String, ms: Long = 30_000) = guestShell(cmd, ms).trim().replace("\n", " | ")
+        val uid = sh("stat -c %u /data/data/$pkg").toIntOrNull()
+        if (uid == null || uid < 10000) { log("magisk: the app's uid is unknown (\"$uid\"): is $pkg installed?"); return }
+        val before = sh("stat -c %u /data/user_de/0/$pkg")
+        if (before != uid.toString()) {
+            log("magisk: /data/user_de/0/$pkg belongs to uid \"$before\", the manager is $uid: chown -> " +
+                sh("chown $uid:$uid /data/user_de/0/$pkg 2>&1; stat -c %u /data/user_de/0/$pkg"))
+        }
+        fun trySu() = sh("su $uid -c 'su -c id' 2>&1 | head -3")
+        var answer = trySu()
+        if (!answer.contains("uid=0")) {
+            // the daemon keeps what it learnt about a uid for a few seconds
+            Thread.sleep(3_500)
+            answer = trySu()
+        }
+        if (!answer.contains("uid=0")) {
+            log("magisk: su for uid $uid still answers \"$answer\": adding an allow policy for it (policy 2 = allow)")
+            sh("/$t/magisk --sqlite 'REPLACE INTO policies (uid,policy,until,logging,notification) VALUES($uid,2,0,1,1)'")
+            MagiskCore.fixDbMode(paths.root)
+            Thread.sleep(3_500)
+            answer = trySu()
+        }
+        log("magisk: check -> app-uid=$uid, db: " + sh("ls -ln /data/adb/magisk.db") +
+            " | policies: " + sh("/$t/magisk --sqlite 'select uid,policy from policies'") + " | su as the app: $answer")
+        if (!answer.contains("uid=0")) log("magisk: su still fails for the app; /cache/magisk.log: ${magiskLogTail()}")
+    }
 
     private fun pidOf(p: Process): Int? {
         var c: Class<*>? = p.javaClass
