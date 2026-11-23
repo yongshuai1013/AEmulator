@@ -160,10 +160,13 @@ class Importer(
             String(h, 0, 8, Charsets.ISO_8859_1) == "ANDROID!" -> takeBoot(readAllFrom(src))
             // raw images without a recognisable header at 0 (YAFFS2 dumps, Samsung RFS)
             Yaffs2Image.probe(src) || FatImage.probe(src) -> importImage(src, "system")
+            // HTC containers: RUU installer (.exe), Dream NBH and the 256-byte-signed wrappers, whose first bytes are a
+            // random RSA signature or a PE header and so match nothing else. (AEmulator-Plus)
+            FirmwareToolset.isHtcContainer(h) -> importToolsetExtract(src, name, depth)
             // LG firmware: TOT/BIN (AP magics), bare DZ and legacy MSTXMETX DZ, a plain KDZ-named cabinet, the oldest KDZ
             // (an RC4-encrypted CAB whose key is the file size, so it has to be recognised from random-looking bytes) and
             // anything named *.kdz, whose table the toolset validates before unpacking. (AEmulator-Plus)
-            isLgFirmware(h, name, src) -> importLgToolset(src, name, depth)
+            isLgFirmware(h, name, src) -> importToolsetExtract(src, name, depth)
             else -> throw IOException("unknown file format \"$name\"")
         }
     }
@@ -1077,19 +1080,20 @@ class Importer(
     }
 
     /**
-     * LG KDZ / DZ / TOT / BIN via [FirmwareToolset] (the LG extractors only; the toolset's other formats stay with the
-     * routes above). The unpacked partition images are fed back by role: boot and recovery directly, the rest through
-     * [handle] so the usual content probes classify them. (Adapted from AEmulator-Plus.)
+     * LG KDZ / DZ / TOT / BIN and the HTC containers via [FirmwareToolset] (only those two families are routed here;
+     * the toolset's other formats stay with the routes above). The unpacked partition images are fed back by role:
+     * boot and recovery directly, the rest through [handle] so the usual content probes classify them.
+     * (Adapted from AEmulator-Plus.)
      */
-    private fun importLgToolset(src: RandomSource, name: String, depth: Int) {
+    private fun importToolsetExtract(src: RandomSource, name: String, depth: Int) {
         if (depth >= MAX_DEPTH) throw IOException("archive nested too deeply")
         val f = spill(streamOf(src), name)
-        val work = File(tmp, "lg-${System.nanoTime()}").apply { mkdirs() }
+        val work = File(tmp, "fw-${System.nanoTime()}").apply { mkdirs() }
         try {
             onProgress("Reading $name", -1f)
             val artifacts = try {
                 FirmwareToolset.extract(f, work, FirmwareToolset.DEFAULT_WANT) { msg -> log(msg) }
-            } catch (e: IOException) { throw e } catch (e: Exception) { throw IOException(e.message ?: "LG firmware unpack failed", e) }
+            } catch (e: IOException) { throw e } catch (e: Exception) { throw IOException(e.message ?: "firmware unpack failed", e) }
             val usable = artifacts.filter { it.file.isFile }
             if (usable.isEmpty()) throw IOException("unknown file format \"$name\"")
             for (a in usable) {
@@ -1101,7 +1105,7 @@ class Importer(
                         if (a.file.length() < 64_000_000) recovery = readAllFrom(FileSource(a.file))
                     base.startsWith("vendor") -> runCatching { importImage(FileSource(a.file), "vendor") }
                     base.contains("product") || base.contains("system_ext") || base.contains("odm") ||
-                        base.contains("modem") || base.contains("oem") -> log("lg: skipped ${a.file.name}")
+                        base.contains("modem") || base.contains("oem") -> log("fw: skipped ${a.file.name}")
                     else -> handle(FileSource(a.file), a.file.name, depth + 1)
                 }
             }
