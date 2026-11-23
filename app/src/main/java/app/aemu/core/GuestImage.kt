@@ -67,6 +67,12 @@ data class VmSettings(
     val vibration: Boolean = true,
     /** ro.hardware given to the guest at launch; blank = whatever the firmware defines (AEmulator Plus) */
     val hardware: String = "",
+    /**
+     * Radio technology the fake modem reports (a NetworkType value: 2G … LTE). Default UMTS —
+     * the value this fork's modem always reported before the setting existed (AEmulator Plus's
+     * own default is EDGE; the field and picker are theirs).
+     */
+    val networkType: Int = NetworkType.UMTS,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -81,6 +87,7 @@ data class VmSettings(
         .put("hostBattery", hostBattery)
         .put("vibration", vibration)
         .put("hardware", hardware)
+        .put("networkType", networkType)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -147,6 +154,7 @@ data class VmSettings(
                 hostBattery = o.optBoolean("hostBattery", true),
                 vibration = o.optBoolean("vibration", true),
                 hardware = cleanHardware(o.optString("hardware", "")),
+                networkType = NetworkType.normalize(o.optInt("networkType", NetworkType.UMTS)),
             )
         }
     }

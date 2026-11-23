@@ -33,7 +33,11 @@ class RilStub(
     /** operator identity from the image settings; blank = the generic test-network identity */
     private val operatorNameSetting: String = "",
     private val operatorNumericSetting: String = "",
+    /** radio technology from the image settings (a NetworkType value); UMTS = what this modem always reported */
+    networkTypeSetting: Int = NetworkType.UMTS,
 ) {
+    /** technology of the registration state and of RIL_REQUEST_VOICE_RADIO_TECH, sanitized for this firmware's API level */
+    @Volatile var networkType: Int = NetworkType.sanitize(networkTypeSetting, api)
     @Volatile var answered = 0L
         private set
 
@@ -204,8 +208,8 @@ class RilStub(
             RIL_REQUEST_LAST_CALL_FAIL_CAUSE -> 0 to ints(16)   // normal clearing
             RIL_REQUEST_GET_IMSI -> 0 to str(mcc + mnc + "0123456789".take(15 - mcc.length - mnc.length))
             RIL_REQUEST_SIGNAL_STRENGTH -> 0 to ints(20, 99, -1, -1, -1, -1, -1, 99, -1, -1, -1, -1, -1)
-            RIL_REQUEST_VOICE_REGISTRATION_STATE -> 0 to strs("1", "0001", "00000001", "3")
-            RIL_REQUEST_DATA_REGISTRATION_STATE -> 0 to strs("1", "0001", "00000001", "3", "0", "1")
+            RIL_REQUEST_VOICE_REGISTRATION_STATE -> 0 to strs("1", "0001", "00000001", networkType.toString())
+            RIL_REQUEST_DATA_REGISTRATION_STATE -> 0 to strs("1", "0001", "00000001", networkType.toString(), "0", "1")
             RIL_REQUEST_OPERATOR -> 0 to strs(operatorName, operatorName, operatorNumeric)
             RIL_REQUEST_SETUP_DATA_CALL -> 0 to dataCall(single = true)
             RIL_REQUEST_DATA_CALL_LIST -> 0 to dataCall(single = false)
@@ -216,7 +220,7 @@ class RilStub(
             RIL_REQUEST_QUERY_NETWORK_SELECTION_MODE -> 0 to ints(0)
             RIL_REQUEST_GET_PREFERRED_NETWORK_TYPE -> 0 to ints(0)
             RIL_REQUEST_GET_NEIGHBORING_CELL_IDS -> 0 to le(0)
-            RIL_REQUEST_VOICE_RADIO_TECH -> 0 to ints(3)
+            RIL_REQUEST_VOICE_RADIO_TECH -> 0 to ints(networkType)
             RIL_REQUEST_GET_SMSC_ADDRESS -> 0 to str("+10000000000")
             RIL_REQUEST_QUERY_FACILITY_LOCK -> 0 to ints(0)
             RIL_REQUEST_SEND_SMS, RIL_REQUEST_SEND_SMS_EXPECT_MORE -> 0 to (le(1) + str(null) + le(-1))

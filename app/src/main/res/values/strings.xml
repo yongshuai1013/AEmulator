@@ -123,6 +123,8 @@
     <string name="vs_operator_name">Operator name (custom)</string>
     <string name="vs_operator_numeric">Operator code MCC+MNC (custom)</string>
     <string name="vs_operator_reset">Reset to default</string>
+    <string name="vs_network">Reported network</string>
+    <string name="vs_network_sub">What the status bar shows: 2G to LTE. Applies at the next boot</string>
     <string name="vs_advanced">Advanced</string>
     <string name="vs_qemu_args">Extra qemu options</string>
     <string name="vs_qemu_args_sub">Example: -d unimp DHD_TBFLUSH=2 (NAME=value becomes an environment variable)</string>

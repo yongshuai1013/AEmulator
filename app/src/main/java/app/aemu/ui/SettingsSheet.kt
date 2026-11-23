@@ -48,6 +48,7 @@ import app.aemu.core.CarrierPresets
 import app.aemu.core.CpuInfo
 import app.aemu.core.Engine
 import app.aemu.core.GuestImage
+import app.aemu.core.NetworkType
 import app.aemu.core.VmSettings
 
 private data class Res(val label: String, val w: Int, val h: Int, val dpi: Int)
@@ -140,6 +141,7 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
                     TextButton(onClick = { s = s.copy(imei = VmSettings.randomImei()) }) { Text(stringResource(R.string.vs_random)) }
                 }
                 OperatorSection(s) { s = it }
+                NetworkTypePicker(s.networkType, img.api) { s = s.copy(networkType = it) }
             }
 
             Spacer(Modifier.height(8.dp))
@@ -237,6 +239,28 @@ private fun HardwarePicker(value: String, set: (String) -> Unit) {
             }
         }
     }
+}
+
+/** Radio technology the fake modem reports (2G … LTE); only the values the firmware's API level knows are offered. */
+@Composable
+private fun NetworkTypePicker(tech: Int, api: Int, set: (Int) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    ListItem(
+        headlineContent = { Text(stringResource(R.string.vs_network)) },
+        supportingContent = { Text(stringResource(R.string.vs_network_sub)) },
+        trailingContent = {
+            Box {
+                TextButton(onClick = { open = true }) { Text(NetworkType.label(NetworkType.sanitize(tech, api))) }
+                DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                    NetworkType.available(api).forEach { e ->
+                        DropdownMenuItem(text = { Text(e.label) }, onClick = { open = false; set(e.tech) })
+                    }
+                }
+            }
+        },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        modifier = Modifier.fillMaxWidth(),
+    )
 }
 
 /** Which buttons the bar has (tap to add or remove; added ones go to the end) and how big it is. */
