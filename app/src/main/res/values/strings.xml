@@ -128,6 +128,8 @@
     <string name="vs_qemu_args_sub">Example: -d unimp DHD_TBFLUSH=2 (NAME=value becomes an environment variable)</string>
     <string name="vs_kernel">Linux kernel version</string>
     <string name="vs_kernel_sub">The banner from the firmware\'s own kernel: shown in /proc/version and reported by uname. Clear it to turn this off. Applies at the next boot</string>
+    <string name="vs_host_battery">Use host battery status</string>
+    <string name="vs_host_battery_sub">Sets the battery status of the VM to your device\'s battery level and charging state.</string>
     <string name="vs_baseband">Baseband version</string>
     <string name="vs_baseband_sub">The modem firmware version the guest sees in About phone. Effective now: %1$s. Clear it to fall back to the factory package\'s version. Applies at the next boot</string>
     <string name="m_power_menu">Power menu</string>

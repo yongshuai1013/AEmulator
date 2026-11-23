@@ -61,6 +61,8 @@ data class VmSettings(
      * Takes effect at the next boot.
      */
     val basebandOverride: String = "",
+    /** the guest's battery follows the phone's real level and charging state (AEmulator Plus) */
+    val hostBattery: Boolean = true,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("width", width).put("height", height).put("density", density)
@@ -72,6 +74,7 @@ data class VmSettings(
         .put("kernelBanner", kernelBanner)
         .put("operatorName", operatorName).put("operatorNumeric", operatorNumeric)
         .put("basebandOverride", basebandOverride)
+        .put("hostBattery", hostBattery)
 
     companion object {
         const val NAV_DEFAULT = "back,home,recents,menu"
@@ -127,6 +130,7 @@ data class VmSettings(
                 operatorName = o.optString("operatorName", ""),
                 operatorNumeric = o.optString("operatorNumeric", ""),
                 basebandOverride = o.optString("basebandOverride", ""),
+                hostBattery = o.optBoolean("hostBattery", true),
             )
         }
     }

@@ -114,6 +114,17 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     val mic = AudioIn(ctx, paths.root, ::log)
     /** the phone's cameras for the guest (camera HAL → /dev/socket/aemu_cam) */
     val camera = CameraFeed(ctx, paths, ::log)
+    /** the guest's battery follows the phone's real one (AEmulator Plus): sysfs nodes in the tree,
+     *  kept current by a receiver, plus `dumpsys battery set` once the system is up */
+    private val battery = HostBatteryBridge(ctx, paths.root, img.api, settings.hostBattery,
+        { everBooted && state == State.RUNNING && !stopping && !recoveryMode },
+        { zygoteRestarts }, { command ->
+            val result = guestRunner.run(listOf("/system/bin/sh", "-c", command), 4_000)
+            check(result.first == 0) { "Guest battery update failed: ${result.first}" }
+        }, ::log)
+    @Volatile private var hostBatteryDefault = settings.hostBattery
+    fun setHostBatteryFollowing(enabled: Boolean) { hostBatteryDefault = enabled; battery.setFollowing(enabled) }
+    val hostBatteryFollowing get() = battery.following
     @Volatile private var lmk: GuestLmk? = null
     val net = NetProxy(ctx, paths, ::log)
     private val dns = DnsProxy(paths, img.api, img.engine == Engine.N64 && Kernel64.forApi(img.api).dnsLayoutProbe, ::log)
@@ -584,6 +595,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         sensors.start()
         mic.start()
         camera.start()
+        battery.start()
         if (img.api >= 21) logd.start()
         if (img.api >= 14) runCatching { dns.ensure() }
         // the RAM the guest is told it has (its /proc/meminfo, scaled by the kernel): the framework sizes its background by it
@@ -1337,6 +1349,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         log("stop: begin sensorsStop"); sensors.stop(); log("stop: done sensorsStop")
         log("stop: begin micStop"); mic.stop(); log("stop: done micStop")
         log("stop: begin cameraStop"); camera.stop(); log("stop: done cameraStop")
+        log("stop: begin batteryStop"); battery.stop(); log("stop: done batteryStop")
         log("stop: begin GlHostStop"); GlHost.stop(); log("stop: done GlHostStop")
         extraStubs.forEachIndexed { i, s -> log("stop: begin extraStub[$i]Stop"); s.stop(); log("stop: done extraStub[$i]Stop") }; extraStubs.clear()
         log("stop: begin lmkStop"); lmk?.stop(); lmk = null; log("stop: done lmkStop")
