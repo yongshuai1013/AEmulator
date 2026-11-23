@@ -91,7 +91,8 @@ android {
         }
     }
 
-    sourceSets["main"].assets.setSrcDirs(listOf(engineOut))
+    // skinAssets/skins: the device skin themes bundled with the app (AEmulator-Plus #32, see VmThemes.skins)
+    sourceSets["main"].assets.setSrcDirs(listOf(engineOut, file("src/main/skinAssets")))
 
     packaging {
         // исполняемые файлы движка лежат как lib*.so и должны распаковываться на диск
