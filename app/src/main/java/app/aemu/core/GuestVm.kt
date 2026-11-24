@@ -163,6 +163,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     @Volatile private var lmk: GuestLmk? = null
     val net = NetProxy(ctx, paths, ::log)
     private val dns = DnsProxy(paths, img.api, img.engine == Engine.N64 && Kernel64.forApi(img.api).dnsLayoutProbe, ::log)
+    private val vpnHub = VpnHub(paths, ::log)
     val runner by lazy { GuestRunner(paths, img) }
 
     private val extraStubs = ArrayList<VoldStub>()
@@ -668,6 +669,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         if (engine == Engine.N64) StorageSpoof.writeNode(paths.root, s.storageGb)
         if (img.api >= 21) logd.start()
         if (img.api >= 14) runCatching { dns.ensure() }
+        if (img.engine == Engine.N64 && img.api == 23) runCatching { vpnHub.ensure() }
         // the RAM the guest is told it has (its /proc/meminfo, scaled by the kernel): the framework sizes its background by it
         if (engine == Engine.N64) runCatching {
             val f = File(paths.root, "dev/.aemu-ram")
@@ -1426,6 +1428,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 Thread.sleep(3000)
                 if (power.length() > 0) { val v = runCatching { power.readText().trim() }.getOrDefault("reboot"); power.writeText(""); powerRequest(v) }
                 if (img.api >= 14) runCatching { dns.ensure() }
+                if (img.engine == Engine.N64 && img.api == 23) runCatching { vpnHub.ensure() }
                 val dead = synchronized(procs) { procs.filter { !it.value.isAlive }.keys.toList() }
                 for (name in dead) {
                     if (stopping) break
@@ -1616,6 +1619,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         log("stop: begin audioStop"); audio.stop(); log("stop: done audioStop")
         log("stop: begin netStop"); net.stop(); log("stop: done netStop")
         log("stop: begin dnsStop"); dns.stop(); log("stop: done dnsStop")
+        log("stop: begin vpnHubStop"); vpnHub.stop(); log("stop: done vpnHubStop")
         log("stop: begin eventsStop"); events.stop(); log("stop: done eventsStop")
         log("stop: begin logdStop"); logd.stop(); log("stop: done logdStop")
         log("stop: begin lightsStop"); lights.stop(); log("stop: done lightsStop")
