@@ -7,6 +7,8 @@ import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
@@ -147,6 +149,29 @@ public final class ManagerActivity extends Activity {
         setContentView(root);
         showPanel("status");
         connect();
+    }
+
+    // The title bar's own overflow — the ⋮ the system draws at the right end of the bar, in the same row
+    // as the icon and the title: the same two jumps the bottom buttons make. The bottom buttons stay;
+    // these are the same doors hung on the bar, for screens where the page's bottom is out of reach.
+    @Override public boolean onCreateOptionsMenu(Menu menu) {
+        menu.add(Menu.NONE, 1, Menu.NONE, "VPN 測試（控制面）")
+            .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
+        menu.add(Menu.NONE, 2, Menu.NONE, "Import inbox")
+            .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
+        return true;
+    }
+
+    @Override public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == 1) {
+            startActivity(new Intent(this, VpnTestActivity.class));
+            return true;
+        }
+        if (item.getItemId() == 2) {
+            startActivity(new Intent(this, InboxActivity.class));
+            return true;
+        }
+        return super.onOptionsItemSelected(item);
     }
 
     private Button tab(LinearLayout parent, String label) {
