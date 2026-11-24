@@ -1179,6 +1179,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             bootDoneAt = System.currentTimeMillis()
             everBooted = true
             log("★ system booted in ${(bootDoneAt - bootAt) / 1000} s")
+            // second mode dump: against the "fixup" one it shows whether the widening
+            // survived the boot (owners-key-measure Q2-f)
+            TreeFixer(ctx, paths, img, ::log).dumpModes("booted")
             setState(State.RUNNING)
             Thread { magiskBootComplete() }.start()
             Thread { agentBootComplete() }.start()

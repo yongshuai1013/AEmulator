@@ -147,6 +147,7 @@ class TreeFixer(
         keyLayout()
         for (n in LOGS) File(root, "dev/log/$n").let { if (!it.isFile) { it.parentFile?.mkdirs(); it.createNewFile() } }
         makeFb()
+        dumpModes("fixup")
     }
 
     /**
@@ -1814,10 +1815,15 @@ class TreeFixer(
                 val uid = Regex("\\suserId=\"(\\d+)\"").find(tag)?.groupValues?.get(1)?.toIntOrNull()
                     ?: Regex("\\ssharedUserId=\"([^\"]+)\"").find(tag)?.groupValues?.get(1)
                         ?.let { it.toIntOrNull() ?: sharedUsers[it] }
-                    ?: continue
+                // Per-package visit list (measurement, owners-key-measure Q2-f): the totals
+                // alone could not prove the walk reached a given package's subtree, so every
+                // package is accounted for by name — resolved uid or the reason it was skipped,
+                // and the rows its walk produced. Logging only; the walk itself is unchanged.
+                if (uid == null) { log("owners pkg: $name skipped (no uid)"); continue }
                 val d = File(dataDir, name)
-                if (!d.isDirectory) continue
+                if (!d.isDirectory) { log("owners pkg: $name uid=$uid skipped (no data dir)"); continue }
                 pkgs++
+                var rows = 0
                 val todo = ArrayDeque<File>().apply { add(d) }
                 while (todo.isNotEmpty()) {
                     val f = todo.removeFirst()
@@ -1829,8 +1835,10 @@ class TreeFixer(
                     val st = runCatching { Os.lstat(f.absolutePath) }.getOrNull() ?: continue
                     val key = String.format("%016x %016x", st.st_dev, st.st_ino)
                     fresh[key] = String.format("%08x %08x", uid, uid)
+                    rows++
                     if (!OsConstants.S_ISLNK(st.st_mode) && f.isDirectory) f.listFiles()?.forEach { todo.add(it) }
                 }
+                log("owners pkg: $name uid=$uid entries=$rows")
             }
             // Rows the walk does not own survive the rewrite. The old table is append-only
             // with last-row-wins reads, so a later old row replaces an earlier one here too.
@@ -1851,6 +1859,38 @@ class TreeFixer(
             File(root, "dhd.owners.seeded").delete()
             log("file owners restored: $pkgs packages, ${kept.size + fresh.size} entries")
         }.onFailure { log("owners: ${it.message}") }
+    }
+
+    /**
+     * Measurement only (owners-key-measure Q2-f): dump the host-true lstat of the three
+     * database packages whose guest opens keep failing with EACCES. The owners table
+     * provably does not gate open() — the host kernel judges the real mode bits — so the
+     * walk's chmod widening is the only thing standing between those packages and the
+     * kernel, and their constant failure has exactly two shapes left: the widening never
+     * reached the subtree (the "fixup" dump is already narrow) or something narrowed it
+     * again during the boot (fixup wide, "booted" narrow). Comparing the two dumps
+     * decides; guest-side `ls -l` is forged and cannot serve. Read-only: lstat + log.
+     */
+    fun dumpModes(tag: String) {
+        val dataDir = File(root, "data/data")
+        for (pkg in MODE_DUMP_PKGS) {
+            val base = File(dataDir, pkg)
+            if (!base.isDirectory) { log("modedump[$tag] $pkg: no data dir"); continue }
+            var n = 0
+            val todo = ArrayDeque<File>().apply { add(base) }
+            while (todo.isNotEmpty()) {
+                val f = todo.removeFirst()
+                val st = runCatching { Os.lstat(f.absolutePath) }.getOrNull() ?: continue
+                if (n < MODE_DUMP_MAX) {
+                    val rel = f.relativeTo(base).path.ifEmpty { "." }
+                    log(String.format("modedump[%s] %s/%s mode=%06o dev=%016x ino=%016x", tag, pkg, rel, st.st_mode, st.st_dev, st.st_ino))
+                }
+                n++
+                if (!OsConstants.S_ISLNK(st.st_mode) && f.isDirectory) f.listFiles()?.forEach { todo.add(it) }
+            }
+            if (n > MODE_DUMP_MAX) log("modedump[$tag] $pkg: $n nodes, truncated at $MODE_DUMP_MAX")
+            else log("modedump[$tag] $pkg: $n nodes")
+        }
     }
 
     /** Пропустить миграцию PRE_BOOT_COMPLETED (4.x): под эмуляцией она занимает минуты. */
@@ -2164,6 +2204,9 @@ class TreeFixer(
 
     companion object {
         private const val OPEN_GL = "engines/kk/libGLES_aemu.so"
+        /** dumpModes targets: the database packages whose guest opens fail with EACCES (owners-key-measure Q2-f). */
+        private val MODE_DUMP_PKGS = listOf("com.android.providers.calendar", "com.google.android.gsf", "com.android.providers.media")
+        private const val MODE_DUMP_MAX = 120
         /** Мастера первого запуска: Samsung, Google, AOSP, MIUI, HTC, Sony */
         val SETUP_WIZARDS = listOf(
             "com.sec.android.app.SecSetupWizard", "com.google.android.setupwizard", "com.android.provision",
