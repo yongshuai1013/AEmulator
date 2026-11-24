@@ -465,7 +465,8 @@ static long input_ioctl(u32 cmd, u64 arg) {
 static struct {
     int live;
     int fd;                 // the guest's descriptor, in this process
-    int peer;               // the channel endpoint
+    int peer;               // the channel endpoint (-1 once the hub holds it)
+    int hubbed;             // M2: the channel endpoint was handed to the VpnHub (see the hub section)
     int granted;            // interface flags granted at TUNSETIFF (IFF_TUN | IFF_NO_PI)
     int up;                 // SIOCSIFFLAGS last said IFF_UP
     int mtu;
@@ -487,7 +488,7 @@ static long tun_chan_write(int s, const char *buf, u64 len) { return S3(NR_write
 static void tun_drain(void) {
     char buf[2048];
     for (int s = 0; s < MAX_TUN; s++) {
-        if (!g_tun[s].live) continue;
+        if (!g_tun[s].live || g_tun[s].hubbed) continue;   // a hubbed channel has exactly one reader: the hub
         for (;;) {
             long n = tun_chan_read(s, buf, sizeof buf);
             if (n > 0) { g_tun[s].pkts++; g_tun[s].bytes += (u64)n; continue; }
@@ -510,6 +511,11 @@ static void tun_drain(void) {
     }
 }
 
+// The hub section below takes the channel over at open and hears about the session's shape.
+static void tun_hub_handoff(int s);
+static void hub_session_cfg(int s);
+static void hub_session_up(int s);
+
 static long tun_open(long flags) {
     if (g_tun_live) tun_drain();                    // reap before allocating
     int s = -1;
@@ -526,7 +532,9 @@ static long tun_open(long flags) {
     g_tun[s].mtu = 1500;
     g_tun[s].index = 61 + s;
     g_tun_live++;
-    say("aemu-tun: /dev/tun opened (M1 control plane: establish works, traffic does not enter the tunnel yet)");
+    tun_hub_handoff(s);
+    say(g_tun[s].hubbed ? "aemu-tun: /dev/tun opened (M2: the hub holds the channel; detoured traffic will enter the tunnel)"
+                        : "aemu-tun: /dev/tun opened (M1 control plane: establish works, traffic does not enter the tunnel yet)");
     return sv[0];
 }
 
@@ -562,6 +570,7 @@ static long tun_ioctl(int fd, u32 cmd, u64 arg) {
         tun_cat(line, &o, g_tun[s].name);
         tun_cat(line, &o, " allocated (TUNSETIFF)");
         say(line);
+        hub_session_cfg(s);
         return 0;
     }
     case 0x800454d2:                                // TUNGETIFF
@@ -595,7 +604,7 @@ static int tun_sioc(u32 cmd, u64 arg, long *out) {
     case 0x8922: g_tun[s].mtu = *(int *)(ifr + 16); *out = 0; return 1;                     // SIOCSIFMTU
     case 0x8921: *(int *)(ifr + 16) = g_tun[s].mtu; *out = 0; return 1;                     // SIOCGIFMTU
     case 0x8933: *(int *)(ifr + 16) = g_tun[s].index; *out = 0; return 1;                   // SIOGIFINDEX
-    case 0x8916: g_tun[s].addr = *(u32 *)(ifr + 20); *out = 0; return 1;                    // SIOCSIFADDR
+    case 0x8916: g_tun[s].addr = *(u32 *)(ifr + 20); hub_session_up(s); *out = 0; return 1;   // SIOCSIFADDR: the address is what makes the session real
     case 0x891c: g_tun[s].mask = *(u32 *)(ifr + 20); *out = 0; return 1;                    // SIOCSIFNETMASK
     case 0x8915:                                                                            // SIOCGIFADDR
         if (!g_tun[s].addr) { *out = -99; return 1; }                                       /* EADDRNOTAVAIL */
@@ -605,6 +614,417 @@ static int tun_sioc(u32 cmd, u64 arg, long *out) {
         memset(ifr + 16, 0, 16); *(u16 *)(ifr + 16) = 2; *(u32 *)(ifr + 20) = g_tun[s].mask; *out = 0; return 1;
     }
     return 0;
+}
+
+
+// ---------------------------------------------------------------------------------------------------- vpn hub (M2)
+
+// The data plane of the VPN completion. A resident piece of the host app, the VpnHub, holds what a
+// per-process supervisor cannot: the tun channel endpoint of the session (handed over at open, see
+// tun_open), the host ends of the guest connections that are detoured into the tunnel, and the
+// netlink listeners to whom the interface's birth and death are announced (a synthesised interface
+// has no kernel to announce it; without the announcement the framework never learns that a session
+// ended — the M1 test page's Stop button proved that). Every supervisor process keeps one lazily
+// opened connection to the hub and a cached copy of the session state; the connect trap is the
+// only place the cache is consulted, so with no session up — or no hub — a guest program's calls
+// take exactly the path they took before M2 (fail-open, down to the M1 local drain at worst).
+//
+// Wire protocol (filesystem unix stream at <root>/dev/socket/aemu_vpnhub): a frame is a u32 LE
+// length (counting the type byte and the payload, not itself), a u8 type, then the payload. The
+// frames that carry a descriptor (TUN_PEER, FLOW_FD, LINKREG) attach it with SCM_RIGHTS to the
+// same sendmsg. IP addresses in payloads are u32 with the first octet in the most significant
+// byte; ports are host-order u16.
+enum {
+    HUB_HELLO = 1,          // -> (empty)
+    HUB_SESSION_STATE = 2,  // <- u8 up, char name[16], u32 addr, u32 mtu, i32 exempt uid
+    HUB_TUN_PEER = 3,       // -> (empty) + fd: the channel endpoint of a fresh /dev/tun
+    HUB_PEER_OK = 4,        // <-
+    HUB_SESSION_CFG = 5,    // -> char name[16], u32 index, u32 mtu
+    HUB_SESSION_UP = 6,     // -> char name[16], u32 index, u32 addr, u32 mtu
+    HUB_SESSION_DOWN = 7,   // <- char name[16]  (broadcast: the channel ran dry, the session is over)
+    HUB_FLOW_NEW = 8,       // -> u32 uid, u32 dst ip, u16 dst port, u16 src port (0 = unbound)
+    HUB_FLOW_OK = 9,        // <- u32 flow id
+    HUB_FLOW_NO = 10,       // <-
+    HUB_FLOW_FD = 11,       // -> u32 flow id + fd: the host end of the detoured connection
+    HUB_LINKREG = 12,       // -> (empty) + fd: a netlink listener's peer, to be told about the interface
+    HUB_LINKREG_OK = 13,    // <- u32 listener id
+    HUB_LINKUNREG = 14,     // -> u32 listener id
+};
+
+static int g_hub_fd = -1;
+static int g_hub_pid;                       // the connection belongs to one process; a fork reconnects
+static struct { int up; char name[16]; u32 addr; u32 mtu; int exempt; } g_hub_sess;
+static volatile int g_hub_lock;
+static int g_hub_logged;                    // per process: the detour was announced, a refusal was announced
+
+static void hub_lock(void) { while (__atomic_exchange_n(&g_hub_lock, 1, __ATOMIC_ACQUIRE)) S0(NR_sched_yield); }
+static int hub_trylock(void) { return __atomic_exchange_n(&g_hub_lock, 1, __ATOMIC_ACQUIRE) == 0; }
+static void hub_unlock(void) { __atomic_store_n(&g_hub_lock, 0, __ATOMIC_RELEASE); }
+
+static void hub_log1(const char *a, const char *b) { say("aemu-vpn: "); say(a); say(b); say("\n"); }
+
+
+// ---- hub wire io (the lock is held by the caller, except in hub_pump, which takes it itself)
+
+#define NR_ppoll 73
+struct hub_pollfd { int fd; short ev, rev; };
+struct hub_ts { i64 sec, nsec; };
+
+static int hub_readable(int fd, int ms) {
+    struct hub_pollfd p = { fd, 1 /*POLLIN*/, 0 };
+    struct hub_ts ts = { ms / 1000, (i64)(ms % 1000) * 1000000 };
+    long r = S5(NR_ppoll, &p, 1, &ts, 0, 0);
+    return r > 0 && (p.rev & (1 | 8 | 16));         // POLLIN | POLLERR | POLLHUP
+}
+
+static int hub_readn(int fd, u8 *buf, u64 n, int ms) {
+    u64 got = 0;
+    while (got < n) {
+        if (!hub_readable(fd, ms)) return -1;
+        long r = S3(NR_read, fd, buf + got, n - got);
+        if (r == -4) continue;                      // EINTR
+        if (r <= 0) return -1;
+        got += (u64)r;
+    }
+    return 0;
+}
+
+static int hub_writen(int fd, const u8 *buf, u64 n) {
+    u64 done = 0;
+    while (done < n) {
+        long r = S3(NR_write, fd, buf + done, n - done);
+        if (r == -4) continue;
+        if (r <= 0) return -1;
+        done += (u64)r;
+    }
+    return 0;
+}
+
+static int hub_send(u8 type, const void *pl, u64 plen, int fd) {
+    if (g_hub_fd < 0) return -1;
+    u8 hdr[5];
+    u32 len = (u32)(1 + plen);
+    hdr[0] = (u8)len; hdr[1] = (u8)(len >> 8); hdr[2] = (u8)(len >> 16); hdr[3] = (u8)(len >> 24);
+    hdr[4] = type;
+    struct iov v[2];
+    v[0].base = hdr; v[0].len = 5;
+    v[1].base = (void *)pl; v[1].len = plen;
+    struct { struct cmsg h; int f; } cm;
+    struct msgh mh;
+    memset(&mh, 0, sizeof mh);
+    mh.iov = v; mh.iovlen = plen ? 2 : 1;
+    if (fd >= 0) {
+        cm.h.len = sizeof cm.h + 4; cm.h.level = 1 /*SOL_SOCKET*/; cm.h.type = 1 /*SCM_RIGHTS*/; cm.f = fd;
+        mh.control = &cm; mh.controllen = (sizeof cm.h + 4 + 7) & ~7UL;
+    }
+    long r;
+    do r = S3(NR_sendmsg, g_hub_fd, &mh, 0x4000 /*MSG_NOSIGNAL*/); while (r == -4);
+    return r < 0 ? -1 : 0;
+}
+
+// One frame: 0 and the type/payload, or -1 (timeout, EOF, garbage). Payloads here are tiny.
+static int hub_recv(u8 *type, u8 *pl, u64 cap, u64 *plen, int ms) {
+    u8 hdr[5];
+    if (hub_readn(g_hub_fd, hdr, 5, ms) < 0) return -1;
+    u32 len = (u32)hdr[0] | ((u32)hdr[1] << 8) | ((u32)hdr[2] << 16) | ((u32)hdr[3] << 24);
+    if (len < 1 || len - 1 > cap) return -1;
+    *type = hdr[4];
+    *plen = len - 1;
+    if (len > 1 && hub_readn(g_hub_fd, pl, len - 1, ms) < 0) return -1;
+    return 0;
+}
+
+static void hub_put32(u8 *p, u32 v) { p[0] = (u8)v; p[1] = (u8)(v >> 8); p[2] = (u8)(v >> 16); p[3] = (u8)(v >> 24); }
+static u32 hub_get32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+static void hub_put16(u8 *p, u32 v) { p[0] = (u8)v; p[1] = (u8)(v >> 8); }
+
+
+// ---- hub state keeping
+
+// A session the hub reports over is over here too: drop the registry entry, so the by-name ioctls
+// stop answering for it. That is what lets the framework's own teardown check (its SIOCGIFFLAGS
+// probe of the interface) read "gone" and finish the disconnect the guest asked for.
+static void hub_session_gone(const char *name) {
+    for (int s = 0; s < MAX_TUN; s++) {
+        if (g_tun[s].live && g_tun[s].name[0] && seq(g_tun[s].name, name)) {
+            if (g_tun[s].peer >= 0) S1(NR_close, g_tun[s].peer);
+            g_tun[s].live = 0;
+            g_tun[s].hubbed = 0;
+            g_tun_live--;
+            char line[96]; u64 o = 0;
+            tun_cat(line, &o, "aemu-vpn: session ");
+            tun_cat(line, &o, name);
+            tun_cat(line, &o, " registry cleared (the hub reported the channel closed)");
+            say(line);
+        }
+    }
+    if (g_hub_sess.up && seq(g_hub_sess.name, name)) g_hub_sess.up = 0;
+}
+
+static void hub_handle(u8 type, const u8 *pl, u64 len) {
+    if (type == HUB_SESSION_STATE && len >= 29) {
+        g_hub_sess.up = pl[0] != 0;
+        memcpy(g_hub_sess.name, pl + 1, 16); g_hub_sess.name[15] = 0;
+        g_hub_sess.addr = hub_get32(pl + 17);
+        g_hub_sess.mtu = hub_get32(pl + 21);
+        g_hub_sess.exempt = (int)hub_get32(pl + 25);
+    } else if (type == HUB_SESSION_DOWN && len >= 16) {
+        char name[16];
+        memcpy(name, pl, 16); name[15] = 0;
+        hub_session_gone(name);
+    }
+}
+
+// The hub went away (its socket closed under us): nothing it held can still be true, least of all
+// a session the framework would go on believing in. Clear the hubbed registry entries with it.
+static void hub_dead(void) {
+    if (g_hub_fd >= 0) S1(NR_close, g_hub_fd);
+    g_hub_fd = -1;
+    g_hub_sess.up = 0;
+    for (int s = 0; s < MAX_TUN; s++) {
+        if (g_tun[s].live && g_tun[s].hubbed) {
+            g_tun[s].live = 0;
+            g_tun[s].hubbed = 0;
+            g_tun_live--;
+            hub_log1("hub connection lost; session ", g_tun[s].name);
+        }
+    }
+}
+
+// Drain whatever the hub sent, without ever blocking: called at every trap entry, it is how a
+// SESSION_DOWN reaches the supervisor that owns the registry (system_server) between two calls.
+static void hub_pump(void) {
+    if (g_hub_fd < 0 || g_hub_pid != (int)S0(NR_getpid)) return;
+    if (!hub_trylock()) return;
+    for (int i = 0; i < 16; i++) {
+        if (!hub_readable(g_hub_fd, 0)) break;
+        u8 type, pl[64]; u64 len = 0;
+        if (hub_recv(&type, pl, sizeof pl, &len, 100) < 0) { hub_dead(); break; }
+        hub_handle(type, pl, len);
+    }
+    hub_unlock();
+}
+
+// Wait for one frame type, handling the others on the way; the wanted frame's payload is copied
+// to the caller's buffer (and, for a session state, handled as well). The lock is held by the caller.
+static int hub_wait(u8 want, int ms, u8 *out, u64 cap, u64 *outlen) {
+    for (int i = 0; i < 32; i++) {
+        u8 type, pl[64]; u64 len = 0;
+        if (hub_recv(&type, pl, sizeof pl, &len, ms) < 0) return -1;
+        if (type == want) {
+            if (want == HUB_SESSION_STATE) hub_handle(type, pl, len);
+            if (out && len <= cap) { memcpy(out, pl, len); *outlen = len; }
+            return 0;
+        }
+        hub_handle(type, pl, len);
+    }
+    return -1;
+}
+
+// Connect (once per process) and learn the current session state. -1: no hub — the caller falls
+// back to the pre-M2 path, unchanged.
+static int hub_ensure(void) {
+    int me = (int)S0(NR_getpid);
+    if (g_hub_fd >= 0 && g_hub_pid == me) return 0;
+    hub_lock();
+    if (g_hub_fd >= 0 && g_hub_pid == me) { hub_unlock(); return 0; }
+    if (g_hub_fd >= 0) { S1(NR_close, g_hub_fd); g_hub_fd = -1; }   // inherited from the parent: not ours
+    long s = S3(NR_socket, 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0);
+    if (s < 0) { hub_unlock(); return -1; }
+    char path[600];
+    memcpy(path, g_root, g_rootlen);
+    memcpy(path + g_rootlen, "/dev/socket/aemu_vpnhub", 24);
+    struct sockaddr_un sa;
+    sa.family = 1;
+    memcpy(sa.path, path, g_rootlen + 24);
+    if (S3(NR_connect, s, &sa, 2 + g_rootlen + 23) < 0) { S1(NR_close, s); hub_unlock(); return -1; }
+    g_hub_fd = (int)s;
+    g_hub_pid = me;
+    if (hub_send(HUB_HELLO, 0, 0, -1) == 0) { u8 pl[64]; u64 ln = 0; hub_wait(HUB_SESSION_STATE, 2000, pl, sizeof pl, &ln); }   // failure just leaves the cache empty
+    hub_unlock();
+    return 0;
+}
+
+
+// ---- what the tun section reports to the hub
+
+// At /dev/tun open: hand the channel endpoint over. If anything about it fails, the session
+// simply stays local — the M1 drain is the floor, never an error for the guest.
+static void tun_hub_handoff(int s) {
+    if (hub_ensure() < 0) { hub_log1("no hub at /dev/tun open; the channel stays with the supervisor (M1 behaviour)", ""); return; }
+    hub_lock();
+    int ok = hub_send(HUB_TUN_PEER, 0, 0, g_tun[s].peer) == 0 && hub_wait(HUB_PEER_OK, 2000, 0, 0, 0) == 0;
+    if (ok) {
+        S1(NR_close, g_tun[s].peer);
+        g_tun[s].peer = -1;
+        g_tun[s].hubbed = 1;
+        hub_log1("tun channel handed to the hub", "");
+    } else {
+        hub_log1("the hub did not take the tun channel; keeping the M1 local drain", "");
+    }
+    hub_unlock();
+}
+
+static void hub_session_cfg(int s) {
+    if (!g_tun[s].hubbed || hub_ensure() < 0) return;
+    u8 pl[24];
+    memset(pl, 0, sizeof pl);
+    memcpy(pl, g_tun[s].name, 16);
+    hub_put32(pl + 16, (u32)g_tun[s].index);
+    hub_put32(pl + 20, (u32)g_tun[s].mtu);
+    hub_lock();
+    hub_send(HUB_SESSION_CFG, pl, sizeof pl, -1);
+    hub_unlock();
+}
+
+// The address is what makes a session real (the framework sets it before it connects the agent):
+// only now does the hub call the session up, announce the interface and start detouring.
+static void hub_session_up(int s) {
+    if (!g_tun[s].hubbed || hub_ensure() < 0) return;
+    u8 pl[28];
+    memset(pl, 0, sizeof pl);
+    memcpy(pl, g_tun[s].name, 16);
+    hub_put32(pl + 16, (u32)g_tun[s].index);
+    u32 a = g_tun[s].addr;   // recorded from the ifreq in memory order: swap to first-octet-first
+    hub_put32(pl + 20, ((a & 0xff) << 24) | ((a & 0xff00) << 8) | ((a >> 8) & 0xff00) | ((a >> 24) & 0xff));
+    hub_put32(pl + 24, (u32)g_tun[s].mtu);
+    hub_lock();
+    hub_send(HUB_SESSION_UP, pl, sizeof pl, -1);
+    hub_unlock();
+    char line[96]; u64 o = 0;
+    tun_cat(line, &o, "aemu-vpn: session ");
+    tun_cat(line, &o, g_tun[s].name);
+    tun_cat(line, &o, " is up; guest connections will be detoured into the tunnel");
+    say(line);
+}
+
+// ---- the connect detour
+
+// Which of this process's descriptors are plain IPv4 stream sockets, and where they bound to.
+// Only those are detour candidates; everything else keeps the path it has always taken.
+#define MAX_SOCK 64
+static struct { int fd; int type; u16 port; } g_sock[MAX_SOCK];
+
+static void sock_track(int fd, int type) {
+    int free_i = -1;
+    for (int i = 0; i < MAX_SOCK; i++) {
+        if (g_sock[i].fd == fd) { g_sock[i].type = type; g_sock[i].port = 0; return; }
+        if (!g_sock[i].fd && free_i < 0) free_i = i;
+    }
+    if (free_i >= 0) { g_sock[free_i].fd = fd; g_sock[free_i].type = type; g_sock[free_i].port = 0; }
+}
+
+static int sock_find(int fd) { for (int i = 0; i < MAX_SOCK; i++) if (g_sock[i].fd == fd) return i; return -1; }
+
+static void sock_forget(int fd) { int i = sock_find(fd); if (i >= 0) g_sock[i].fd = 0; }
+
+static void sock_note_bind(int fd) {
+    int i = sock_find(fd);
+    if (i < 0) return;
+    u8 sa[32]; u32 sl = sizeof sa;
+    memset(sa, 0, sizeof sa);
+    if (S3(NR_getsockname, fd, sa, &sl) == 0 && sa[0] == 2) g_sock[i].port = (u16)(((u32)sa[2] << 8) | sa[3]);
+}
+
+
+// The detour itself. Returns 1 when the call is settled here (with *out as its result), 0 when
+// the caller should take the ordinary path — no session, an exempt uid, a hub that will not
+// answer, a refusal: every doubt resolves to the connection the guest would have had before M2.
+static int hub_maybe_detour(int fd, const u8 *sa, u64 salen, long *out) {
+    int si = sock_find(fd);
+    if (si < 0 || (g_sock[si].type & 0xff) != 1 /*SOCK_STREAM*/) return 0;
+    if (!sa || salen < 16 || sa[0] != 2 /*AF_INET*/) return 0;
+    if (hub_ensure() < 0) return 0;
+    hub_pump();
+    if (!g_hub_sess.up) return 0;
+    if (g_hub_sess.exempt >= 0 && g_uid == g_hub_sess.exempt) return 0;   // VpnService.protect(), on the supervisor's side
+
+    u8 req[12];
+    hub_put32(req, (u32)g_uid);
+    hub_put32(req + 4, ((u32)sa[4] << 24) | ((u32)sa[5] << 16) | ((u32)sa[6] << 8) | (u32)sa[7]);
+    hub_put16(req + 8, ((u32)sa[2] << 8) | (u32)sa[3]);
+    hub_put16(req + 10, g_sock[si].port);
+
+    hub_lock();
+    u32 flow = 0;
+    int ok = 0;
+    if (hub_send(HUB_FLOW_NEW, req, sizeof req, -1) == 0) {
+        u8 pl[64]; u64 ln = 0;
+        if (hub_wait(HUB_FLOW_OK, 2000, pl, sizeof pl, &ln) == 0 && ln >= 4) { flow = hub_get32(pl); ok = 1; }
+    }
+    if (!ok) {
+        hub_unlock();
+        if (!g_hub_logged) { g_hub_logged = 1; hub_log1("the hub refused a detour; connections stay direct", ""); }
+        return 0;
+    }
+    int sv[2];
+    if (S4(NR_socketpair, 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0, (long)sv) < 0) { hub_unlock(); return 0; }
+    u8 idpl[4];
+    hub_put32(idpl, flow);
+    if (hub_send(HUB_FLOW_FD, idpl, sizeof idpl, sv[1]) < 0) {
+        hub_unlock();
+        S1(NR_close, sv[0]);
+        S1(NR_close, sv[1]);
+        hub_log1("a detoured connection could not be handed to the hub; closing it rather than faking success", "");
+        *out = -111;   // ECONNREFUSED: the one failure that is reported as a failure
+        return 1;
+    }
+    hub_unlock();
+    // The guest's descriptor now names the socket pair: its reads, writes and polls are plain
+    // host calls on it from here on, and the hub's synthesizer reads the other end.
+    long r = S3(NR_dup3, sv[0], fd, (g_sock[si].type & 02000000) ? 02000000 /*O_CLOEXEC*/ : 0);
+    S1(NR_close, sv[0]);
+    S1(NR_close, sv[1]);
+    if (r < 0) { *out = r; return 1; }
+    if (!g_hub_logged) { g_hub_logged = 1; hub_log1("detouring guest connections into the tunnel (this process)", ""); }
+    *out = 0;
+    return 1;
+}
+
+// ---- netlink listeners (the stop fix's missing link)
+
+// A synthesised interface has no kernel to announce its death. The listeners that bind netlink
+// groups (netd above all) are registered with the hub, which writes the RTM_NEWLINK /
+// RTM_DELLINK events a real kernel would have produced; the rest of the teardown chain is the
+// guest's own stock code.
+#define MAX_LINKREG 16
+static struct { int fd; u32 id; } g_linkreg[MAX_LINKREG];
+
+static void hub_linkreg(int fd, const u8 *sa, u64 salen) {
+    if (!sa || salen < 12 || sa[0] != 16 /*AF_NETLINK*/) return;
+    u32 groups = hub_get32(sa + 8);
+    if (!groups) return;                       // a request socket, not a listener: no events for it
+    for (int i = 0; i < MAX_LINKREG; i++) if (g_linkreg[i].fd == fd) return;
+    int peer = nl_find_peer(fd);
+    if (peer < 0 || hub_ensure() < 0) return;
+    int dup = (int)S2(NR_dup, peer, 0);
+    if (dup < 0) return;
+    hub_lock();
+    u32 id = 0;
+    if (hub_send(HUB_LINKREG, 0, 0, dup) == 0) {
+        u8 pl[64]; u64 ln = 0;
+        if (hub_wait(HUB_LINKREG_OK, 2000, pl, sizeof pl, &ln) == 0 && ln >= 4) id = hub_get32(pl);
+    }
+    hub_unlock();
+    S1(NR_close, dup);
+    if (!id) return;
+    for (int i = 0; i < MAX_LINKREG; i++) if (!g_linkreg[i].fd) { g_linkreg[i].fd = fd; g_linkreg[i].id = id; return; }
+}
+
+static void hub_linkunreg(int fd) {
+    for (int i = 0; i < MAX_LINKREG; i++) {
+        if (g_linkreg[i].fd != fd) continue;
+        u32 id = g_linkreg[i].id;
+        g_linkreg[i].fd = 0;
+        if (hub_ensure() == 0) {
+            u8 pl[4];
+            hub_put32(pl, id);
+            hub_lock();
+            hub_send(HUB_LINKUNREG, pl, sizeof pl, -1);
+            hub_unlock();
+        }
+        return;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------- exec
@@ -744,6 +1164,7 @@ static long trap(long nr, long *a, void *uc) {
 static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     int err = 0;
     if (g_tun_live) tun_drain();
+    hub_pump();                    // the VPN hub's broadcasts (a session ending above all): a no-op with no hub connection
     switch (nr) {
     case NR_openat: {
         char *b1 = PB(0);
@@ -980,12 +1401,15 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         return (long)n;
     }
     case NR_bind: case NR_connect:
-        if (is_nl_fd((int)a[0])) return 0;
+        if (is_nl_fd((int)a[0])) { if (nr == NR_bind) hub_linkreg((int)a[0], (const u8 *)a[1], (u64)a[2]); return 0; }
         if (a[1] && *(u16 *)a[1] == 16) {           // a real netlink socket: binding to groups is not for an app
             long r = S3(nr, a[0], a[1], a[2]);
             return r < 0 && nr == NR_bind ? 0 : r;
         }
-        return unix_addr(nr, a[0], (const struct sockaddr_un *)a[1], (u64)a[2], PB(0));
+        if (nr == NR_connect) { long out; if (hub_maybe_detour((int)a[0], (const u8 *)a[1], (u64)a[2], &out)) return out; }
+        { long r = unix_addr(nr, a[0], (const struct sockaddr_un *)a[1], (u64)a[2], PB(0));
+          if (nr == NR_bind && r >= 0) sock_note_bind((int)a[0]);
+          return r; }
     case NR_getsockname: {
         long r = S3(nr, a[0], a[1], a[2]);
         if (r == 0 && a[1] && a[2] && *(u32 *)a[2] > 2) {
@@ -1014,11 +1438,13 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             if (S2(NR_fstat, a[1], &st) == 0 && st.st_ino == g_logino && st.st_dev == g_logdev &&
                 S2(NR_fstat, a[0], &st) == 0 && (st.st_mode & 0170000) == 0020000 && st.st_rdev == 0x103) return a[1];
         }
-        return S3(nr, a[0], a[1], a[2]);
+        { long r = S3(nr, a[0], a[1], a[2]); if (r >= 0) { sock_forget((int)a[1]); hub_linkunreg((int)a[1]); } return r; }
     }
     case NR_close: {
         if (is_nl_fd((int)a[0])) nl_close((int)a[0]);
         if (is_tun_fd((int)a[0])) say("aemu-tun: the framework closed its tun descriptor (the session ends when the channel runs dry)");
+        sock_forget((int)a[0]);
+        hub_linkunreg((int)a[0]);
         return S1(nr, a[0]);
     }
     case NR_execve:
@@ -1112,6 +1538,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
                 return sv[0];
             }
         }
+        if (r >= 0 && a[0] == 2) sock_track((int)r, (int)a[1]);   // the VPN detour keeps a table of plain IPv4 sockets
         return r;
     }
     case NR_setsockopt: {
