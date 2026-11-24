@@ -25,6 +25,15 @@ private val ALWAYS_RESTART = setOf("mediaserver", "installd", "netd", "keystore"
  * netd needs ~140 s of continuous life before it accepts; this finds the call it parks in. */
 private val NETD_STRACE = true
 
+/** Measurement build: also trace the zygote of translated (KK) guests — its translator carries
+ * system_server and every app process, so this is the only seat from which the contacts
+ * provider's own file calls (and its database open failing) can be seen; installd is traced too,
+ * for its /data/user/0 access (see SyscallPathTrace). The run/ markers live in the app sandbox,
+ * which the field phone cannot write, so — exactly as with NETD_STRACE — the measurement build
+ * turns this on by constant; run/strace.acore and run/strace.installd stay the switches in a
+ * build without it. */
+private val ACORE_STRACE = true
+
 /** Native arm64 engine: vendor daemons that only poll hardware the phone does not have (modem, DSP, TrustZone). */
 private val N64_SKIP = setOf("audiod", "ATFWD-daemon", "imsqmidaemon", "loc_launcher", "cnd", "dpmd", "cnss-daemon",
     "tftp_server", "qcom-system-daemon", "hvdcp_opti", "pm-service", "mtd", "mlipayd", "vsimd", "fdpp", "perfd", "ipacm",
@@ -938,8 +947,11 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         val argv = if (svc.name == "zygote" && !settings.jit && img.runtime == "dalvik")
             svc.argv.take(1) + "-Xint:fast" + svc.argv.drop(1) else svc.argv
         // отладка: файл run/strace.<служба> включает трассировку системных вызовов qemu
-        // measurement build: netd is traced unconditionally (NETD_STRACE), other services keep the marker
-        if (File(paths.bin, "strace.${svc.name}").exists() || (svc.name == "netd" && NETD_STRACE)) extra["QEMU_STRACE"] = "1"
+        // measurement build: netd is traced unconditionally (NETD_STRACE), other services keep the marker;
+        // ACORE_STRACE does the same for the zygote and installd of translated guests (api 14+)
+        if (File(paths.bin, "strace.${svc.name}").exists() || (svc.name == "netd" && NETD_STRACE) ||
+            (engine == Engine.KK && img.api >= 14 && ACORE_STRACE && (svc.name == "zygote" || svc.name == "installd")))
+            extra["QEMU_STRACE"] = "1"
         if (engine == Engine.N64 && props != null) extra["AEMU64_PROPS_FILE"] = props.absolutePath
         // the engine's own 64-bit HAL service over a vendor's firmware: its libraries are the engine's copy of its VNDK
         if (engine == Engine.N64) kernel.ownVndkDir?.let { dir ->
@@ -987,6 +999,23 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             log("netd-trace: tracing netd syscalls (QEMU_STRACE) into run/netd.log")
             trace.digestThread({ stopping }, { s -> log(s) }).start()
         }
+        // acore measurement: the zygote's translator carries system_server and every app process,
+        // so tracing it is the only way to see the contacts provider's own file calls; the lines
+        // naming its database are digested into this log (SyscallPathTrace). The raw trace lands
+        // in run/zygote.log, capped — a traced zygote out-produces a traced daemon by far.
+        val acoreTrace = if (name == "zygote" && engine == Engine.KK && env["QEMU_STRACE"] == "1" && !direct)
+            SyscallPathTrace("acore-trace", listOf("providers.contacts", "contacts2.db"), true, SystemClock.uptimeMillis()) else null
+        if (acoreTrace != null) {
+            log("acore-trace: tracing zygote syscalls (QEMU_STRACE) into run/zygote.log; lines naming the contacts database will be mirrored here")
+            acoreTrace.digestThread({ stopping }, { s -> log(s) }).start()
+        }
+        // installd measurement (same seat): its initialize_directories touches /data/user/0 once
+        // per incarnation, so the few lines naming it are mirrored as they arrive, not digested
+        val installdTrace = if (name == "installd" && engine == Engine.KK && env["QEMU_STRACE"] == "1" && !direct)
+            SyscallPathTrace("installd-trace", listOf("/data/user/0"), false, SystemClock.uptimeMillis()) else null
+        if (installdTrace != null) {
+            log("installd-trace: tracing installd syscalls (QEMU_STRACE) into run/installd.log; lines naming /data/user/0 will be mirrored here")
+        }
         // init publishes every service's state; the framework waits on it (SystemService.waitForState: the WebView
         // zygote, the boot animation)
         props.put("init.svc.$name", "running")
@@ -994,18 +1023,38 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             if (!direct) runCatching {
                 OutputStreamWriter(FileOutputStream(log, true)).use { w ->
                     w.write("\n=== $name ${stamp()} ===\n")
-                    if (trace == null) {
+                    if (trace == null && acoreTrace == null && installdTrace == null) {
                         p.inputStream.bufferedReader().forEachLine { w.write(it); w.write("\n"); w.flush() }
                     } else {
+                        var rawLines = 0
+                        var rawCapped = false
                         p.inputStream.bufferedReader().forEachLine { line ->
-                            val el = trace.record(line)
-                            w.write(String.format(java.util.Locale.US, "[+%d.%03d] %s\n", el / 1000, el % 1000, line))
-                            w.flush()
+                            val el = when {
+                                trace != null -> trace.record(line)
+                                acoreTrace != null -> acoreTrace.record(line)
+                                installdTrace != null -> installdTrace.record(line)
+                                else -> 0L
+                            }
+                            if (acoreTrace == null || rawLines < SyscallPathTrace.RAW_FILE_CAP) {
+                                w.write(String.format(java.util.Locale.US, "[+%d.%03d] %s\n", el / 1000, el % 1000, line))
+                                w.flush()
+                                rawLines++
+                            } else if (!rawCapped) {
+                                rawCapped = true
+                                w.write("[acore-trace: raw trace capped at ${SyscallPathTrace.RAW_FILE_CAP} lines in this file; matching lines keep being counted and mirrored to the host log]\n")
+                                w.flush()
+                            }
+                            if (installdTrace != null && installdTrace.isMatch(line)) {
+                                log(String.format(java.util.Locale.US, "installd-trace: [+%d.%03d] %s", el / 1000, el % 1000, line.take(300)))
+                            }
                         }
                     }
                 }
             }
             trace?.exited()
+            acoreTrace?.exited()
+            installdTrace?.exited()
+            installdTrace?.summary { s -> log(s) }
             val code = runCatching { p.waitFor() }.getOrDefault(-1)
             if (!stopping) log("· $name exited, code $code")
             // a restarted service is already running again under this name
