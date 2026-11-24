@@ -809,8 +809,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             startService(svc)
             svc.waitSocket?.let { sock -> waitFor("socket $sock", 20_000) { paths.socket(sock).exists() } }
             // The socket file only proves that dhdrun bound it. Do not start zygote (and with it system_server's NetdConnector)
-            // until netd itself answers, and give a netd that never does a fresh start: see NetdProbe
-            if (svc.name == "netd" && svc.waitSocket == "netd" && img.api < 29) ensureNetdServing(svc)
+            // until netd itself answers: see NetdProbe and ensureNetdServing
+            if (svc.name == "netd" && svc.waitSocket == "netd" && img.api < 29) ensureNetdServing()
             if (svc.delayMs > 0) Thread.sleep(svc.delayMs)
         }
         if (!glDone) glUp()
@@ -1002,28 +1002,22 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     }
 
     /**
-     * Added for AEmulator Plus (2026-11-17). Returns once netd answers a command; a netd that stays silent is killed and
-     * started again (its socket is re-bound by dhdrun), up to [attempts] times. After the last attempt the boot goes on as
-     * it always did, so a netd that cannot be fixed costs the wait and nothing more.
+     * Waits for the one netd that was started to answer a command, up to 90 s, and never restarts it: in the field our
+     * netd is slow to warm up rather than wedged (a single one answered the framework after ~140 s of continuous life),
+     * and killing it only resets that clock — the Plus restart gate (three 15 s attempts, ported 2026-11-24) left all
+     * three incarnations silent. Probing stays short and dense (see NetdProbe), so a netd that answers early releases
+     * the boot at once. After the deadline the boot goes on as it always did, so a netd that stays silent costs the
+     * wait and nothing more.
      */
-    private fun ensureNetdServing(svc: GuestService, attempts: Int = 3, perAttemptMs: Long = 15_000) {
+    private fun ensureNetdServing() {
         val sock = paths.socket("netd")
         val t0 = SystemClock.uptimeMillis()
-        for (n in 1..attempts) {
-            if (stopping) return
-            if (NetdProbe.waitServing(sock, perAttemptMs, stopped = { stopping })) {
-                log("netd answers (attempt $n, ${SystemClock.uptimeMillis() - t0} ms after its start)")
-                return
-            }
-            if (stopping) return
-            if (n == attempts) break
-            log("⚠ netd did not answer within ${perAttemptMs / 1000} s (attempt $n of $attempts): starting it again")
-            // (killed by us: exit 137 is not restarted by the watcher, so the one start below is the only one)
-            synchronized(procs) { procs.remove("netd") }?.let { runCatching { it.destroyForcibly().waitFor() } }
-            startService(svc)
-            waitFor("socket netd", 20_000) { paths.socket("netd").exists() }
+        if (NetdProbe.waitServing(sock, 90_000, stopped = { stopping })) {
+            log("netd answers (${SystemClock.uptimeMillis() - t0} ms after its start)")
+            return
         }
-        log("⚠ netd never answered ${SystemClock.uptimeMillis() - t0} ms after its start; booting on (ConnectivityService may fail)")
+        if (stopping) return
+        log("⚠ netd never answered within 90 s (${SystemClock.uptimeMillis() - t0} ms after its start); booting on (ConnectivityService may fail)")
     }
 
     // ------------------------------------------------------------------ присмотр
