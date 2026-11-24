@@ -13,6 +13,9 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStreamWriter
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Daemons system_server cannot live without: restarted even when init.rc marks them oneshot
  * (MIUI installd dies in the LBE security hook on start). */
@@ -1006,18 +1009,57 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
      * netd is slow to warm up rather than wedged (a single one answered the framework after ~140 s of continuous life),
      * and killing it only resets that clock — the Plus restart gate (three 15 s attempts, ported 2026-11-24) left all
      * three incarnations silent. Probing stays short and dense (see NetdProbe), so a netd that answers early releases
-     * the boot at once. After the deadline the boot goes on as it always did, so a netd that stays silent costs the
-     * wait and nothing more.
+     * the boot at once.
+     *
+     * The probe runs on a daemon thread and this loop only waits on its latch. A single LocalSocket.connect() inside
+     * the probe is a blocking native call with no timeout of its own, and when one wedges, the probe's deadline —
+     * checked only between tries — never gets a turn: run synchronously on this loop, the probe left a boot parked
+     * after "netd started" for over 800 s in the field. The latch wait below is sliced and hard-capped here, so the
+     * gate releases at 90 s whatever the probe thread is doing. A probe that finishes after the gate has already
+     * released logs one late line and touches nothing else.
      */
     private fun ensureNetdServing() {
         val sock = paths.socket("netd")
         val t0 = SystemClock.uptimeMillis()
-        if (NetdProbe.waitServing(sock, 90_000, stopped = { stopping })) {
-            log("netd answers (${SystemClock.uptimeMillis() - t0} ms after its start)")
-            return
+        val done = CountDownLatch(1)
+        val answered = AtomicBoolean(false)
+        val released = AtomicBoolean(false)
+        val probe = Thread({
+            val ok = NetdProbe.waitServing(sock, 90_000, stopped = { stopping })
+            answered.set(ok)
+            done.countDown()
+            if (released.get()) {
+                log("netd probe (late): ${if (ok) "answered" else "never answered"} (${SystemClock.uptimeMillis() - t0} ms after netd's start); the boot had already gone on")
+            }
+        }, "netd-probe")
+        probe.isDaemon = true
+        probe.start()
+        val until = t0 + 90_000
+        var finished = false
+        while (!stopping) {
+            val remaining = until - SystemClock.uptimeMillis()
+            if (remaining <= 0) break
+            try {
+                if (done.await(minOf(remaining, 200L), TimeUnit.MILLISECONDS)) {
+                    finished = true
+                    break
+                }
+            } catch (_: InterruptedException) {
+                finished = done.count == 0L
+                break
+            }
         }
         if (stopping) return
-        log("⚠ netd never answered within 90 s (${SystemClock.uptimeMillis() - t0} ms after its start); booting on (ConnectivityService may fail)")
+        if (finished) {
+            if (answered.get()) {
+                log("netd answers (${SystemClock.uptimeMillis() - t0} ms after its start)")
+            } else {
+                log("⚠ netd never answered within 90 s (${SystemClock.uptimeMillis() - t0} ms after its start); booting on (ConnectivityService may fail)")
+            }
+            return
+        }
+        released.set(true)
+        log("⚠ netd probe thread still blocked after 90 s (${SystemClock.uptimeMillis() - t0} ms after netd's start); booting on (ConnectivityService may fail)")
     }
 
     // ------------------------------------------------------------------ присмотр
