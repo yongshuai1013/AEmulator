@@ -1776,10 +1776,20 @@ class TreeFixer(
     /**
      * Владельцы файлов приложений в /data/data: ядро телефона не даёт менять uid, поэтому qemu
      * подставляет их по таблице dhd.owners (dev, ino → uid, gid). Берём uid из packages.xml.
+     *
+     * Sunset rework: the table is rebuilt on every boot instead of being appended to once.
+     * The old stamp (dhd.owners.seeded) made seeding one-shot per package: a file a package
+     * created after its seeding boot (an app database above all — the translator deliberately
+     * does not record plain file creation) never got a row, qemu answered root for it, and the
+     * package could no longer open its own files on later boots; rows for long-deleted inodes
+     * also lingered and could be inherited by a reused inode. Now the walk result wins: rows
+     * whose key the walk does not produce (the translator's runtime chown / mkdir notes and
+     * the prop-area row, which live outside package subtrees) are kept, everything inside a
+     * package subtree is re-derived from packages.xml, and a key the walk produces replaces
+     * any older row for it. The rewrite happens in fixup, before the translator starts, so
+     * there is no concurrent reader.
      */
     fun seedOwners() {
-        val stamp = File(root, "dhd.owners.seeded")
-        val done = if (stamp.isFile) stamp.readLines().filter { it.isNotBlank() }.toMutableSet() else mutableSetOf()
         val pkgXml = File(root, "data/system/packages.xml")
         val dataDir = File(root, "data/data")
         if (!pkgXml.isFile || !dataDir.isDirectory) return
@@ -1790,8 +1800,8 @@ class TreeFixer(
             for (m in suRe.findAll(text)) {
                 sharedUsers[m.groupValues[1]] = m.groupValues[2].toInt()
             }
-            val sb = StringBuilder()
-            var rows = 0
+            // Fresh rows for every node inside a package subtree, keyed like the table.
+            val fresh = LinkedHashMap<String, String>()
             var pkgs = 0
             val pkgRe = Regex("<package name=\"([^\"]+)\"[^>]*?>")
             for (m in pkgRe.findAll(text)) {
@@ -1802,9 +1812,6 @@ class TreeFixer(
                     ?: continue
                 val d = File(dataDir, name)
                 if (!d.isDirectory) continue
-                val key = "$name $uid"
-                if (key in done) continue
-                done.add(key)
                 pkgs++
                 val todo = ArrayDeque<File>().apply { add(d) }
                 while (todo.isNotEmpty()) {
@@ -1815,16 +1822,29 @@ class TreeFixer(
                         if (f.isDirectory) f.setExecutable(true, false)
                     }
                     val st = runCatching { Os.lstat(f.absolutePath) }.getOrNull() ?: continue
-                    sb.append(String.format("%016x %016x %08x %08x\n", st.st_dev, st.st_ino, uid, uid))
-                    rows++
+                    val key = String.format("%016x %016x", st.st_dev, st.st_ino)
+                    fresh[key] = String.format("%08x %08x", uid, uid)
                     if (!OsConstants.S_ISLNK(st.st_mode) && f.isDirectory) f.listFiles()?.forEach { todo.add(it) }
                 }
             }
-            if (rows > 0) {
-                paths.owners.appendText(sb.toString())
-                log("file owners restored: $pkgs packages, $rows entries")
+            // Rows the walk does not own survive the rewrite. The old table is append-only
+            // with last-row-wins reads, so a later old row replaces an earlier one here too.
+            val kept = LinkedHashMap<String, String>()
+            if (paths.owners.isFile) paths.owners.forEachLine { line ->
+                val fields = line.trim().split(Regex("\\s+"))
+                if (fields.size == 4) {
+                    val key = "${fields[0]} ${fields[1]}"
+                    if (key !in fresh) kept[key] = "${fields[2]} ${fields[3]}"
+                }
             }
-            stamp.writeText(done.joinToString("\n", postfix = "\n"))
+            val sb = StringBuilder()
+            for ((key, ids) in kept) sb.append(key).append(' ').append(ids).append('\n')
+            for ((key, ids) in fresh) sb.append(key).append(' ').append(ids).append('\n')
+            val tmp = File(root, "dhd.owners.tmp")
+            tmp.writeText(sb.toString())
+            if (!tmp.renameTo(paths.owners)) { paths.owners.writeText(sb.toString()); tmp.delete() }
+            File(root, "dhd.owners.seeded").delete()
+            log("file owners restored: $pkgs packages, ${kept.size + fresh.size} entries")
         }.onFailure { log("owners: ${it.message}") }
     }
 
