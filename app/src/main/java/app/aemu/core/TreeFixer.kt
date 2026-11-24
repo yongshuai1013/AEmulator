@@ -1807,8 +1807,13 @@ class TreeFixer(
             for (m in pkgRe.findAll(text)) {
                 val tag = m.value
                 val name = m.groupValues[1]
+                // A package owned by a shared user carries only sharedUserId, and in the
+                // format the guest writes (PmSettings.writePackageLPr) that value is the
+                // numeric appId, not a shared-user name — parse it as the uid directly and
+                // only fall back to the name table for a non-numeric value.
                 val uid = Regex("\\suserId=\"(\\d+)\"").find(tag)?.groupValues?.get(1)?.toIntOrNull()
-                    ?: Regex("\\ssharedUserId=\"([^\"]+)\"").find(tag)?.groupValues?.get(1)?.let { sharedUsers[it] }
+                    ?: Regex("\\ssharedUserId=\"([^\"]+)\"").find(tag)?.groupValues?.get(1)
+                        ?.let { it.toIntOrNull() ?: sharedUsers[it] }
                     ?: continue
                 val d = File(dataDir, name)
                 if (!d.isDirectory) continue
