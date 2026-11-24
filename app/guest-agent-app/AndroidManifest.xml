@@ -5,8 +5,8 @@
      boot complete (AgentSupport.APK_COPY); the package id is AgentSupport.APP_PACKAGE. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="app.aemu.agent"
-    android:versionCode="4"
-    android:versionName="1.3">
+    android:versionCode="5"
+    android:versionName="1.4">
 
     <uses-sdk android:minSdkVersion="14" android:targetSdkVersion="23" />
 
@@ -27,7 +27,7 @@
             android:exported="true" />
         <activity
             android:name=".VpnTestActivity"
-            android:label="VPN 測試（控制面）"
+            android:label="VPN 測試（M2）"
             android:exported="true" />
         <service
             android:name=".VpnTestService"

@@ -12,10 +12,11 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 /**
- * The VPN test page (control plane, milestone M1). One button walks the standard consent flow
- * (VpnService.prepare) and starts VpnTestService; the readout shows where establish() landed and
- * how many packets the tunnel has carried — zero is the expected, honest number at M1, and the
- * page labels itself accordingly so a lit key icon is never read as a working VPN.
+ * The VPN test page (milestone M2). One button walks the standard consent flow
+ * (VpnService.prepare) and starts VpnTestService; the readout shows where establish() landed,
+ * how many packets the tunnel has carried, and the first packet's summary — the count and the
+ * summary are the milestone's evidence, and they should agree with the host log's own
+ * "first packet" line. The return path is M3, and the page says so.
  */
 public final class VpnTestActivity extends Activity {
     private static final int REQ_CONSENT = 1;
@@ -26,8 +27,8 @@ public final class VpnTestActivity extends Activity {
     private final Runnable tick = new Runnable() {
         @Override public void run() {
             status.setText("狀態：" + VpnTestState.status
-                    + "\ntun 讀到封包：" + VpnTestState.packets + " 個 / " + VpnTestState.bytes
-                    + " bytes（M1 預期 0）"
+                    + "\ntun 讀到封包：" + VpnTestState.packets + " 個 / " + VpnTestState.bytes + " bytes"
+                    + (VpnTestState.firstPacket.isEmpty() ? "" : "\n首顆封包：" + VpnTestState.firstPacket)
                     + "\n\n接著請到 設定 → 更多 → VPN 查看：這一頁的測試 App 應出現在列管中，"
                     + "連線後狀態列會亮鑰匙圖示。");
             ui.postDelayed(this, 500);
@@ -36,20 +37,21 @@ public final class VpnTestActivity extends Activity {
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
-        setTitle("VPN 測試（控制面）");
+        setTitle("VPN 測試（M2）");
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
 
         TextView label = new TextView(this);
         label.setPadding(24, 16, 24, 8);
         label.setTextSize(14);
-        label.setText("控制面測試：流量尚未進隧道。\n"
-                + "這一頁證明的是 VpnService 的 establish() 能成功、設定頁會列管、狀態列會亮鑰匙圖示；"
-                + "客體 App 的流量目前仍直通、不經過這個隧道。真的載流是下一里程碑（M2）。");
+        label.setText("M2 測試：客體流量會繞進隧道。\n"
+                + "開始後開瀏覽器連一個網站：被繞道的連線會被組裝成 TCP 封包寫進隧道，"
+                + "下面的計數應大於 0、並出現首顆封包摘要（與宿主日誌的 first packet 行對賬）。\n"
+                + "回程尚未接（M3）：被繞道的連線收不到回覆、讀取會等到工作階段結束才返回，屬預期，不是故障。");
         root.addView(label);
 
         Button start = new Button(this);
-        start.setText("開始 VPN 控制面測試");
+        start.setText("開始 VPN 測試（M2）");
         start.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { askConsent(); }
         });

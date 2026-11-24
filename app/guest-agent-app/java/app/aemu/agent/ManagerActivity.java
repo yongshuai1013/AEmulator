@@ -139,7 +139,7 @@ public final class ManagerActivity extends Activity {
         root.addView(inbox);
 
         Button vpn = new Button(this);
-        vpn.setText("VPN 測試（控制面）");
+        vpn.setText("VPN 測試（M2）");
         vpn.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
                 startActivity(new Intent(ManagerActivity.this, VpnTestActivity.class));
@@ -155,7 +155,7 @@ public final class ManagerActivity extends Activity {
     // as the icon and the title: the same two jumps the bottom buttons make. The bottom buttons stay;
     // these are the same doors hung on the bar, for screens where the page's bottom is out of reach.
     @Override public boolean onCreateOptionsMenu(Menu menu) {
-        menu.add(Menu.NONE, 1, Menu.NONE, "VPN 測試（控制面）")
+        menu.add(Menu.NONE, 1, Menu.NONE, "VPN 測試（M2）")
             .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
         menu.add(Menu.NONE, 2, Menu.NONE, "Import inbox")
             .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);

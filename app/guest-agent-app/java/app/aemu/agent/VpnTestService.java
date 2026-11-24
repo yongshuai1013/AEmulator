@@ -5,20 +5,23 @@ import android.net.VpnService;
 import android.os.ParcelFileDescriptor;
 
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 
 /**
- * The smallest real VpnService: the control-plane test for milestone M1. It asks the framework
- * for a tunnel exactly like a shipping VPN app (Builder, one address, a default route, MTU) and
- * reports where establish() lands. M1 is the control plane only: in this build no guest traffic
- * enters the tunnel yet, so the reader below is expected to count zero packets — that is the
- * honest readout, and the page says so. Carrying traffic is M2.
+ * The smallest real VpnService: the test for milestone M2. It asks the framework for a tunnel
+ * exactly like a shipping VPN app (Builder, one address, a default route, MTU) and reports where
+ * establish() lands. At M2 guest traffic is detoured into the tunnel and the hub's synthesizer
+ * frames it back as TCP segments, so the reader below counts real packets — the first one's
+ * summary is the milestone's evidence. The return path (segments read back out and answered)
+ * is M3: a detoured connection gets no reply yet, and the page says so.
  */
 public final class VpnTestService extends VpnService {
     static final String ACTION_STOP = "app.aemu.agent.VPN_TEST_STOP";
 
     private ParcelFileDescriptor tunnel;
     private Thread reader;
+    private FileInputStream readerIn;
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
@@ -28,7 +31,7 @@ public final class VpnTestService extends VpnService {
             return START_NOT_STICKY;
         }
         if (tunnel != null) {
-            VpnTestState.set("已在運行——控制面已建立");
+            VpnTestState.set("已在運行——會話已建立");
             return START_STICKY;
         }
         VpnTestState.reset();
@@ -47,6 +50,14 @@ public final class VpnTestService extends VpnService {
             }
             tunnel = p;
             VpnTestState.onEstablished();
+            // Register this app's uid with the hub, through the tunnel itself: the hub exempts
+            // it from the detour, which is what VpnService.protect() promises the app's own
+            // sockets. Written before the reader starts so it is the channel's first content.
+            try {
+                FileOutputStream out = new FileOutputStream(p.getFileDescriptor());
+                out.write(("EXEMPT " + android.os.Process.myUid() + "\n").getBytes("UTF-8"));
+                out.flush();
+            } catch (Throwable ignored) { }
             reader = new Thread(new Runnable() {
                 @Override public void run() { readLoop(); }
             }, "aemu-vpn-reader");
@@ -63,6 +74,7 @@ public final class VpnTestService extends VpnService {
     private void readLoop() {
         byte[] buf = new byte[32767];
         FileInputStream in = new FileInputStream(tunnel.getFileDescriptor());
+        readerIn = in;
         try {
             while (!Thread.currentThread().isInterrupted()) {
                 final int n;
@@ -78,7 +90,7 @@ public final class VpnTestService extends VpnService {
                     return;
                 }
                 if (n > 0) {
-                    VpnTestState.addPacket(n);
+                    VpnTestState.addPacket(buf, n);
                 } else if (n < 0) {
                     VpnTestState.set("tun 已關閉（read 回 EOF）");
                     return;
@@ -105,6 +117,10 @@ public final class VpnTestService extends VpnService {
         if (reader != null) {
             reader.interrupt();
             reader = null;
+        }
+        if (readerIn != null) {
+            try { readerIn.close(); } catch (Throwable ignored) { }
+            readerIn = null;
         }
         if (tunnel != null) {
             try { tunnel.close(); } catch (Throwable ignored) { }
