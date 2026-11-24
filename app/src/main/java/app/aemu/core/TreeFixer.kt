@@ -1891,6 +1891,51 @@ class TreeFixer(
             if (n > MODE_DUMP_MAX) log("modedump[$tag] $pkg: $n nodes, truncated at $MODE_DUMP_MAX")
             else log("modedump[$tag] $pkg: $n nodes")
         }
+        dumpLinkCheck(tag)
+    }
+
+    /**
+     * Measurement only (db-dac-measure): the one path segment no dump has ever covered.
+     * The walk above and seedOwners reach the packages via data/data directly, but every
+     * guest open goes through the data/user/0 symlink — and makeUserZeroLink asserts its
+     * relative "../data" target only during fixup, silently. If something replaces it
+     * with the absolute "/data/data" during the boot, host-side resolution escapes the
+     * sysroot and lands on the host's own /data (0771, system-owned): every guest
+     * open/chmod under it comes back EACCES while the data/data view stays wide open —
+     * exactly the all-refused run's shape, with modes, keys and the table all proven
+     * identical between the all-open and all-refused runs. Log the link target, the
+     * ancestors and one node resolved through the link at both dumpModes timepoints,
+     * so a single run decides. Read-only: readlink + lstat/stat + log.
+     */
+    private fun dumpLinkCheck(tag: String) {
+        val data = File(root, "data")
+        val userZero = File(data, "user/0")
+        fun lst(f: File) = runCatching { Os.lstat(f.absolutePath) }.getOrNull()
+        val zst = lst(userZero)
+        when {
+            zst == null -> log("modedump[$tag] linkcheck data/user/0: lstat failed (missing?)")
+            OsConstants.S_ISLNK(zst.st_mode) -> {
+                val target = runCatching { Os.readlink(userZero.absolutePath) }
+                    .getOrElse { "<readlink failed: ${it.message}>" }
+                log("modedump[$tag] linkcheck data/user/0 -> $target")
+            }
+            else -> log(String.format("modedump[%s] linkcheck data/user/0: not a link, mode=%06o", tag, zst.st_mode))
+        }
+        for ((rel, f) in listOf("data" to data, "data/user" to File(data, "user"), "data/user/0" to userZero, "data/data" to File(data, "data"))) {
+            val st = lst(f)
+            if (st == null) { log("modedump[$tag] linkcheck $rel: lstat failed"); continue }
+            val kind = if (rel == "data/data") when {
+                OsConstants.S_ISLNK(st.st_mode) -> " (symlink)"
+                OsConstants.S_ISDIR(st.st_mode) -> " (real directory)"
+                else -> " (other)"
+            } else ""
+            log(String.format("modedump[%s] linkcheck %s mode=%06o dev=%016x ino=%016x%s", tag, rel, st.st_mode, st.st_dev, st.st_ino, kind))
+        }
+        // One representative node resolved through the link, against the same package's
+        // direct data/data values in the dump above: same (dev,ino) or an escape.
+        runCatching { Os.stat(File(userZero, "com.google.android.gsf").absolutePath) }
+            .onSuccess { st -> log(String.format("modedump[%s] linkcheck data/user/0/com.google.android.gsf mode=%06o dev=%016x ino=%016x", tag, st.st_mode, st.st_dev, st.st_ino)) }
+            .onFailure { log("modedump[$tag] linkcheck data/user/0/com.google.android.gsf: stat failed: ${it.message}") }
     }
 
     /** Пропустить миграцию PRE_BOOT_COMPLETED (4.x): под эмуляцией она занимает минуты. */
