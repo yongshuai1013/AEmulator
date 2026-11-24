@@ -442,6 +442,171 @@ static long input_ioctl(u32 cmd, u64 arg) {
     return -EINVAL;
 }
 
+// ---------------------------------------------------------------------------------------------------- tun
+
+// /dev/tun, synthesised for VpnService. This is M1 of the VPN completion: the CONTROL PLANE only.
+// establish() works end to end (the framework's Vpn JNI gets a real interface, the settings page
+// lists the app, the key icon lights), but no guest traffic enters the tunnel yet — the guest's
+// routes are still answered by the netlink emulation, which sends nothing here. The guest agent's
+// test page says exactly that; the data plane is M2.
+//
+// The channel: opening /dev/tun makes a datagram socket pair. The guest's end is the descriptor
+// the framework holds (and dups into the VPN app); reads and writes on it are plain host calls
+// with the host's blocking and readiness semantics, exactly like a real tun. The other end is the
+// channel endpoint, held here, in the supervisor of the process that opened it (system_server):
+//
+//     tun_chan_read(s, buf, cap)    one packet the VPN app wrote, or a negative error (-11: none)
+//     tun_chan_write(s, buf, len)   hand one packet to the VPN app's reads
+//
+// M1 drains the channel and counts what arrives; the count is logged when the session ends, so a
+// field run can prove whether anything was ever written into the tunnel. M2's packet stack
+// attaches at exactly these two calls: it consumes tun_chan_read and feeds tun_chan_write.
+#define MAX_TUN 4
+static struct {
+    int live;
+    int fd;                 // the guest's descriptor, in this process
+    int peer;               // the channel endpoint
+    int granted;            // interface flags granted at TUNSETIFF (IFF_TUN | IFF_NO_PI)
+    int up;                 // SIOCSIFFLAGS last said IFF_UP
+    int mtu;
+    int index;
+    u32 addr, mask;         // what SIOCSIFADDR / SIOCSIFNETMASK recorded, network order
+    u64 pkts, bytes;        // drained from the channel (written by the VPN app)
+    char name[16];
+} g_tun[MAX_TUN];
+static int g_tun_live;
+
+static void tun_cat(char *t, u64 *o, const char *s) { u64 n = slen(s); memcpy(t + *o, s, n); *o += n; t[*o] = 0; }
+static void tun_catn(char *t, u64 *o, u64 v) { char num[24]; char *p = utoa(v, num + sizeof num); tun_cat(t, o, p); }
+
+static long tun_chan_read(int s, char *buf, u64 cap) { return S3(NR_read, g_tun[s].peer, buf, cap); }
+static long tun_chan_write(int s, const char *buf, u64 len) { return S3(NR_write, g_tun[s].peer, buf, len); }
+
+// Retire sessions whose guest side is entirely gone: once every descriptor the guest held (the
+// framework's and the app's dup alike) is closed, reads on the channel return 0.
+static void tun_drain(void) {
+    char buf[2048];
+    for (int s = 0; s < MAX_TUN; s++) {
+        if (!g_tun[s].live) continue;
+        for (;;) {
+            long n = tun_chan_read(s, buf, sizeof buf);
+            if (n > 0) { g_tun[s].pkts++; g_tun[s].bytes += (u64)n; continue; }
+            if (n == 0) {
+                char line[224]; u64 o = 0;
+                tun_cat(line, &o, "aemu-tun: session ");
+                tun_cat(line, &o, g_tun[s].name);
+                tun_cat(line, &o, " ended; the VPN app wrote ");
+                tun_catn(line, &o, g_tun[s].pkts);
+                tun_cat(line, &o, " packets, ");
+                tun_catn(line, &o, g_tun[s].bytes);
+                tun_cat(line, &o, " bytes (M1: drained and discarded at the channel endpoint)");
+                say(line);
+                S1(NR_close, g_tun[s].peer);
+                g_tun[s].live = 0;
+                g_tun_live--;
+            }
+            break;
+        }
+    }
+}
+
+static long tun_open(long flags) {
+    if (g_tun_live) tun_drain();                    // reap before allocating
+    int s = -1;
+    for (int i = 0; i < MAX_TUN; i++) if (!g_tun[i].live) { s = i; break; }
+    if (s < 0) return -24;                          /* EMFILE */
+    int sv[2];
+    long r = S4(NR_socketpair, 1 /*AF_UNIX*/, 2 /*SOCK_DGRAM*/ | (int)(flags & 02004000), 0, (long)sv);
+    if (r < 0) return r;
+    S3(NR_fcntl, sv[1], 4 /*F_SETFL*/, 2048 /*O_NONBLOCK*/);   // the endpoint never blocks the supervisor
+    memset(&g_tun[s], 0, sizeof g_tun[s]);
+    g_tun[s].live = 1;
+    g_tun[s].fd = sv[0];
+    g_tun[s].peer = sv[1];
+    g_tun[s].mtu = 1500;
+    g_tun[s].index = 61 + s;
+    g_tun_live++;
+    say("aemu-tun: /dev/tun opened (M1 control plane: establish works, traffic does not enter the tunnel yet)");
+    return sv[0];
+}
+
+static int is_tun_fd(int fd) { for (int i = 0; i < MAX_TUN; i++) if (g_tun[i].live && g_tun[i].fd == fd) return 1; return 0; }
+
+static long tun_ioctl(int fd, u32 cmd, u64 arg) {
+    int s = -1;
+    for (int i = 0; i < MAX_TUN; i++) if (g_tun[i].live && g_tun[i].fd == fd) s = i;
+    if (s < 0) return -25;                          /* ENOTTY */
+    char *ifr = (char *)arg;
+    switch (cmd) {
+    case 0x400454ca: {                              // TUNSETIFF
+        char want[16];
+        memcpy(want, ifr, 16);
+        want[15] = 0;
+        if (!want[0]) {                             // no name asked for: the lowest free tunN, as the kernel assigns
+            for (int n = 0; n < MAX_TUN + 4 && !want[0]; n++) {
+                char cand[16];
+                u64 o = 0;
+                tun_cat(cand, &o, "tun");
+                tun_catn(cand, &o, (u64)n);
+                int taken = 0;
+                for (int i = 0; i < MAX_TUN; i++) if (g_tun[i].live && seq(g_tun[i].name, cand)) taken = 1;
+                if (!taken) memcpy(want, cand, o + 1);
+            }
+        }
+        memcpy(g_tun[s].name, want, 16);
+        g_tun[s].granted = *(u16 *)(ifr + 16);
+        memcpy(ifr, g_tun[s].name, 16);
+        *(u16 *)(ifr + 16) = (u16)g_tun[s].granted;
+        char line[96]; u64 o = 0;
+        tun_cat(line, &o, "aemu-tun: interface ");
+        tun_cat(line, &o, g_tun[s].name);
+        tun_cat(line, &o, " allocated (TUNSETIFF)");
+        say(line);
+        return 0;
+    }
+    case 0x800454d2:                                // TUNGETIFF
+        memcpy(ifr, g_tun[s].name, 16);
+        *(u16 *)(ifr + 16) = (u16)g_tun[s].granted;
+        return 0;
+    case 0x800454d3: *(int *)arg = 212992; return 0;    // TUNGETSNDBUF
+    default: return 0;                              // the rest of the 'T' family: accepted, nothing to do at M1
+    }
+}
+
+// The framework configures and checks the interface by NAME, through ioctls on a plain internet
+// socket (the Vpn JNI's SIOCSIFFLAGS / SIOCSIFMTU / SIOGIFINDEX / SIOCSIFADDR / SIOCGIFFLAGS).
+// Those used to fall through to the phone's kernel, which has no such interface and refused them
+// all — a second, hidden break behind the missing /dev/tun. They are answered here, from this
+// registry: an interface exists because a session is registered, and its flags, MTU and addresses
+// are what the framework itself set. Returns 1 (and *out) when the name is one of ours.
+static int tun_sioc(u32 cmd, u64 arg, long *out) {
+    if ((cmd & 0xffffff00u) != 0x8900u || !arg || !g_tun_live) return 0;
+    char *ifr = (char *)arg;
+    char name[16];
+    memcpy(name, ifr, 16);
+    name[15] = 0;
+    for (int i = 0; i < 15 && name[i]; i++) if (name[i] == ':') { name[i] = 0; break; }   // tun0:1 aliases
+    int s = -1;
+    for (int i = 0; i < MAX_TUN; i++) if (g_tun[i].live && g_tun[i].name[0] && seq(g_tun[i].name, name)) s = i;
+    if (s < 0) return 0;
+    switch (cmd) {
+    case 0x8914: g_tun[s].up = *(u16 *)(ifr + 16) & 1; *out = 0; return 1;                  // SIOCSIFFLAGS
+    case 0x8913: *(u16 *)(ifr + 16) = (u16)((g_tun[s].up ? 0x41 : 0) | 0x10 | 0x80 | 0x8000); *out = 0; return 1;  // SIOCGIFFLAGS: UP|RUNNING, POINTOPOINT|NOARP|MULTICAST
+    case 0x8922: g_tun[s].mtu = *(int *)(ifr + 16); *out = 0; return 1;                     // SIOCSIFMTU
+    case 0x8921: *(int *)(ifr + 16) = g_tun[s].mtu; *out = 0; return 1;                     // SIOCGIFMTU
+    case 0x8933: *(int *)(ifr + 16) = g_tun[s].index; *out = 0; return 1;                   // SIOGIFINDEX
+    case 0x8916: g_tun[s].addr = *(u32 *)(ifr + 20); *out = 0; return 1;                    // SIOCSIFADDR
+    case 0x891c: g_tun[s].mask = *(u32 *)(ifr + 20); *out = 0; return 1;                    // SIOCSIFNETMASK
+    case 0x8915:                                                                            // SIOCGIFADDR
+        if (!g_tun[s].addr) { *out = -99; return 1; }                                       /* EADDRNOTAVAIL */
+        memset(ifr + 16, 0, 16); *(u16 *)(ifr + 16) = 2; *(u32 *)(ifr + 20) = g_tun[s].addr; *out = 0; return 1;
+    case 0x891b:                                                                            // SIOCGIFNETMASK
+        if (!g_tun[s].mask) { *out = -99; return 1; }                                       /* EADDRNOTAVAIL */
+        memset(ifr + 16, 0, 16); *(u16 *)(ifr + 16) = 2; *(u32 *)(ifr + 20) = g_tun[s].mask; *out = 0; return 1;
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------------------------------- exec
 
 static int env_is_ours(const char *e) { return pre(e, "AEMU64_"); }
@@ -578,6 +743,7 @@ static long trap(long nr, long *a, void *uc) {
 
 static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     int err = 0;
+    if (g_tun_live) tun_drain();
     switch (nr) {
     case NR_openat: {
         char *b1 = PB(0);
@@ -588,6 +754,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
                 }
                 if (seq(P(1), "/dev/binder") || seq(P(1), "/dev/hwbinder") || seq(P(1), "/dev/vndbinder")) return binder_open(a[2], P(1));
                 if (pre(P(1), "/dev/input/event")) return input_open(a[2]);
+                if (seq(P(1), "/dev/tun") || seq(P(1), "/dev/net/tun")) return tun_open(a[2]);
             }
             u64 pl = slen(P(1));
             if (pre(P(1), "/proc/") && ((pl >= 13 && seq(P(1) + pl - 13, "/attr/current")) || (pl >= 10 && seq(P(1) + pl - 10, "/attr/exec")))) {
@@ -632,6 +799,14 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
                 st->st_nlink = 1;
                 return 0;
             }
+            if (seq(P(1), "/dev/tun") || seq(P(1), "/dev/net/tun")) {
+                struct kstat *st = (struct kstat *)a[2];
+                memset(st, 0, sizeof *st);
+                st->st_mode = 0020666; // S_IFCHR | 0666
+                st->st_rdev = 0xAC8;   // the tun misc device, 10:200
+                st->st_nlink = 1;
+                return 0;
+            }
             u64 pl = slen(P(1));
             if (pre(P(1), "/proc/") && pl >= 13 && seq(P(1) + pl - 13, "/attr/current")) {
                 struct kstat *st = (struct kstat *)a[2];
@@ -666,6 +841,14 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         return r;
     }
     case NR_fstat: {
+        if (is_tun_fd((int)a[0])) {
+            struct kstat *st = (struct kstat *)a[1];
+            memset(st, 0, sizeof *st);
+            st->st_mode = 0020666; // S_IFCHR | 0666
+            st->st_rdev = 0xAC8;   // the tun misc device, 10:200
+            st->st_nlink = 1;
+            return 0;
+        }
         if (is_binder_fd((int)a[0])) {
             struct kstat *st = (struct kstat *)a[1];
             memset(st, 0, sizeof *st);
@@ -695,6 +878,9 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         char *b1 = PB(0);
         if (P(1)) {
             if (seq(P(1), "/dev/binder") || seq(P(1), "/dev/hwbinder") || seq(P(1), "/dev/vndbinder") || seq(P(1), "/dev/ashmem")) {
+                return 0;
+            }
+            if (seq(P(1), "/dev/tun") || seq(P(1), "/dev/net/tun")) {
                 return 0;
             }
             u64 pl = slen(P(1));
@@ -832,11 +1018,14 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     }
     case NR_close: {
         if (is_nl_fd((int)a[0])) nl_close((int)a[0]);
+        if (is_tun_fd((int)a[0])) say("aemu-tun: the framework closed its tun descriptor (the session ends when the channel runs dry)");
         return S1(nr, a[0]);
     }
     case NR_execve:
         return do_exec(P(0), (char *const *)a[1], (char *const *)a[2]);
     case NR_ioctl:
+        if (is_tun_fd((int)a[0])) return tun_ioctl((int)a[0], (u32)a[1], (u64)a[2]);
+        { long so; if (tun_sioc((u32)a[1], (u64)a[2], &so)) return so; }
         if (((a[1] >> 8) & 0xff) == ASHMEM_MAGIC) return ashmem_ioctl((int)a[0], (u32)a[1], (u64)a[2]);
         if (((a[1] >> 8) & 0xff) == 'E' && is_input_fd((int)a[0])) return input_ioctl((u32)a[1], (u64)a[2]);
         if (((u32)a[1] & 0xffffff00u) == 0x4600) return fb_ioctl((u32)a[1], (u64)a[2]);
