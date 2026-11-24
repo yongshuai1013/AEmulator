@@ -21,6 +21,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * (MIUI installd dies in the LBE security hook on start). */
 private val ALWAYS_RESTART = setOf("mediaserver", "installd", "netd", "keystore")
 
+/** Measurement build: always trace netd's guest syscalls (QEMU_STRACE, see NetdTrace). The field
+ * netd needs ~140 s of continuous life before it accepts; this finds the call it parks in. */
+private val NETD_STRACE = true
+
 /** Native arm64 engine: vendor daemons that only poll hardware the phone does not have (modem, DSP, TrustZone). */
 private val N64_SKIP = setOf("audiod", "ATFWD-daemon", "imsqmidaemon", "loc_launcher", "cnd", "dpmd", "cnss-daemon",
     "tftp_server", "qcom-system-daemon", "hvdcp_opti", "pm-service", "mtd", "mlipayd", "vsimd", "fdpp", "perfd", "ipacm",
@@ -934,7 +938,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         val argv = if (svc.name == "zygote" && !settings.jit && img.runtime == "dalvik")
             svc.argv.take(1) + "-Xint:fast" + svc.argv.drop(1) else svc.argv
         // отладка: файл run/strace.<служба> включает трассировку системных вызовов qemu
-        if (File(paths.bin, "strace.${svc.name}").exists()) extra["QEMU_STRACE"] = "1"
+        // measurement build: netd is traced unconditionally (NETD_STRACE), other services keep the marker
+        if (File(paths.bin, "strace.${svc.name}").exists() || (svc.name == "netd" && NETD_STRACE)) extra["QEMU_STRACE"] = "1"
         if (engine == Engine.N64 && props != null) extra["AEMU64_PROPS_FILE"] = props.absolutePath
         // the engine's own 64-bit HAL service over a vendor's firmware: its libraries are the engine's copy of its VNDK
         if (engine == Engine.N64) kernel.ownVndkDir?.let { dir ->
@@ -974,6 +979,14 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         synchronized(procs) { procs[name] = p }
         pidOf(p)?.let { pgids.add(it) }
         log("· $name started")
+        // netd syscall tracing (measurement build): the pump below stamps every line with the time
+        // since this spawn and feeds NetdTrace; its digest lands in this log once the trace settles
+        val trace = if (name == "netd" && env["QEMU_STRACE"] == "1" && !direct)
+            NetdTrace(SystemClock.uptimeMillis()) else null
+        if (trace != null) {
+            log("netd-trace: tracing netd syscalls (QEMU_STRACE) into run/netd.log")
+            trace.digestThread({ stopping }, { s -> log(s) }).start()
+        }
         // init publishes every service's state; the framework waits on it (SystemService.waitForState: the WebView
         // zygote, the boot animation)
         props.put("init.svc.$name", "running")
@@ -981,9 +994,18 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             if (!direct) runCatching {
                 OutputStreamWriter(FileOutputStream(log, true)).use { w ->
                     w.write("\n=== $name ${stamp()} ===\n")
-                    p.inputStream.bufferedReader().forEachLine { w.write(it); w.write("\n"); w.flush() }
+                    if (trace == null) {
+                        p.inputStream.bufferedReader().forEachLine { w.write(it); w.write("\n"); w.flush() }
+                    } else {
+                        p.inputStream.bufferedReader().forEachLine { line ->
+                            val el = trace.record(line)
+                            w.write(String.format(java.util.Locale.US, "[+%d.%03d] %s\n", el / 1000, el % 1000, line))
+                            w.flush()
+                        }
+                    }
                 }
             }
+            trace?.exited()
             val code = runCatching { p.waitFor() }.getOrDefault(-1)
             if (!stopping) log("· $name exited, code $code")
             // a restarted service is already running again under this name
