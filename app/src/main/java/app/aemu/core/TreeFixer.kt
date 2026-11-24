@@ -883,24 +883,34 @@ class TreeFixer(
             }
         }
         // netfilter в эмуляторе нет: iptables всегда падает, а netd 4.x (Samsung) считает это фатальным
-        // для NetworkManagementService/ConnectivityService — ставим пустую программу, родную прячем
+        // для NetworkManagementService/ConnectivityService — ставим пустую программу, родную прячем.
+        // The name family is the native engine's exec-mute list (run64.c) verbatim: the translated
+        // engines have no exec-point seam of ours (qemu re-execs itself), so the same names are
+        // stubbed as files instead — keep the two lists in sync.
         val trueSize = runCatching { EngineAssets.size(ctx, "engines/common/aemu_true.so") }.getOrDefault(-1L)
         // MIUI: invoke-as runs FirewallService's iptables loop as root; under qemu that shell never sees its
         // children exit, so ConnectivityService (and the whole boot) hangs in CommandLineUtils.waitFor
-        val fakes = listOf("bin/iptables", "bin/ip6tables") + if (img.skin.contains("MIUI", true)) listOf("xbin/invoke-as") else emptyList()
+        val fakes = listOf("bin/ip", "bin/tc", "bin/iptables", "bin/ip6tables", "bin/iptables-restore", "bin/ip6tables-restore", "bin/ndppd") +
+            if (img.skin.contains("MIUI", true)) listOf("xbin/invoke-as") else emptyList()
+        val fakeState = ArrayList<String>()
         for (rel in fakes) {
             val n = rel.substringAfter('/')
             val f = File(root, "system/$rel")
-            if (!f.exists() && !isLink(f) || trueSize < 0 || (!isLink(f) && f.length() == trueSize)) continue
-            runCatching {
+            if (!f.exists() && !isLink(f)) { fakeState += "$n=absent"; continue }
+            if (trueSize < 0) { fakeState += "$n=skipped"; continue }
+            if (!isLink(f) && f.length() == trueSize) { fakeState += "$n=stub"; continue }
+            val ok = runCatching {
                 val parked = File(root, "system/.aemu-parked/system#${rel.replace('/', '#')}")
                 parked.parentFile?.mkdirs()
                 if (isLink(f)) Os.remove(f.absolutePath) else if (!parked.exists()) f.renameTo(parked) else f.delete()
                 EngineAssets.open(ctx, "engines/common/aemu_true.so").use { i -> f.outputStream().use { o -> i.copyTo(o) } }
                 f.setReadable(true, false); f.setExecutable(true, false)
                 copied++
-            }.onFailure { log("$n not replaced: ${it.message}") }
+            }.onFailure { log("$n not replaced: ${it.message}") }.isSuccess
+            fakeState += if (ok) "$n=stubbed" else "$n=FAILED"
         }
+        // one line per fixup, every name with its state: the field log itself proves the stubs landed
+        log("net tool stubs: " + fakeState.joinToString(", "))
         // камера 2.3: заглушка вместо вендорской libcamera.so, которая лезет в /dev/msm_camera
         val cam = File(root, "system/lib/libcamera.so")
         val stamp = File(root, "system/lib/libcamera.so.aemu")
