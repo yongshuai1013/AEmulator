@@ -15,6 +15,9 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStreamWriter
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Daemons system_server cannot live without: restarted even when init.rc marks them oneshot
  * (MIUI installd dies in the LBE security hook on start). */
@@ -1014,48 +1017,88 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
      * no network service. So probe netd on an own connection with that very command
      * and hold the plan until it answers — the race becomes a wait. Bounded at 60 s:
      * a netd that never answers must not hang the boot; we proceed and say so.
+     *
+     * The first version ran this loop on the service thread and checked the deadline
+     * only between attempts; attempt #1 never came back (2zcs2q, run 45311012359:
+     * the host log stops after "netd started" — no success line, no timeout line,
+     * for minutes). LocalSocket.connect() has no timeout of its own — soTimeout
+     * governs reads only — and it was called before soTimeout was even set, so a
+     * connect that cannot complete against the pre-built listening socket wedged
+     * the one thread the deadline check lived on. The probe therefore runs on a
+     * daemon worker now and this thread only waits on a latch for the same 60 s:
+     * a wedged attempt wedges the worker, never the boot, and an answer that
+     * arrives late still reaches the log without touching the boot that moved on.
      */
     private fun probeNetd() {
         val path = paths.socket("netd").absolutePath
         val t0 = SystemClock.uptimeMillis()
-        val deadline = t0 + 60_000
-        var attempt = 0
-        while (SystemClock.uptimeMillis() < deadline && !stopping) {
-            attempt++
-            val ok = runCatching {
-                val sock = LocalSocket()
-                try {
-                    sock.connect(LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM))
-                    sock.soTimeout = 5_000
-                    val out = sock.outputStream
-                    out.write("0 interface list\u0000".toByteArray(Charsets.US_ASCII))
-                    out.flush()
-                    // replies are NUL-terminated "code seq text": 1xx continues, 2xx and
-                    // above ends the exchange (an error reply proves dispatch just as well)
-                    val inp = sock.inputStream
-                    val sb = StringBuilder()
-                    var final = false
-                    while (!final) {
-                        val b = inp.read()
-                        if (b < 0) return@runCatching false
-                        if (b == 0) {
-                            val code = sb.toString().trim().split(' ', limit = 2).firstOrNull()?.toIntOrNull()
-                            sb.setLength(0)
-                            if (code != null && code >= 200) final = true
-                        } else sb.append(b.toChar())
-                    }
-                    true
-                } finally {
-                    runCatching { sock.close() }
-                }
-            }.getOrDefault(false)
-            if (ok) {
-                log("netd: answering after ${(SystemClock.uptimeMillis() - t0) / 1000} s (probe attempt $attempt)")
-                return
+        val done = CountDownLatch(1)
+        val warned = AtomicBoolean(false)
+        fun warnOnce() {
+            if (!stopping && warned.compareAndSet(false, true)) {
+                log("⚠ netd: no answer to the probe in 60 s, starting the framework anyway")
             }
-            Thread.sleep(1_000)
         }
-        if (!stopping) log("⚠ netd: no answer to the probe in 60 s, starting the framework anyway")
+        val worker = Thread({
+            val deadline = t0 + 60_000
+            var attempt = 0
+            var answered = false
+            while (!answered && SystemClock.uptimeMillis() < deadline && !stopping) {
+                attempt++
+                val (ok, why) = probeNetdOnce(path)
+                if (ok) {
+                    log("netd: answering after ${(SystemClock.uptimeMillis() - t0) / 1000} s (probe attempt $attempt)")
+                    answered = true
+                } else {
+                    log("netd probe attempt $attempt: $why")
+                    try { Thread.sleep(1_000) } catch (e: InterruptedException) { break }
+                }
+            }
+            if (!answered) warnOnce()
+            done.countDown()
+        }, "netd-probe")
+        worker.isDaemon = true
+        worker.start()
+        val until = t0 + 60_000
+        while (SystemClock.uptimeMillis() < until && !stopping) {
+            if (runCatching { done.await(200, TimeUnit.MILLISECONDS) }.getOrDefault(false)) return
+        }
+        if (done.count > 0) warnOnce()
+    }
+
+    /**
+     * One probe exchange: true when netd dispatched the command (any final reply
+     * code proves the command loop is alive, an error reply included); false plus
+     * the reason it failed, for the log. The read is bounded by soTimeout, set
+     * before connecting; connect() itself has no timeout API, which is why the
+     * caller quarantines this on a daemon worker.
+     */
+    private fun probeNetdOnce(path: String): Pair<Boolean, String> {
+        val sock = LocalSocket()
+        try {
+            sock.soTimeout = 5_000
+            sock.connect(LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM))
+            val out = sock.outputStream
+            out.write("0 interface list\u0000".toByteArray(Charsets.US_ASCII))
+            out.flush()
+            // replies are NUL-terminated "code seq text": 1xx continues, 2xx and
+            // above ends the exchange (an error reply proves dispatch just as well)
+            val inp = sock.inputStream
+            val sb = StringBuilder()
+            while (true) {
+                val b = inp.read()
+                if (b < 0) return false to "connection closed before a final reply"
+                if (b == 0) {
+                    val code = sb.toString().trim().split(' ', limit = 2).firstOrNull()?.toIntOrNull()
+                    sb.setLength(0)
+                    if (code != null && code >= 200) return true to ""
+                } else sb.append(b.toChar())
+            }
+        } catch (e: Exception) {
+            return false to "${e.javaClass.simpleName}: ${e.message}"
+        } finally {
+            runCatching { sock.close() }
+        }
     }
 
     // ------------------------------------------------------------------ присмотр
