@@ -1069,15 +1069,18 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     /**
      * One probe exchange: true when netd dispatched the command (any final reply
      * code proves the command loop is alive, an error reply included); false plus
-     * the reason it failed, for the log. The read is bounded by soTimeout, set
-     * before connecting; connect() itself has no timeout API, which is why the
-     * caller quarantines this on a daemon worker.
+     * the reason it failed, for the log. The read is bounded by soTimeout, which
+     * must be set after connect(): the fd is only created inside connect(), and
+     * setting a timeout before it throws "socket not created" (run 45315687750:
+     * all 60 attempts died on that line, the probe never sent a byte).
+     * connect() itself has no timeout API, which is why the caller quarantines
+     * this on a daemon worker.
      */
     private fun probeNetdOnce(path: String): Pair<Boolean, String> {
         val sock = LocalSocket()
         try {
-            sock.soTimeout = 5_000
             sock.connect(LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM))
+            sock.soTimeout = 5_000
             val out = sock.outputStream
             out.write("0 interface list\u0000".toByteArray(Charsets.US_ASCII))
             out.flush()
