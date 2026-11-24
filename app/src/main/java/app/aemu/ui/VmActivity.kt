@@ -1055,7 +1055,8 @@ class VmActivity : ComponentActivity() {
 
     /**
      * A hardware key drawn on the device skin: touching that part of the picture presses the key in the guest and
-     * holds it for as long as it is held here, like the bar's keys. [area] is in root pixels, as the layout
+     * holds it for as long as it is held here, like the bar's keys. The press buzzes the phone once, like the real
+     * key would; the on-screen bar (the unframed mode) has no such buzz. [area] is in root pixels, as the layout
      * listener computed it from DeviceSkin.layout.
      */
     @Composable
@@ -1071,12 +1072,14 @@ class VmActivity : ComponentActivity() {
             else -> 0
         }
         val density = androidx.compose.ui.platform.LocalDensity.current
+        val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
         Box(Modifier.offset { androidx.compose.ui.unit.IntOffset(area.left, area.top) }
             .size(with(density) { area.width.toDp() }, with(density) { area.height.toDp() })
             .pointerInput(button) {
                 awaitEachGesture {
                     val down = awaitFirstDown()
                     down.consume()
+                    haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
                     if (button == app.aemu.core.NavButton.HOME) vm.input.home(true)
                     else if (code != 0) vm.input.key(code, true)
                     while (true) {
