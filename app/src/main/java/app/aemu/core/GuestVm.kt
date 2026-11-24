@@ -1,8 +1,6 @@
 package app.aemu.core
 
 import android.content.Context
-import android.net.LocalSocket
-import android.net.LocalSocketAddress
 import android.os.Process as AProcess
 import android.os.SystemClock
 import android.view.Surface
@@ -15,9 +13,6 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStreamWriter
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 
 /** Daemons system_server cannot live without: restarted even when init.rc marks them oneshot
  * (MIUI installd dies in the LBE security hook on start). */
@@ -813,9 +808,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             }
             startService(svc)
             svc.waitSocket?.let { sock -> waitFor("socket $sock", 20_000) { paths.socket(sock).exists() } }
-            // a listening netd socket is not yet a netd that answers: probe it for real
-            // before the plan moves on towards zygote (see probeNetd)
-            if (svc.name == "netd" && svc.waitSocket != null) probeNetd()
+            // The socket file only proves that dhdrun bound it. Do not start zygote (and with it system_server's NetdConnector)
+            // until netd itself answers, and give a netd that never does a fresh start: see NetdProbe
+            if (svc.name == "netd" && svc.waitSocket == "netd" && img.api < 29) ensureNetdServing(svc)
             if (svc.delayMs > 0) Thread.sleep(svc.delayMs)
         }
         if (!glDone) glUp()
@@ -1007,101 +1002,28 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     }
 
     /**
-     * The waitSocket gate above proves nothing about netd: the translator creates the
-     * listening socket at spawn time, while netd itself needs tens of seconds under
-     * translation before its command loop reads anything. The framework's first
-     * synchronous netd call sits inside ConnectivityService's constructor
-     * (EthernetDataTracker's interface list, guarded only against RemoteException);
-     * when it eats the 60 s daemon timeout, the exception crosses the constructor,
-     * SystemServer skips registering the connectivity service, and the whole boot has
-     * no network service. So probe netd on an own connection with that very command
-     * and hold the plan until it answers — the race becomes a wait. Bounded at 60 s:
-     * a netd that never answers must not hang the boot; we proceed and say so.
-     *
-     * The first version ran this loop on the service thread and checked the deadline
-     * only between attempts; attempt #1 never came back (2zcs2q, run 45311012359:
-     * the host log stops after "netd started" — no success line, no timeout line,
-     * for minutes). LocalSocket.connect() has no timeout of its own — soTimeout
-     * governs reads only — and it was called before soTimeout was even set, so a
-     * connect that cannot complete against the pre-built listening socket wedged
-     * the one thread the deadline check lived on. The probe therefore runs on a
-     * daemon worker now and this thread only waits on a latch for the same 60 s:
-     * a wedged attempt wedges the worker, never the boot, and an answer that
-     * arrives late still reaches the log without touching the boot that moved on.
+     * Added for AEmulator Plus (2026-11-17). Returns once netd answers a command; a netd that stays silent is killed and
+     * started again (its socket is re-bound by dhdrun), up to [attempts] times. After the last attempt the boot goes on as
+     * it always did, so a netd that cannot be fixed costs the wait and nothing more.
      */
-    private fun probeNetd() {
-        val path = paths.socket("netd").absolutePath
+    private fun ensureNetdServing(svc: GuestService, attempts: Int = 3, perAttemptMs: Long = 15_000) {
+        val sock = paths.socket("netd")
         val t0 = SystemClock.uptimeMillis()
-        val done = CountDownLatch(1)
-        val warned = AtomicBoolean(false)
-        fun warnOnce() {
-            if (!stopping && warned.compareAndSet(false, true)) {
-                log("⚠ netd: no answer to the probe in 60 s, starting the framework anyway")
+        for (n in 1..attempts) {
+            if (stopping) return
+            if (NetdProbe.waitServing(sock, perAttemptMs, stopped = { stopping })) {
+                log("netd answers (attempt $n, ${SystemClock.uptimeMillis() - t0} ms after its start)")
+                return
             }
+            if (stopping) return
+            if (n == attempts) break
+            log("⚠ netd did not answer within ${perAttemptMs / 1000} s (attempt $n of $attempts): starting it again")
+            // (killed by us: exit 137 is not restarted by the watcher, so the one start below is the only one)
+            synchronized(procs) { procs.remove("netd") }?.let { runCatching { it.destroyForcibly().waitFor() } }
+            startService(svc)
+            waitFor("socket netd", 20_000) { paths.socket("netd").exists() }
         }
-        val worker = Thread({
-            val deadline = t0 + 60_000
-            var attempt = 0
-            var answered = false
-            while (!answered && SystemClock.uptimeMillis() < deadline && !stopping) {
-                attempt++
-                val (ok, why) = probeNetdOnce(path)
-                if (ok) {
-                    log("netd: answering after ${(SystemClock.uptimeMillis() - t0) / 1000} s (probe attempt $attempt)")
-                    answered = true
-                } else {
-                    log("netd probe attempt $attempt: $why")
-                    try { Thread.sleep(1_000) } catch (e: InterruptedException) { break }
-                }
-            }
-            if (!answered) warnOnce()
-            done.countDown()
-        }, "netd-probe")
-        worker.isDaemon = true
-        worker.start()
-        val until = t0 + 60_000
-        while (SystemClock.uptimeMillis() < until && !stopping) {
-            if (runCatching { done.await(200, TimeUnit.MILLISECONDS) }.getOrDefault(false)) return
-        }
-        if (done.count > 0) warnOnce()
-    }
-
-    /**
-     * One probe exchange: true when netd dispatched the command (any final reply
-     * code proves the command loop is alive, an error reply included); false plus
-     * the reason it failed, for the log. The read is bounded by soTimeout, which
-     * must be set after connect(): the fd is only created inside connect(), and
-     * setting a timeout before it throws "socket not created" (run 45315687750:
-     * all 60 attempts died on that line, the probe never sent a byte).
-     * connect() itself has no timeout API, which is why the caller quarantines
-     * this on a daemon worker.
-     */
-    private fun probeNetdOnce(path: String): Pair<Boolean, String> {
-        val sock = LocalSocket()
-        try {
-            sock.connect(LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM))
-            sock.soTimeout = 5_000
-            val out = sock.outputStream
-            out.write("0 interface list\u0000".toByteArray(Charsets.US_ASCII))
-            out.flush()
-            // replies are NUL-terminated "code seq text": 1xx continues, 2xx and
-            // above ends the exchange (an error reply proves dispatch just as well)
-            val inp = sock.inputStream
-            val sb = StringBuilder()
-            while (true) {
-                val b = inp.read()
-                if (b < 0) return false to "connection closed before a final reply"
-                if (b == 0) {
-                    val code = sb.toString().trim().split(' ', limit = 2).firstOrNull()?.toIntOrNull()
-                    sb.setLength(0)
-                    if (code != null && code >= 200) return true to ""
-                } else sb.append(b.toChar())
-            }
-        } catch (e: Exception) {
-            return false to "${e.javaClass.simpleName}: ${e.message}"
-        } finally {
-            runCatching { sock.close() }
-        }
+        log("⚠ netd never answered ${SystemClock.uptimeMillis() - t0} ms after its start; booting on (ConnectivityService may fail)")
     }
 
     // ------------------------------------------------------------------ присмотр
