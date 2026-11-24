@@ -135,6 +135,15 @@ public final class ManagerActivity extends Activity {
             }
         });
         root.addView(inbox);
+
+        Button vpn = new Button(this);
+        vpn.setText("VPN 測試（控制面）");
+        vpn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                startActivity(new Intent(ManagerActivity.this, VpnTestActivity.class));
+            }
+        });
+        root.addView(vpn);
         setContentView(root);
         showPanel("status");
         connect();
