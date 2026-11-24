@@ -1,6 +1,8 @@
 package app.aemu.core
 
 import android.content.Context
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
 import android.os.Process as AProcess
 import android.os.SystemClock
 import android.view.Surface
@@ -808,6 +810,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             }
             startService(svc)
             svc.waitSocket?.let { sock -> waitFor("socket $sock", 20_000) { paths.socket(sock).exists() } }
+            // a listening netd socket is not yet a netd that answers: probe it for real
+            // before the plan moves on towards zygote (see probeNetd)
+            if (svc.name == "netd" && svc.waitSocket != null) probeNetd()
             if (svc.delayMs > 0) Thread.sleep(svc.delayMs)
         }
         if (!glDone) glUp()
@@ -996,6 +1001,61 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         val ok = cond()
         if (!ok) log("⚠ timed out waiting for: $what")
         return ok
+    }
+
+    /**
+     * The waitSocket gate above proves nothing about netd: the translator creates the
+     * listening socket at spawn time, while netd itself needs tens of seconds under
+     * translation before its command loop reads anything. The framework's first
+     * synchronous netd call sits inside ConnectivityService's constructor
+     * (EthernetDataTracker's interface list, guarded only against RemoteException);
+     * when it eats the 60 s daemon timeout, the exception crosses the constructor,
+     * SystemServer skips registering the connectivity service, and the whole boot has
+     * no network service. So probe netd on an own connection with that very command
+     * and hold the plan until it answers — the race becomes a wait. Bounded at 60 s:
+     * a netd that never answers must not hang the boot; we proceed and say so.
+     */
+    private fun probeNetd() {
+        val path = paths.socket("netd").absolutePath
+        val t0 = SystemClock.uptimeMillis()
+        val deadline = t0 + 60_000
+        var attempt = 0
+        while (SystemClock.uptimeMillis() < deadline && !stopping) {
+            attempt++
+            val ok = runCatching {
+                val sock = LocalSocket()
+                try {
+                    sock.connect(LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM))
+                    sock.soTimeout = 5_000
+                    val out = sock.outputStream
+                    out.write("0 interface list\u0000".toByteArray(Charsets.US_ASCII))
+                    out.flush()
+                    // replies are NUL-terminated "code seq text": 1xx continues, 2xx and
+                    // above ends the exchange (an error reply proves dispatch just as well)
+                    val inp = sock.inputStream
+                    val sb = StringBuilder()
+                    var final = false
+                    while (!final) {
+                        val b = inp.read()
+                        if (b < 0) return@runCatching false
+                        if (b == 0) {
+                            val code = sb.toString().trim().split(' ', limit = 2).firstOrNull()?.toIntOrNull()
+                            sb.setLength(0)
+                            if (code != null && code >= 200) final = true
+                        } else sb.append(b.toChar())
+                    }
+                    true
+                } finally {
+                    runCatching { sock.close() }
+                }
+            }.getOrDefault(false)
+            if (ok) {
+                log("netd: answering after ${(SystemClock.uptimeMillis() - t0) / 1000} s (probe attempt $attempt)")
+                return
+            }
+            Thread.sleep(1_000)
+        }
+        if (!stopping) log("⚠ netd: no answer to the probe in 60 s, starting the framework anyway")
     }
 
     // ------------------------------------------------------------------ присмотр
