@@ -1769,7 +1769,12 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     /**
      * sys.boot_completed: the agent's inbox app (the AEmuImport list inside the guest). Installed the way
      * the Magisk app is — staged through data/local/tmp, a plain tree directory the installer reads fine —
-     * when it is missing or its length differs from the delivered copy.
+     * when it is missing or its length differs from the delivered copy. A replace install the package
+     * manager refuses falls back to an uninstall and a fresh install: the app is signed by a key its build
+     * generates on the spot (the keystore is gitignored, so no two builds share one) and pm will not replace
+     * across signatures, which would otherwise pin the guest to the first build's copy forever. The app
+     * holds no state of its own — the hide list is the agent service's file, the inbox a folder — so the
+     * fresh install loses nothing.
      */
     private fun agentBootComplete() {
         if (!agentOn) return
@@ -1784,8 +1789,15 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             java.nio.file.Files.copy(apk.toPath(), staged.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
             staged.setReadable(true, false)
             try {
-                val out = installApk("/data/local/tmp/aemu-agent.apk").trim()
-                log("agent: inbox app install -> ${out.take(300)}")
+                var out = installApk("/data/local/tmp/aemu-agent.apk").trim()
+                if (out.contains("Success")) {
+                    log("agent: inbox app install -> ${out.take(300)}")
+                } else {
+                    log("agent: inbox app update refused (${out.take(200)}); reinstalling from scratch")
+                    val un = guestShell("pm uninstall ${AgentSupport.APP_PACKAGE}", 60_000).trim()
+                    out = installApk("/data/local/tmp/aemu-agent.apk").trim()
+                    log("agent: inbox app install -> ${out.take(300)} (after uninstall: ${un.take(120)})")
+                }
             } finally {
                 staged.delete()
             }
