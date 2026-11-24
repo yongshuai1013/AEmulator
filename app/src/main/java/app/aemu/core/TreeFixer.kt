@@ -1880,6 +1880,12 @@ class TreeFixer(
      * reached the subtree (the "fixup" dump is already narrow) or something narrowed it
      * again during the boot (fixup wide, "booted" narrow). Comparing the two dumps
      * decides; guest-side `ls -l` is forged and cannot serve. Read-only: lstat + log.
+     *
+     * The list also carries com.android.providers.contacts (contacts-cantopen-desk):
+     * its failure is SQLITE_CANTOPEN on contacts2.db, not EACCES, and the guest dies
+     * before "booted" ever fires — hence the third timepoint, "stop", dumped from the
+     * watchdog when a zygote death is declared fatal. Node lines carry st_size so a
+     * present-but-empty (or truncated) database file is visible at a glance.
      */
     fun dumpModes(tag: String) {
         val dataDir = File(root, "data/data")
@@ -1893,7 +1899,7 @@ class TreeFixer(
                 val st = runCatching { Os.lstat(f.absolutePath) }.getOrNull() ?: continue
                 if (n < MODE_DUMP_MAX) {
                     val rel = f.relativeTo(base).path.ifEmpty { "." }
-                    log(String.format("modedump[%s] %s/%s mode=%06o dev=%016x ino=%016x", tag, pkg, rel, st.st_mode, st.st_dev, st.st_ino))
+                    log(String.format("modedump[%s] %s/%s mode=%06o dev=%016x ino=%016x size=%d", tag, pkg, rel, st.st_mode, st.st_dev, st.st_ino, st.st_size))
                 }
                 n++
                 if (!OsConstants.S_ISLNK(st.st_mode) && f.isDirectory) f.listFiles()?.forEach { todo.add(it) }
@@ -1941,11 +1947,13 @@ class TreeFixer(
             } else ""
             log(String.format("modedump[%s] linkcheck %s mode=%06o dev=%016x ino=%016x%s", tag, rel, st.st_mode, st.st_dev, st.st_ino, kind))
         }
-        // One representative node resolved through the link, against the same package's
+        // Representative nodes resolved through the link, against the same packages'
         // direct data/data values in the dump above: same (dev,ino) or an escape.
-        runCatching { Os.stat(File(userZero, "com.google.android.gsf").absolutePath) }
-            .onSuccess { st -> log(String.format("modedump[%s] linkcheck data/user/0/com.google.android.gsf mode=%06o dev=%016x ino=%016x", tag, st.st_mode, st.st_dev, st.st_ino)) }
-            .onFailure { log("modedump[$tag] linkcheck data/user/0/com.google.android.gsf: stat failed: ${it.message}") }
+        for (pkg in listOf("com.google.android.gsf", "com.android.providers.contacts")) {
+            runCatching { Os.stat(File(userZero, pkg).absolutePath) }
+                .onSuccess { st -> log(String.format("modedump[%s] linkcheck data/user/0/%s mode=%06o dev=%016x ino=%016x", tag, pkg, st.st_mode, st.st_dev, st.st_ino)) }
+                .onFailure { log("modedump[$tag] linkcheck data/user/0/$pkg: stat failed: ${it.message}") }
+        }
     }
 
     /** Пропустить миграцию PRE_BOOT_COMPLETED (4.x): под эмуляцией она занимает минуты. */
@@ -2259,8 +2267,8 @@ class TreeFixer(
 
     companion object {
         private const val OPEN_GL = "engines/kk/libGLES_aemu.so"
-        /** dumpModes targets: the database packages whose guest opens fail with EACCES (owners-key-measure Q2-f). */
-        private val MODE_DUMP_PKGS = listOf("com.android.providers.calendar", "com.google.android.gsf", "com.android.providers.media")
+        /** dumpModes targets: the database packages whose guest opens fail (EACCES trio of owners-key-measure Q2-f, plus contacts whose contacts2.db open fails with SQLITE_CANTOPEN — contacts-cantopen-desk). */
+        private val MODE_DUMP_PKGS = listOf("com.android.providers.calendar", "com.google.android.gsf", "com.android.providers.media", "com.android.providers.contacts")
         private const val MODE_DUMP_MAX = 120
         /** Мастера первого запуска: Samsung, Google, AOSP, MIUI, HTC, Sony */
         val SETUP_WIZARDS = listOf(

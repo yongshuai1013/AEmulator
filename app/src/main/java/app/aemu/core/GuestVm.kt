@@ -1352,6 +1352,20 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         runCatching { marker.writeText("1") }
     }
 
+    /**
+     * Third dumpModes timepoint (contacts-cantopen-desk): a guest that dies before
+     * sys.boot_completed never produces the "booted" dump, so when the watchdog
+     * declares a zygote death fatal it also captures the post-boot tree state as
+     * "stop". Once per VM run; read-only lstat + log, the stop flow itself is
+     * untouched.
+     */
+    private val stopDumpDone = java.util.concurrent.atomic.AtomicBoolean(false)
+    private fun dumpModesOnStop() {
+        if (!stopDumpDone.compareAndSet(false, true)) return
+        runCatching { TreeFixer(ctx, paths, img, ::log).dumpModes("stop") }
+            .onFailure { log("modedump[stop]: dump failed: ${it.message}") }
+    }
+
     /** qemu maps a guest path into the tree only if the file exists there, so the shim's request file is pre-made */
     private val power: File get() = File(paths.root, "dev/aemu_power")
 
@@ -1374,6 +1388,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                             if (code == 137 && guestLogHas("No original dex files found"))
                                 failure = "system_server cannot start: the precompiled code of the framework (system/framework/oat) is missing from this container — import the firmware again"
                             log("✖ $failure"); setState(State.FAILED)
+                            dumpModesOnStop()
                         } else if (plannedRestart) {
                             plannedRestart = false
                             killZygoteChildren()
@@ -1388,6 +1403,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                             if (recentCrashesIn1Min >= 5 || zygoteCrashes.size > 6) {
                                 failure = "system keeps crashing: $name exited $recentCrashesIn1Min times in 1 min (${zygoteCrashes.size} times in 10 min, last code $code)"
                                 log("✖ $failure"); setState(State.FAILED)
+                                dumpModesOnStop()
                             } else {
                                 log("✖ $name crashed (code $code), restarting system ($zygoteRestarts)")
                                 restartZygote()
