@@ -40,6 +40,14 @@ enum class Kernel64(
      *  Chromium draw on the phone's GPU too (the 4.4 engine's closed bridge has no EGLImage of a texture), with the
      *  engine's 32-bit SwiftShader behind it */
     val gpuBridge32Open: Boolean = false,
+    /** the open bridge for 32-bit programs stands under the merged "emulation" name next to the 32-bit drivers of
+     *  a Treble kernel, instead of the gpuBridge32 planting in system/lib/egl: that field also starts the 4.4
+     *  engine's bridge server (GuestVm.glUp) and sets its runner environment (GuestRunner), which belong to the
+     *  closed bridge and are no part of this shape — the host renderer here is the one of the 64-bit bridge
+     *  (GlHost, on /dev/socket/aemu_gl for both widths). Behind the bridge stands the kernel's own 32-bit
+     *  SwiftShader in the same directory, which it opens by name; with the GPU off the merged name is
+     *  SwiftShader's again (see TreeFixer) */
+    val bridge32OpenAsEmulation: Boolean = false,
     /**
      * SurfaceFlinger is told to compose every layer itself (its own debug call 1008). 11: over the 8.1 composer
      * service its layers stay "device" ones, which the framebuffer composer never draws: a black screen.
@@ -266,7 +274,7 @@ enum class Kernel64(
         firmwareOwn = listOf("vendor#bin#hw#android.hardware.media.omx@1.0-service", "vendor#etc#init#android.hardware.media.omx@1.0-service.rc",
             "vendor#lib#libmediacodecservice.so")),
     // Android 8.1
-    A8_1("27", 27..27, gpuBridge64 = true, bridgeAsEmulation = true, emulationDir = "vendor/lib64/egl", qcomHandles = true, webViewSingleProcess = true, registeredNetwork = true, treble = true, eglDir = "vendor/lib64/egl", gles = "2",
+    A8_1("27", 27..27, gpuBridge64 = true, bridgeAsEmulation = true, emulationDir = "vendor/lib64/egl", bridge32OpenAsEmulation = true, qcomHandles = true, webViewSingleProcess = true, registeredNetwork = true, treble = true, eglDir = "vendor/lib64/egl", gles = "2",
         // MIUI's system_server reads the panel colour from the touch controller's lockdown bytes before anything else
         // and dies closing the reader it never opened when the file is not there
         procFiles = mapOf("tp_lockdown_info" to "4636320131320200\n"),

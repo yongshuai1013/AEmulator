@@ -474,6 +474,27 @@ class TreeFixer(
                 } else if (to != name || !isLink(f)) f.delete()
             }
         }
+        // the open GPU bridge for 32-bit programs of a Treble kernel (Kernel64.bridge32OpenAsEmulation): a Treble
+        // libEGL loads its drivers in the vendor namespace, which does not reach the system/lib/egl planting
+        // above, so the bridge stands next to the 32-bit drivers themselves, under the merged name the loader
+        // asks for with the GPU on — the name the emulation block below gives SwiftShader whenever the bridge
+        // is not there (nothing the asset copies ship carries that name, so the two never overwrite each
+        // other). With the GPU off a copy planted by an earlier start comes out again here (only ever our own
+        // copy — the length is the bridge's) and the name goes back to SwiftShader.
+        var bridge32Up = false
+        if (kernel.bridge32OpenAsEmulation) {
+            val on = img.settings.gpu && File(root, "system/bin/app_process32").isFile
+            val f = File(root, "${kernel.eglDir.replace("/lib64/", "/lib/")}/libGLES_emulation.so")
+            val len = EngineAssets.size(ctx, "engines/kk/libGLES_aemu.so")
+            if (on) runCatching {
+                if (isLink(f) || !f.isFile || f.length() != len) {
+                    f.delete()
+                    EngineAssets.open(ctx, "engines/kk/libGLES_aemu.so").use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+                    f.setReadable(true, false); f.setExecutable(true, false); copied++
+                }
+                bridge32Up = true
+            } else if (!isLink(f) && f.isFile && f.length() == len) f.delete()
+        }
         // 10+ over the 8.1 vendor side: the codec service there is 8.1's, and its minijail takes one @include in a
         // policy; the system image's policy has a second one (code coverage, empty in a release build), and the
         // service gives up on it. That line goes.
@@ -604,7 +625,9 @@ class TreeFixer(
         // itself (emulationDir names the 64-bit one there, as eglDir does): the links then stand next to the files
         // they name, under bare names, and the combined "GLES" name the loader tries first goes to SwiftShader's
         // libEGL — the one body whose eglGetProcAddress serves the merged load (the GLESv2 body has none to give,
-        // and a driver taken for merged without it leaves null calls behind)
+        // and a driver taken for merged without it leaves null calls behind). Where the kernel's 32-bit GPU bridge
+        // is planted under that same name this start (bridge32Up), the bridge serves the merged load instead and
+        // the link is not made; the split names go to SwiftShader either way.
         if (kernel.emulationDir != null) {
             val srcDir = "vendor/lib/egl"
             val linkDir = kernel.emulationDir!!.replace("/lib64/", "/lib/")
@@ -617,7 +640,7 @@ class TreeFixer(
                     if (!isLink(link)) { link.delete(); runCatching { Os.symlink(if (sameDir) f.name else "../../../$srcDir/${f.name}", link.path) } }
                 }
             }
-            if (sameDir) {
+            if (sameDir && !bridge32Up) {
                 val link = File(root, "$linkDir/libGLES_emulation.so")
                 if (!isLink(link)) { link.delete(); runCatching { Os.symlink("libEGL_swiftshader.so", link.path) } }
             }
