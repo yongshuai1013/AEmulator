@@ -157,6 +157,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     private val logd = LogdSink(paths, ::log)
     /** the guest log, copied to run/logcat-stream.log in real time so a crash's death segment survives */
     private val logStream = GuestLogStream(paths, ::log)
+    /** one tombstone mirror scan at a time (see [mirrorTombstones]) */
+    private val tombstoneMirrorBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     /** notification / battery LED of the guest (lights HAL → /dev/aemu_lights) */
     val lights = Lights(paths.root, ::log)
     /** the phone's accelerometer and vibration motor for the guest */
@@ -1255,6 +1257,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             Thread { magiskBootComplete() }.start()
             Thread { agentBootComplete() }.start()
             Thread { afterBoot() }.start()
+            mirrorTombstones()
         }
     }
 
@@ -1577,6 +1580,24 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     @Volatile private var plannedRestart = false
     private var wizardSkipped = false
 
+    /**
+     * Copies the guest tree's native-crash tombstones into run/ (GuestLog.mirrorTombstones),
+     * always on its own thread: a zygote restart and the boot itself must never wait on a
+     * copy. Runs after every boot_completed and, delayed a few seconds, after every zygote
+     * restart — debuggerd writes the tombstone as the crash happens, so it is already in
+     * the tree by restart time even if the new system never reaches boot_completed.
+     */
+    private fun mirrorTombstones(delayMs: Long = 0) {
+        Thread {
+            if (delayMs > 0) runCatching { Thread.sleep(delayMs) }
+            if (!tombstoneMirrorBusy.compareAndSet(false, true)) return@Thread
+            try {
+                runCatching { GuestLog.mirrorTombstones(paths.root, paths.bin, ::log) }
+                    .onFailure { log("tombstone: mirror scan failed: ${it.message}") }
+            } finally { tombstoneMirrorBusy.set(false) }
+        }.start()
+    }
+
     private fun restartZygote() {
         // the stream keeps the dead system's last records above this marker
         logStream.mark("zygote restart")
@@ -1602,6 +1623,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             synchronized(procs) { procs.remove("zygote_secondary") }?.let { runCatching { it.destroyForcibly() } }
             runCatching { startService(z2) }
         }
+        // the crash that brought us here left its tombstone in the tree; mirror it host-side
+        mirrorTombstones(4_000)
     }
 
     private fun guestLogHas(text: String): Boolean = runCatching {
