@@ -44,6 +44,17 @@ object GuestLog {
         return out
     }
 
+    /**
+     * Newest native-crash tombstone in the guest tree (data/tombstones/tombstone_*),
+     * picked by modification time (name breaks ties). Null when the directory is
+     * missing or holds no tombstone — the guest never crashed natively.
+     */
+    fun latestTombstone(root: File): File? {
+        val files = runCatching { File(root, "data/tombstones").listFiles() }.getOrNull() ?: return null
+        return files.filter { it.isFile && it.name.startsWith("tombstone_") }
+            .maxWithOrNull(compareBy({ it.lastModified() }, { it.name }))
+    }
+
     fun parse(data: ByteArray): List<Rec> {
         val out = ArrayList<Rec>()
         var i = 0

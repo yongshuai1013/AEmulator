@@ -128,6 +128,7 @@ import app.aemu.core.GuestLog
 import app.aemu.core.GuestVm
 import app.aemu.core.ImageStore
 import app.aemu.core.InputService
+import java.io.File
 import kotlinx.coroutines.delay
 import kotlin.concurrent.thread
 
@@ -1206,7 +1207,11 @@ class VmActivity : ComponentActivity() {
                     Text(stringResource(R.string.log), style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f),
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
                     IconButton(onClick = { copyLog(list.toList()) }) { Icon(Icons.Rounded.ContentCopy, stringResource(R.string.log_copy)) }
-                    IconButton(onClick = { pendingExport = if (guestTab) GuestLog.exportLines(vm.paths.root) else list.toList(); exportLog.launch("aemu-${vm.img.id}-${if (guestTab) "logcat" else "host"}.log") }) {
+                    IconButton(onClick = {
+                        pendingExport = if (guestTab) GuestLog.exportLines(vm.paths.root) else list.toList()
+                        pendingTombstone = if (guestTab) GuestLog.latestTombstone(vm.paths.root) else null
+                        exportLog.launch("aemu-${vm.img.id}-${if (guestTab) "logcat" else "host"}.log")
+                    }) {
                         Icon(Icons.Rounded.Download, stringResource(R.string.log_export))
                     }
                     FilledTonalIconButton(onClick = onClose) { Icon(Icons.Rounded.Close, stringResource(R.string.close)) }
@@ -1299,10 +1304,30 @@ class VmActivity : ComponentActivity() {
 
     private var pendingExport: List<String> = emptyList()
     private val exportLog = registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
-        if (uri == null) return@registerForActivityResult
+        if (uri == null) { pendingTombstone = null; return@registerForActivityResult }
         val lines = pendingExport
         thread {
             val ok = runCatching { contentResolver.openOutputStream(uri)!!.bufferedWriter().use { w -> lines.forEach { w.write(it); w.write("\n") } } }.isSuccess
+            runOnUiThread {
+                Toast.makeText(this, if (ok) R.string.log_exported else R.string.log_export_failed, Toast.LENGTH_SHORT).show()
+                // Guest-tab exports also offer the newest guest tombstone as a second
+                // document; host-tab exports never set pendingTombstone.
+                val ts = pendingTombstone
+                if (ok && ts != null) exportTombstone.launch("aemu-${vm.img.id}-${ts.name}.txt")
+                else pendingTombstone = null
+            }
+        }
+    }
+
+    private var pendingTombstone: File? = null
+    private val exportTombstone = registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+        val f = pendingTombstone
+        pendingTombstone = null
+        if (uri == null || f == null) return@registerForActivityResult
+        thread {
+            // Byte-for-byte copy: tombstones are debuggerd text but may carry
+            // non-UTF-8 bytes in register/memory dumps, so no line/charset pass.
+            val ok = runCatching { contentResolver.openOutputStream(uri)!!.use { out -> f.inputStream().use { it.copyTo(out) } } }.isSuccess
             runOnUiThread { Toast.makeText(this, if (ok) R.string.log_exported else R.string.log_export_failed, Toast.LENGTH_SHORT).show() }
         }
     }
