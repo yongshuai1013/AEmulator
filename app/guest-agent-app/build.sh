@@ -5,7 +5,11 @@
 # this script (agent.keystore, gitignored like every keystore here): the app is ours alone, installed by
 # the host through pm, and its updates are recognised by package + versionCode, not by signature continuity
 # with anything else.
-# Needs a JDK (javac, keytool) and the Android SDK (aapt2, d8, zipalign, apksigner, android.jar):
+# The APK also carries the isolation probe binary (isoprobe.c, compiled here with the NDK and stored
+# in the zip as "aemu-isoprobe"): the agent service extracts and runs it for the probe page. A build
+# without the NDK fails loudly rather than shipping an app whose probe page cannot run.
+# Needs a JDK (javac, keytool), the Android SDK (aapt2, d8, zipalign, apksigner, android.jar) and
+# the NDK (ANDROID_NDK_HOME, or an ndk/ directory inside the SDK):
 #   ANDROID_HOME=/path/to/sdk ./build.sh     (android-19 jar is enough; BT picks the newest build-tools)
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
@@ -25,7 +29,16 @@ javac -encoding UTF-8 --release 8 -nowarn -Xlint:-options -cp "$JAR" -d "$work/c
     $(find "$here/java" -name '*.java')
 (cd "$work/classes" && zip -q -X "$work/classes.jar" $(find . -name '*.class'))
 "${BT}d8" --min-api 14 --lib "$JAR" --output "$work" "$work/classes.jar"
-python3 -c "import zipfile;z=zipfile.ZipFile('$work/base.apk','a',zipfile.ZIP_DEFLATED);z.write('$work/classes.dex','classes.dex');z.close()"
+NDK=${ANDROID_NDK_HOME:-${NDK:-}}
+if [ -z "$NDK" ] && [ -d "$SDK/ndk" ]; then NDK=$(ls -d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -1); fi
+CBIN=""
+if [ -n "$NDK" ]; then
+    CBIN="$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin"
+    [ -x "$CBIN/clang" ] || CBIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+fi
+[ -n "$CBIN" ] && [ -x "$CBIN/clang" ] || { echo "isoprobe: no NDK clang found (set ANDROID_NDK_HOME)"; exit 1; }
+"$CBIN/clang" --target=aarch64-linux-android23 -O2 -static -Wall -o "$work/aemu-isoprobe" "$here/isoprobe.c"
+python3 -c "import zipfile;z=zipfile.ZipFile('$work/base.apk','a',zipfile.ZIP_DEFLATED);z.write('$work/classes.dex','classes.dex');z.write('$work/aemu-isoprobe','aemu-isoprobe',zipfile.ZIP_STORED);z.close()"
 "${BT}zipalign" -f 4 "$work/base.apk" "$work/aligned.apk"
 out="$here/../src/main/assets/engines/kk/aemu-agent.apk"
 "${BT}apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --out "$out" "$work/aligned.apk"

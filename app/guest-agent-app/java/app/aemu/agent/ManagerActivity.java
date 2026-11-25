@@ -146,6 +146,15 @@ public final class ManagerActivity extends Activity {
             }
         });
         root.addView(vpn);
+
+        Button iso = new Button(this);
+        iso.setText("隔離探針");
+        iso.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                startActivity(new Intent(ManagerActivity.this, IsoProbeActivity.class));
+            }
+        });
+        root.addView(iso);
         setContentView(root);
         showPanel("status");
         connect();
@@ -159,6 +168,8 @@ public final class ManagerActivity extends Activity {
             .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
         menu.add(Menu.NONE, 2, Menu.NONE, "Import inbox")
             .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
+        menu.add(Menu.NONE, 3, Menu.NONE, "隔離探針")
+            .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
         return true;
     }
 
@@ -169,6 +180,10 @@ public final class ManagerActivity extends Activity {
         }
         if (item.getItemId() == 2) {
             startActivity(new Intent(this, InboxActivity.class));
+            return true;
+        }
+        if (item.getItemId() == 3) {
+            startActivity(new Intent(this, IsoProbeActivity.class));
             return true;
         }
         return super.onOptionsItemSelected(item);

@@ -28,10 +28,15 @@ public final class AgentClient {
 
     /** one command, all answer lines (without the closing END) */
     public static List<String> call(String command) throws IOException {
+        return call(command, TIMEOUT_MS);
+    }
+
+    /** one command on a slower clock (ISORUN: the agent runs a whole probe suite first) */
+    public static List<String> call(String command, int timeoutMs) throws IOException {
         LocalSocket s = new LocalSocket();
         try {
             s.connect(new LocalSocketAddress(SOCKET, LocalSocketAddress.Namespace.ABSTRACT));
-            s.setSoTimeout(TIMEOUT_MS);
+            s.setSoTimeout(timeoutMs);
             OutputStream out = s.getOutputStream();
             out.write((command + "\n").getBytes("UTF-8"));
             out.flush();
