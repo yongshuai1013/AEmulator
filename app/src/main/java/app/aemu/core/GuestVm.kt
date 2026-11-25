@@ -1822,7 +1822,10 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     /**
      * sys.boot_completed: the agent's inbox app (the AEmuImport list inside the guest). Installed the way
      * the Magisk app is — staged through data/local/tmp, a plain tree directory the installer reads fine —
-     * when it is missing or its length differs from the delivered copy. A replace install the package
+     * when it is missing or its versionCode differs from the delivered copy (length alone is not the gate:
+     * two builds can share a length — 1.3 and 1.4 both landed on 24,973 bytes — and a length-only gate
+     * then skips the update forever; length is only the fallback for when a versionCode cannot be read).
+     * A replace install the package
      * manager refuses falls back to an uninstall and a fresh install: the app is signed by a key its build
      * generates on the spot (the keystore is gitignored, so no two builds share one) and pm will not replace
      * across signatures, which would otherwise pin the guest to the first build's copy forever. The app
@@ -1836,8 +1839,21 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             if (!apk.isFile) { log("agent: aemu-agent.apk is not in the image (build guest-agent-app/build.sh), no inbox app"); return }
             val pkgPath = guestShell("pm path ${AgentSupport.APP_PACKAGE}", 60_000).lines()
                 .firstOrNull { it.startsWith("package:") }?.removePrefix("package:")?.trim()
-            val guestLen = pkgPath?.let { guestShell("wc -c < $it", 30_000).trim().toLongOrNull() }
-            if (pkgPath != null && guestLen == apk.length()) return
+            if (pkgPath != null) {
+                val installedCode = Regex("""versionCode=(\d+)""")
+                    .find(guestShell("dumpsys package ${AgentSupport.APP_PACKAGE}", 60_000))
+                    ?.groupValues?.get(1)?.toIntOrNull()
+                val stagedCode = runCatching {
+                    ctx.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)?.versionCode
+                }.getOrNull()
+                if (installedCode != null && stagedCode != null) {
+                    if (installedCode == stagedCode) return
+                    log("agent: inbox app versionCode $installedCode, delivered $stagedCode: updating")
+                } else {
+                    val guestLen = guestShell("wc -c < $pkgPath", 30_000).trim().toLongOrNull()
+                    if (guestLen == apk.length()) return
+                }
+            }
             val staged = File(paths.root, "data/local/tmp").apply { mkdirs() }.let { File(it, "aemu-agent.apk") }
             java.nio.file.Files.copy(apk.toPath(), staged.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
             staged.setReadable(true, false)

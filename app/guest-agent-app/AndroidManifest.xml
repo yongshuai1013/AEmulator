@@ -5,8 +5,8 @@
      boot complete (AgentSupport.APK_COPY); the package id is AgentSupport.APP_PACKAGE. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="app.aemu.agent"
-    android:versionCode="5"
-    android:versionName="1.4">
+    android:versionCode="6"
+    android:versionName="1.5">
 
     <uses-sdk android:minSdkVersion="14" android:targetSdkVersion="23" />
 

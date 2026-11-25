@@ -3,7 +3,7 @@
 # ManagerActivity — the Root Manager — InboxActivity and AgentClient), without Gradle, like
 # tools/guesttest. Signed with a self-generated keystore next to
 # this script (agent.keystore, gitignored like every keystore here): the app is ours alone, installed by
-# the host through pm, and its updates are recognised by package + length, not by signature continuity
+# the host through pm, and its updates are recognised by package + versionCode, not by signature continuity
 # with anything else.
 # Needs a JDK (javac, keytool) and the Android SDK (aapt2, d8, zipalign, apksigner, android.jar):
 #   ANDROID_HOME=/path/to/sdk ./build.sh     (android-19 jar is enough; BT picks the newest build-tools)
