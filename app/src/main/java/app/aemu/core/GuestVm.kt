@@ -129,6 +129,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         listeners.forEach { runCatching { it(line) } }
     }
     fun lines(): List<String> = lines.toList()
+    /** the real-time guest log stream files (rotated backups first, the live file last) for the panel's export */
+    fun logStreamFiles(): List<File> = logStream.filesOldestFirst()
     fun onLog(l: (String) -> Unit) { listeners.add(l) }
     fun onState(l: (State) -> Unit) { stateListeners.add(l) }
     private fun setState(s: State) { state = s; stateListeners.forEach { runCatching { it(s) } } }
@@ -153,6 +155,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     val frames = FrameBell(paths, ::log) { onFrame?.invoke() }
     private val events = EventsSink(paths, ::log)
     private val logd = LogdSink(paths, ::log)
+    /** the guest log, copied to run/logcat-stream.log in real time so a crash's death segment survives */
+    private val logStream = GuestLogStream(paths, ::log)
     /** notification / battery LED of the guest (lights HAL → /dev/aemu_lights) */
     val lights = Lights(paths.root, ::log)
     /** the phone's accelerometer and vibration motor for the guest */
@@ -683,6 +687,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         // the storage size the guest is told (AEmulator Plus): the size node the shim reads; 64-bit engine only
         if (engine == Engine.N64) StorageSpoof.writeNode(paths.root, s.storageGb)
         if (img.api >= 21) logd.start()
+        logStream.start()
         if (img.api >= 14) runCatching { dns.ensure() }
         if (img.engine == Engine.N64 && img.api == 23) runCatching { vpnHub.ensure() }
         // the RAM the guest is told it has (its /proc/meminfo, scaled by the kernel): the framework sizes its background by it
@@ -1573,6 +1578,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     private var wizardSkipped = false
 
     private fun restartZygote() {
+        // the stream keeps the dead system's last records above this marker
+        logStream.mark("zygote restart")
         val z = img.services.firstOrNull { it.name == "zygote" } ?: return
         bootDoneAt = 0
         setState(State.BOOTING)
@@ -1655,6 +1662,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         log("stop: begin vpnHubStop"); vpnHub.stop(); log("stop: done vpnHubStop")
         log("stop: begin eventsStop"); events.stop(); log("stop: done eventsStop")
         log("stop: begin logdStop"); logd.stop(); log("stop: done logdStop")
+        log("stop: begin logStreamStop"); logStream.stop(); log("stop: done logStreamStop")
         log("stop: begin lightsStop"); lights.stop(); log("stop: done lightsStop")
         log("stop: begin sensorsStop"); sensors.stop(); log("stop: done sensorsStop")
         log("stop: begin micStop"); mic.stop(); log("stop: done micStop")
