@@ -181,6 +181,24 @@ def main():
          f"-L{arm_lib}", "-ldl", "-lc", "-llog"], cwd=glsplit_dir)
     subprocess.run([strip, out_split])
 
+    # 8. gatekeeperhal: aemu-gatekeeper.so / aemu-gatekeeper32.so (software GateKeeper legacy
+    # module for api 27; TreeFixer plants it over the firmware's TEE-backed gatekeeper.*.so)
+    gk_dir = os.path.join(repo_root, "native", "gatekeeperhal")
+    n64_27_dir = os.path.join(assets, "n64-27")
+    os.makedirs(n64_27_dir, exist_ok=True)
+    out_gk64 = os.path.join(n64_27_dir, "aemu-gatekeeper.so")
+    run([clang, "--target=aarch64-linux-android27", "-Os", "-fPIC", "-shared", "-nostdlib",
+         "-fvisibility=hidden", "-fno-stack-protector", "-ffreestanding", "-fno-builtin",
+         "-Wl,-z,norelro", "-Wl,--no-undefined", "-Wl,-soname,gatekeeper.aemu.so",
+         "-Wl,--build-id=none", "-o", out_gk64, "gatekeeper_soft.c", "-lc", "-llog"], cwd=gk_dir)
+    subprocess.run([strip, out_gk64])
+    out_gk32 = os.path.join(n64_27_dir, "aemu-gatekeeper32.so")
+    run([clang, "--target=armv7a-linux-androideabi27", "-march=armv7-a", "-mthumb", "-Os", "-fPIC", "-shared",
+         "-nostdlib", "-fvisibility=hidden", "-fno-stack-protector", "-ffreestanding", "-fno-builtin",
+         "-Wl,--hash-style=sysv", "-Wl,-z,norelro", "-Wl,--no-undefined", "-Wl,-soname,gatekeeper.aemu.so",
+         "-Wl,--build-id=none", "-o", out_gk32, "gatekeeper_soft.c", "-lc", "-llog"], cwd=gk_dir)
+    subprocess.run([strip, out_gk32])
+
     print("=== All native guest components compiled successfully! ===")
 
 if __name__ == "__main__":
