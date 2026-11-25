@@ -1342,6 +1342,398 @@ static void iso_observe(int fd, const char *guest, char *t, char *line) {
     say(line);
 }
 
+// ---------------------------------------------------------------------------------------------------- isolation shadow resolver
+
+// Shadow mode (the isolation repair batch, observation half): an in-root resolver walks the path a
+// call asked for in guest space — segment by segment, anchored at the guest cwd for a relative path,
+// at the descriptor's guest landing for openat's dirfd, expanding the symlinks it finds in the tree
+// and the /proc magic doorways (self/root, <pid>/root, self/cwd, <pid>/cwd, self/exe, <pid>/exe) —
+// and computes where the call SHOULD land if the root were a wall. The answer is never used: it is
+// compared with what really happened and written to the host log as an iso-shadow line. No return
+// value, path or behaviour changes anywhere in this section. A real landing outside the root is
+// checked against the shared-folder authorisation table — a sibling of the root directory,
+// ../aemu-shared.txt, one host path per line with an optional ro/rw word after it, '#' comments, an
+// absent file means an empty table — and the line ends would-deny or would-allow-by-table. The card
+// folder (g_sd) is the one built-in share and, like the other designed surfaces iso_observe stays
+// silent about, never produces a line. ISO_SHADOW=0 silences.
+#define ISO_SHADOW 1
+
+struct isob { char *land, *cur, *probe, *tgt, *rest, *line; };
+
+static void iso_blk(struct isob *b, char **b1, char **b2) {
+    *b1 = pb_get(); *b2 = pb_get();
+    b->land = *b1; b->cur = *b1 + PATH_MAX; b->probe = *b1 + 2 * PATH_MAX;
+    b->tgt = *b2; b->rest = *b2 + PATH_MAX; b->line = *b2 + 2 * PATH_MAX;
+}
+
+static void iso_comm(char *comm) {
+    u64 cl = 0;
+    long cf = S4(NR_openat, AT_FDCWD, "/proc/self/comm", 0, 0);
+    if (cf >= 0) { long n = S3(NR_read, cf, comm, 31); S1(NR_close, cf); if (n > 0) cl = (u64)n; }
+    while (cl && (comm[cl - 1] == '\n' || comm[cl - 1] == ' ')) cl--;
+    comm[cl] = 0;
+    if (!cl) memcpy(comm, "?", 2);
+}
+
+// a landing this layer means to allow (or no file landing at all): no line
+static int iso_quiet(const char *t) {
+    if (t[0] != '/') return 1;
+    if (pre(t, g_root) && (t[g_rootlen] == '/' || !t[g_rootlen])) return 1;
+    if (g_sdlen && pre(t, g_sd) && (t[g_sdlen] == '/' || !t[g_sdlen])) return 1;
+    if (pre(t, "/dev/") || pre(t, "/proc/") || pre(t, "/sys/") || pre(t, "/memfd:")) return 1;
+    return 0;
+}
+
+// the host directory a descriptor (or the working directory) stands on
+static int iso_host_dir(long dirfd, char *out) {
+    char lp[40] = "/proc/self/fd/", num[24];
+    if ((int)dirfd == AT_FDCWD) memcpy(lp, "/proc/self/cwd", 15);
+    else { char *d = utoa((u64)(u32)dirfd, num + sizeof num); memcpy(lp + 14, d, slen(d) + 1); }
+    long r = S4(NR_readlinkat, AT_FDCWD, lp, out, PATH_MAX - 1);
+    if (r <= 0) return 0;
+    out[r] = 0;
+    return out[0] == '/';
+}
+
+static void iso_pop(char *cur) {
+    u64 n = slen(cur);
+    while (n > 1 && cur[n - 1] != '/') n--;
+    if (n > 1) n--;
+    cur[n] = 0;
+    if (!n) { cur[0] = '/'; cur[1] = 0; }
+}
+
+static int iso_push(char *cur, const char *seg, u64 n) {
+    u64 cl = slen(cur);
+    if (cl + n + 2 > PATH_MAX) return -1;
+    if (cl > 1) cur[cl++] = '/';
+    memcpy(cur + cl, seg, n);
+    cur[cl + n] = 0;
+    return 0;
+}
+
+// plain string resolution (no tree probing): ".." is clamped at "/", as the in-root walk clamps it
+static void iso_resolve_str(const char *anchor, const char *path, char *out) {
+    if (path[0] == '/') memcpy(out, "/", 2);
+    else memcpy(out, anchor, slen(anchor) + 1);
+    const char *p = path;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *e = p; while (*e && *e != '/') e++;
+        u64 n = (u64)(e - p);
+        if (n == 1 && p[0] == '.') { p = e; continue; }
+        if (n == 2 && p[0] == '.' && p[1] == '.') { iso_pop(out); p = e; continue; }
+        if (iso_push(out, p, n)) return;
+        p = e;
+    }
+}
+// The /proc magic doorways, met while walking: /proc/<who>/root is the guest root here, not the
+// phone's; /proc/<who>/cwd and /proc/<who>/exe name that process's guest cwd and program.
+static int iso_doorway(char *cur, const char *selfcwd, char *scratch) {
+    if (!pre(cur, "/proc/")) return 0;
+    const char *q = cur + 6, *slash = q;
+    while (*slash && *slash != '/') slash++;
+    if (!*slash) return 0;
+    int self = (slash - q == 4 && pre(q, "self"));
+    int numeric = slash > q;
+    for (const char *d = q; d < slash; d++) if (*d < '0' || *d > '9') numeric = 0;
+    if (!self && !numeric) return 0;
+    if (seq(slash, "/root")) { memcpy(cur, "/", 2); return 1; }
+    if (seq(slash, "/cwd") || seq(slash, "/exe")) {
+        if (self && seq(slash, "/cwd")) { memcpy(cur, selfcwd, slen(selfcwd) + 1); return 1; }
+        if (self && seq(slash, "/exe") && g_exe[0]) { memcpy(cur, g_exe, slen(g_exe) + 1); return 1; }
+        char lp[64];
+        memcpy(lp, "/proc/", 6);
+        memcpy(lp + 6, q, (u64)(slash - q));
+        memcpy(lp + 6 + (slash - q), slash, slen(slash) + 1);
+        long r = S4(NR_readlinkat, AT_FDCWD, lp, scratch, PATH_MAX - 1);
+        if (r <= 0) return 0;
+        scratch[r] = 0;
+        unxl(scratch);
+        memcpy(cur, scratch, slen(scratch) + 1);
+        return 1;
+    }
+    return 0;
+}
+
+// Walk `path` in guest space from the guest directory `anchor`, expanding the tree's symlinks and
+// the /proc doorways; `selfcwd` is this process's cwd in guest terms. Returns 0 with the in-root
+// guest landing in b->cur, 1 when the walk steps onto a designed surface (the /proc or /sys
+// fallthrough, a host device node), 2 when it cannot be resolved (a missing component, a link
+// loop, a mount rewrite it does not model). b->land is not touched.
+static int iso_walk(const char *anchor, const char *path, const char *selfcwd, struct isob *b) {
+    char *cur = b->cur, *rest = b->rest, *probe = b->probe, *tgt = b->tgt;
+    if (path[0] == '/') memcpy(cur, "/", 2);
+    else memcpy(cur, anchor, slen(anchor) + 1);
+    memcpy(rest, path, slen(path) + 1);
+    u64 off = 0;
+    int depth = 0;
+    for (;;) {
+        while (rest[off] == '/') off++;
+        if (!rest[off]) return 0;
+        u64 e = off;
+        while (rest[e] && rest[e] != '/') e++;
+        u64 n = e - off;
+        const char *seg = rest + off;
+        if (n == 1 && seg[0] == '.') { off = e; continue; }
+        if (n == 2 && seg[0] == '.' && seg[1] == '.') { iso_pop(cur); off = e; continue; }
+        if (iso_push(cur, seg, n)) return 2;
+        off = e;
+        if (iso_doorway(cur, selfcwd, probe)) continue;
+        if (pre(cur, "/proc/") || pre(cur, "/sys/") || seq(cur, "/proc") || seq(cur, "/sys")) {
+            memcpy(probe, g_root, g_rootlen);
+            memcpy(probe + g_rootlen, cur, slen(cur) + 1);
+            struct kstat st;
+            if (S4(NR_newfstatat, AT_FDCWD, probe, &st, 0x100) != 0) return 1;   // not the image's: the phone's, by design
+        }
+        if (pre(cur, "/dev/") && host_dev(cur + 5)) return 1;
+        memcpy(probe, g_root, g_rootlen);
+        memcpy(probe + g_rootlen, cur, slen(cur) + 1);
+        struct kstat st;
+        if (S4(NR_newfstatat, AT_FDCWD, probe, &st, 0x100) != 0) return 2;
+        if ((st.st_mode & 0170000) != 0120000) continue;
+        long tr = S4(NR_readlinkat, AT_FDCWD, probe, tgt, PATH_MAX - 1);
+        if (tr <= 0) return 2;
+        tgt[tr] = 0;
+        if (++depth > 40) return 2;
+        iso_pop(cur);
+        if (tgt[0] == '/') memcpy(cur, "/", 2);
+        u64 tl = slen(tgt), rl = slen(rest + off);
+        if (tl + rl + 2 > PATH_MAX) return 2;
+        char *nb = b->line;
+        memcpy(nb, tgt, tl);
+        u64 no = tl;
+        if (rl) { nb[no++] = '/'; memcpy(nb + no, rest + off, rl); no += rl; }
+        nb[no] = 0;
+        memcpy(rest, nb, no + 1);
+        off = 0;
+    }
+}
+// The authorisation table next to the root: one host path per line, an optional ro/rw word after
+// it, '#' comments; no file, no entries.
+static int iso_table_allows(const char *landing, char *content) {
+    u64 gl = g_rootlen;
+    while (gl && g_root[gl - 1] != '/') gl--;
+    if (!gl || gl + 16 > 600) return 0;
+    char tp[600];
+    memcpy(tp, g_root, gl);
+    memcpy(tp + gl, "aemu-shared.txt", 16);
+    long fd = S4(NR_openat, AT_FDCWD, tp, 0, 0);
+    if (fd < 0) return 0;
+    long n = S3(NR_read, fd, content, PATH_MAX - 1);
+    S1(NR_close, fd);
+    if (n <= 0) return 0;
+    content[n] = 0;
+    char *p = content;
+    while (*p) {
+        char *e = p;
+        while (*e && *e != '\n') e++;
+        char *s = p;
+        while (s < e && (*s == ' ' || *s == '\t' || *s == '\r')) s++;
+        if (s < e && *s != '#') {
+            char *te = s;
+            while (te < e && *te != ' ' && *te != '\t' && *te != '\r') te++;
+            u64 el = (u64)(te - s), ll = slen(landing);
+            int eq = el && el <= ll;
+            for (u64 i = 0; eq && i < el; i++) if (landing[i] != s[i]) eq = 0;
+            if (eq && (el == ll || landing[el] == '/' || s[el - 1] == '/')) return 1;
+        }
+        p = *e ? e + 1 : e;
+    }
+    return 0;
+}
+
+static void iso_shadow_report(const char *kind, const char *akind, const char *asked, const char *lands,
+                              const char *inroot, struct isob *b) {
+    int allow = iso_table_allows(lands, b->rest);
+    char comm[32];
+    iso_comm(comm);
+    char *line = b->line;
+    u64 o = 0;
+    iso_cat(line, &o, "iso-shadow: ");
+    iso_cat(line, &o, comm);
+    iso_cat(line, &o, " ");
+    iso_cat(line, &o, kind);
+    iso_cat(line, &o, " anchor=");
+    iso_cat(line, &o, akind);
+    iso_cat(line, &o, " asked ");
+    iso_cat(line, &o, asked ? asked : "?");
+    iso_cat(line, &o, " lands ");
+    iso_cat(line, &o, lands);
+    iso_cat(line, &o, "; in-root ");
+    iso_cat(line, &o, inroot);
+    iso_cat(line, &o, allow ? "; would-allow-by-table\n" : "; would-deny\n");
+    say(line);
+}
+
+static void iso_shadow_open(int fd, long dirfd, const char *asked) {
+    if (!ISO_SHADOW || !asked) return;
+    struct isob b;
+    char *blk1, *blk2;
+    iso_blk(&b, &blk1, &blk2);
+    const char *akind = (int)dirfd == AT_FDCWD ? "cwd" : "dirfd";
+    int anchor_out = 0, walkrc = 2;
+    if (!iso_host_dir(dirfd, b.tgt)) goto out;
+    if (!(pre(b.tgt, g_root) && (b.tgt[g_rootlen] == '/' || !b.tgt[g_rootlen])) &&
+        !(g_sdlen && pre(b.tgt, g_sd) && (b.tgt[g_sdlen] == '/' || !b.tgt[g_sdlen]))) anchor_out = 1;
+    if (iso_host_dir(AT_FDCWD, b.land)) unxl(b.land);
+    else memcpy(b.land, "/", 2);
+    unxl(b.tgt);
+    if (asked[0] == '/' || !anchor_out) walkrc = iso_walk(b.tgt, asked, b.land, &b);
+    {
+        char lp[40] = "/proc/self/fd/", num[24];
+        char *d = utoa((u64)(u32)fd, num + sizeof num);
+        memcpy(lp + 14, d, slen(d) + 1);
+        long r = S4(NR_readlinkat, AT_FDCWD, lp, b.land, PATH_MAX - 1);
+        if (r <= 0) goto out;
+        b.land[r] = 0;
+    }
+    if (iso_quiet(b.land)) goto out;
+    iso_shadow_report("openat", akind, asked, b.land,
+                      (anchor_out && asked[0] != '/') ? "(anchor outside the root)" :
+                      walkrc == 1 ? "(designed surface)" : walkrc ? "(unresolved)" : b.cur, &b);
+out:
+    pb_put(blk1);
+    pb_put(blk2);
+}
+// A bare read of a /proc magic doorway: the answer names a host place. A root doorway always
+// leads out (its in-root answer is the guest's own "/"); a cwd/exe naming an in-root file is an
+// honest answer and stays silent.
+static void iso_shadow_magic(const char *asked, const char *raw) {
+    if (!ISO_SHADOW || !asked || !raw) return;
+    if (!pre(asked, "/proc/")) return;
+    const char *q = asked + 6, *slash = q;
+    while (*slash && *slash != '/') slash++;
+    if (!*slash) return;
+    int self = (slash - q == 4 && pre(q, "self"));
+    int numeric = slash > q;
+    for (const char *d = q; d < slash; d++) if (*d < '0' || *d > '9') numeric = 0;
+    if (!self && !numeric) return;
+    int isroot = seq(slash, "/root");
+    if (!isroot && !seq(slash, "/cwd") && !seq(slash, "/exe")) return;
+    if (!isroot && iso_quiet(raw)) return;
+    struct isob b;
+    char *blk1, *blk2;
+    iso_blk(&b, &blk1, &blk2);
+    memcpy(b.land, raw, slen(raw) + 1);
+    const char *inroot = "/";
+    if (!isroot) {
+        memcpy(b.cur, raw, slen(raw) + 1);
+        unxl(b.cur);
+        inroot = b.cur;
+    }
+    iso_shadow_report("readlink", "magic", asked, b.land, inroot, &b);
+    pb_put(blk1);
+    pb_put(blk2);
+}
+
+// chdir is resolved before the move (the anchor is gone afterwards) and reported after it, only
+// when the process really ended up outside the root.
+static void iso_shadow_chdir_pre(const char *asked, char *out) {
+    out[0] = 0;
+    if (!ISO_SHADOW || !asked) return;
+    struct isob b;
+    char *blk1, *blk2;
+    iso_blk(&b, &blk1, &blk2);
+    if (!iso_host_dir(AT_FDCWD, b.tgt)) goto done;
+    if (!(pre(b.tgt, g_root) && (b.tgt[g_rootlen] == '/' || !b.tgt[g_rootlen])) &&
+        !(g_sdlen && pre(b.tgt, g_sd) && (b.tgt[g_sdlen] == '/' || !b.tgt[g_sdlen]))) goto done;
+    unxl(b.tgt);
+    memcpy(b.land, b.tgt, slen(b.tgt) + 1);
+    if (iso_walk(b.tgt, asked, b.land, &b) == 0) memcpy(out, b.cur, slen(b.cur) + 1);
+done:
+    pb_put(blk1);
+    pb_put(blk2);
+}
+
+static void iso_shadow_chdir_post(const char *asked, const char *pre_landing) {
+    if (!ISO_SHADOW || !asked) return;
+    struct isob b;
+    char *blk1, *blk2;
+    iso_blk(&b, &blk1, &blk2);
+    if (iso_host_dir(AT_FDCWD, b.land) && !iso_quiet(b.land))
+        iso_shadow_report("chdir", "cwd", asked, b.land,
+                          pre_landing[0] ? pre_landing : "(anchor outside the root)", &b);
+    pb_put(blk1);
+    pb_put(blk2);
+}
+
+// A symlink planted with a relative target: the target is stored as it was given, and the phone's
+// kernel will walk it from the link's real directory — out of the root, if it climbs. (An absolute
+// target was re-rooted by xl when the link was made, so it cannot climb.)
+static void iso_shadow_symlink(long dirfd, const char *target, const char *linkpath) {
+    if (!ISO_SHADOW || !target || !linkpath || target[0] == '/') return;
+    struct isob b;
+    char *blk1, *blk2;
+    iso_blk(&b, &blk1, &blk2);
+    if (linkpath[0] == '/') {
+        const char *last = linkpath;
+        for (const char *p = linkpath; *p; p++) if (*p == '/') last = p;
+        u64 dl = (u64)(last - linkpath);
+        if (!dl) dl = 1;
+        memcpy(b.probe, linkpath, dl);
+        b.probe[dl] = 0;
+        memcpy(b.tgt, g_root, g_rootlen);
+        memcpy(b.tgt + g_rootlen, b.probe, dl + 1);
+    } else {
+        if (!iso_host_dir(dirfd, b.tgt)) goto done;
+        memcpy(b.probe, b.tgt, slen(b.tgt) + 1);
+        unxl(b.probe);
+        const char *last = 0;
+        for (const char *p = linkpath; *p; p++) if (*p == '/') last = p;
+        if (last) {
+            u64 dl = (u64)(last - linkpath), cl = slen(b.probe), hl = slen(b.tgt);
+            if (cl > 1) b.probe[cl++] = '/';
+            memcpy(b.probe + cl, linkpath, dl);
+            b.probe[cl + dl] = 0;
+            if (hl > 1) b.tgt[hl++] = '/';
+            memcpy(b.tgt + hl, linkpath, dl);
+            b.tgt[hl + dl] = 0;
+        }
+    }
+    iso_resolve_str(b.tgt, target, b.land);          // where the phone's kernel will take this link
+    if (iso_quiet(b.land)) goto done;
+    iso_resolve_str(b.probe, target, b.cur);         // where it should stay
+    {
+        u64 o = 0;
+        iso_cat(b.tgt, &o, target);
+        iso_cat(b.tgt, &o, " at ");
+        iso_cat(b.tgt, &o, linkpath);
+    }
+    iso_shadow_report("symlink", "link", b.tgt, b.land, b.cur, &b);
+done:
+    pb_put(blk1);
+    pb_put(blk2);
+}
+
+// ptrace is observed, never mediated: the request is performed exactly as the guest made it and
+// only the attach-family attempts (traceme, attach, seize) are written down, with their result.
+// The guest's own crash machinery lives on this call — debuggerd attaches to a crashing process
+// to take its tombstone — so an enforcement phase must not simply refuse it; these lines are the
+// evidence that phase will have to separate debuggerd's attaches from a tracer taking over a
+// process it should not own.
+static void iso_shadow_ptrace(long req, long pid, long r) {
+    if (!ISO_SHADOW) return;
+    char comm[32];
+    iso_comm(comm);
+    char line[512];
+    u64 o = 0;
+    iso_cat(line, &o, "iso-shadow: ");
+    iso_cat(line, &o, comm);
+    iso_cat(line, &o, " ptrace ");
+    iso_cat(line, &o, req == 0 ? "traceme" : req == 16 ? "attach" : "seize");
+    iso_cat(line, &o, " pid ");
+    char num[24];
+    char *d = utoa((u64)pid, num + sizeof num);
+    iso_cat(line, &o, d);
+    iso_cat(line, &o, " -> ");
+    if (r < 0) { iso_cat(line, &o, "-"); d = utoa((u64)(-r), num + sizeof num); iso_cat(line, &o, d); }
+    else { d = utoa((u64)r, num + sizeof num); iso_cat(line, &o, d); }
+    iso_cat(line, &o, "\n");
+    say(line);
+}
+
 static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     int err = 0;
     if (g_tun_live) tun_drain();
@@ -1386,7 +1778,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         }
         NEEDX(1);
         if ((a[2] & (3 | 0100 | 01000)) && in_system(a[0], h1, PB(2))) return -EROFS;
-        { long r = S4(nr, a[0], h1, a[2], a[3]); if (r >= 0) iso_observe((int)r, P(1), PB(1), PB(2)); return r; }
+        { long r = S4(nr, a[0], h1, a[2], a[3]); if (r >= 0) { iso_observe((int)r, P(1), PB(1), PB(2)); iso_shadow_open((int)r, a[0], P(1)); } return r; }
     }
     case NR_newfstatat: {
         // fstat as newer C libraries make it (qemu-arm's does): the same answers as for fstat
@@ -1525,6 +1917,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         long r = S4(nr, a[0], h1, t, PATH_MAX - 1);
         if (r < 0) return r;
         t[r] = 0;
+        iso_shadow_magic(P(1), t);
         if (g_logpipe && pre(P(1), "/proc/") && pre(t, "pipe:")) { memcpy(t, "/dev/null", 10); r = 9; }
         if (pre(P(1), "/proc/") && t[0] == '/') {
             // what an open descriptor is: zygote (8.0+) lists its own before every fork and aborts on a file it does
@@ -1544,7 +1937,9 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     case NR_symlinkat: {             // target, newdirfd, linkpath: an absolute target is re-rooted
         char *b0 = PB(0), *b2 = PB(1);
         NEEDX(0); NEEDX(2);
-        return S3(nr, h0, a[1], h2);
+        long r = S3(nr, h0, a[1], h2);
+        if (r >= 0) iso_shadow_symlink(a[1], P(0), P(2));
+        return r;
     }
     case NR_linkat: case NR_renameat: case NR_renameat2: {
         char *b1 = PB(0), *b3 = PB(1);
@@ -1552,7 +1947,17 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         if (nr != NR_linkat && (in_system(a[0], h1, PB(2)) || in_system(a[2], h3, PB(2)))) return -EROFS;
         return S5(nr, a[0], h1, a[2], h3, a[4]);
     }
-    case NR_statfs: case NR_truncate: case NR_chdir:
+    case NR_chdir: {
+        char *b0 = PB(0);
+        NEEDX(0);
+        char *sb = pb_get();
+        iso_shadow_chdir_pre(P(0), sb);
+        long r = S5(nr, h0, a[1], a[2], a[3], a[4]);
+        if (r == 0) iso_shadow_chdir_post(P(0), sb);
+        pb_put(sb);
+        return r;
+    }
+    case NR_statfs: case NR_truncate:
     case NR_setxattr: case NR_lsetxattr: case NR_getxattr: case NR_lgetxattr: case NR_listxattr: case NR_llistxattr:
     case NR_removexattr: case NR_lremovexattr: {
         char *b0 = PB(0);
