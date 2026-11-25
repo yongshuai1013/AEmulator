@@ -26,8 +26,11 @@ import java.io.OutputStream
  *    answered, so a detoured connection gets no reply — that half is M3, and the test page
  *    says so rather than pretending otherwise.
  *  - the netlink listeners (netd above all). A synthesised interface has no kernel to announce
- *    its birth and death, so the hub writes the RTM_NEWLINK / RTM_DELLINK events itself; the
- *    rest of the framework's teardown chain is the guest's own stock code.
+ *    its birth and death, so the hub writes the link events itself — a kernel uevent for a
+ *    listener on the uevent protocol (the only dialect netd turns into an interface removal),
+ *    binary RTM_NEWLINK / RTM_DELLINK for the rest — and the supervisor delivers them with a
+ *    kernel-shaped receive envelope; the rest of the framework's teardown chain is the
+ *    guest's own stock code.
  *
  * Everything here is fail-open: no session, no listener, a dead supervisor — the guest simply
  * keeps the behaviour it had before M2.
@@ -86,7 +89,7 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         @Volatile var synthPkts = 0L
     }
 
-    private class Listener(val id: Int, val fd: FileDescriptor) {
+    private class Listener(val id: Int, val fd: FileDescriptor, val proto: Int) {
         val out: OutputStream = FileOutputStream(fd)
         val wlock = Object()
     }
@@ -196,7 +199,7 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                 if (fd == null) return false
                 val l: Listener
                 synchronized(lock) {
-                    l = Listener(nextListener++, fd)
+                    l = Listener(nextListener++, fd, if (pl.size >= 4) le32(pl, 0) else 0)
                     listeners[l.id] = l
                 }
                 val id = ByteArray(4); putLe32(id, 0, l.id)
@@ -214,12 +217,13 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
 
     private fun statePayload(): ByteArray {
         val s = session
-        val pl = ByteArray(29)
+        val pl = ByteArray(33)
         pl[0] = if (s != null && s.up) 1 else 0
         if (s != null) {
             val n = s.name.toByteArray()
             System.arraycopy(n, 0, pl, 1, minOf(n.size, 15))
             putLe32(pl, 17, s.addr); putLe32(pl, 21, s.mtu)
+            putLe32(pl, 29, s.index)
         }
         putLe32(pl, 25, exemptUid)
         return pl
@@ -431,7 +435,13 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
     }
 
     private fun linkEventTo(l: Listener, up: Boolean, s: Session) {
-        val msg = linkMessage(up, s)
+        // Each listener is spoken to in the dialect its consumer parses. A listener on the
+        // kernel-uevent protocol gets a kernel uevent: that is the only dialect the guest's
+        // netd turns into an interface removal (its binary rtnetlink parser has no
+        // RTM_DELLINK branch at all — the remove action exists only in the ASCII uevent
+        // parser), and the removal is what the framework's whole VPN teardown waits for.
+        // Route-protocol listeners keep the binary rtnetlink message they had.
+        val msg = if (l.proto == PROTO_UEVENT) ueventMessage(up, s) else linkMessage(up, s)
         try {
             synchronized(l.wlock) { l.out.write(msg); l.out.flush() }
         } catch (_: Throwable) {
@@ -453,12 +463,26 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         m[16] = 0
         putLe16(m, 18, 1)                  // ARPHRD_ETHER
         putLe32(m, 20, s.index)
-        putLe32(m, 24, if (up) 0x80d1 else 0)   // UP|RUNNING|POINTOPOINT|NOARP|MULTICAST, as SIOCGIFFLAGS answers
+        putLe32(m, 24, if (up) 0x180d1 else 0)   // the SIOCGIFFLAGS set plus IFF_LOWER_UP: a live channel has carrier, as a kernel NEWLINK reports
         putLe32(m, 28, -1)
         putLe16(m, 32, attrLen)
         putLe16(m, 34, IFLA_IFNAME)
         System.arraycopy(name, 0, m, 36, name.size)
         return m
+    }
+
+    private var ueventSeq = 1000
+
+    // A kernel uevent for a virtual net device, byte for byte the shape the kernel's
+    // kobject_uevent + netdev_uevent produce: "<action>@<devpath>", then NUL-separated
+    // ACTION / DEVPATH / SUBSYSTEM / INTERFACE / IFINDEX / SEQNUM pairs.
+    private fun ueventMessage(up: Boolean, s: Session): ByteArray {
+        val action = if (up) "add" else "remove"
+        val path = "/devices/virtual/net/${s.name}"
+        val seq = ++ueventSeq
+        val text = "$action@$path\u0000ACTION=$action\u0000DEVPATH=$path\u0000SUBSYSTEM=net\u0000" +
+            "INTERFACE=${s.name}\u0000IFINDEX=${s.index}\u0000SEQNUM=$seq\u0000"
+        return text.toByteArray(Charsets.US_ASCII)
     }
 
     // ---- small helpers
@@ -522,6 +546,7 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         const val T_LINKUNREG = 14
         const val RTM_NEWLINK = 16
         const val RTM_DELLINK = 17
+        const val PROTO_UEVENT = 15   // NETLINK_KOBJECT_UEVENT
         const val IFLA_IFNAME = 3
         const val FLAG_SYN = 0x02
         const val FLAG_FIN = 0x01
