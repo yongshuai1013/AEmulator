@@ -70,12 +70,18 @@ curl -sL -o "$work/annotations.jar" "https://maven.google.com/com/android/suppor
 echo "$ANNOTATIONS_SHA256  $work/annotations.jar" | sha256sum -c - >/dev/null
 
 # ---- JNI libraries, both ABIs ----
+# -static-libstdc++: link the C++ runtime into each library. The default dynamic
+# link leaves a DT_NEEDED on libc++_shared.so, which the APK does not carry —
+# the second field run opened the window, then died in TermExec.<clinit> with
+# "dlopen failed: library libc++_shared.so not found" when the first session
+# loaded the library. With the runtime linked in, the only DT_NEEDED entries
+# left are system libraries (guarded at the end of this script).
 mkdir -p "$work/stage/lib/arm64-v8a" "$work/stage/lib/armeabi-v7a"
 for abi in arm64-v8a armeabi-v7a; do
     if [ "$abi" = arm64-v8a ]; then CXX=$CXX64; else CXX=$CXX32; fi
-    "$CXX" -O2 -fPIC -shared -o "$work/stage/lib/$abi/libjackpal-androidterm5.so" \
+    "$CXX" -O2 -fPIC -shared -static-libstdc++ -o "$work/stage/lib/$abi/libjackpal-androidterm5.so" \
         "$TERM/src/main/jni/common.cpp" "$TERM/src/main/jni/fileCompat.cpp" "$TERM/src/main/jni/termExec.cpp" -llog
-    "$CXX" -O2 -fPIC -shared -o "$work/stage/lib/$abi/libjackpal-termexec2.so" \
+    "$CXX" -O2 -fPIC -shared -static-libstdc++ -o "$work/stage/lib/$abi/libjackpal-termexec2.so" \
         "$TE/src/main/jni/process.cpp" -llog
 done
 
@@ -131,4 +137,27 @@ if bad:
           file=sys.stderr)
     sys.exit(1)
 PYEOF
+# Guard the static-C++-runtime rule above: fail the build if any packaged native
+# library DT_NEEDEDs a library the guest does not provide as a system library —
+# the libc++_shared.so miss shipped silently once and only died on the device.
+READELF=readelf
+[ -x "${NDKBIN}llvm-readelf" ] && READELF=${NDKBIN}llvm-readelf
+mkdir -p "$work/needed"
+python3 - "$out/aemu-terminal.apk" "$work/needed" <<'PYEOF'
+import os, sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+for i in z.infolist():
+    if i.filename.startswith("lib/") and i.filename.endswith(".so"):
+        z.extract(i, sys.argv[2])
+PYEOF
+needed_bad=0
+for so in $(find "$work/needed" -name '*.so' | sort); do
+    for lib in $("$READELF" -d "$so" | sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p'); do
+        case "$lib" in
+            libc.so|libm.so|libdl.so|liblog.so|libandroid.so|libstdc++.so) ;;
+            *) echo "guest-terminal: $so needs non-system library $lib" >&2; needed_bad=1 ;;
+        esac
+    done
+done
+[ "$needed_bad" -eq 0 ] || exit 1
 echo "guest-terminal: built $out/aemu-terminal.apk from jackpal/Android-Terminal-Emulator $TERMINAL_COMMIT"
