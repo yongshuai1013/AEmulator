@@ -162,7 +162,7 @@ class TreeFixer(
     private fun superuserFiles() {
         val su = File(root, SuperuserSupport.SU_PATH)
         val app = File(root, SuperuserSupport.APP_PATH)
-        if (!(engine == Engine.N64 && img.api == 23 && img.settings.superuser)) {
+        if (!(SuperuserSupport.supported(img) && img.settings.superuser)) {
             runCatching {
                 val bytes = EngineAssets.open(ctx, SuperuserSupport.SU_ASSET).use { it.readBytes() }
                 if (su.isFile && su.readBytes().contentEquals(bytes)) { su.delete(); log("superuser: su removed (switch off)") }
