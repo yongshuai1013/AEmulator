@@ -1190,23 +1190,32 @@ class VmActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * The panel's tombstone source: the guest tree's newest if it holds one, else the newest
+     * host-side mirror copy in run/ (GuestVm mirrors them there at every boot and zygote
+     * restart, and the copies outlive the tree).
+     */
+    private fun latestTombstoneAny(): File? =
+        GuestLog.latestTombstone(vm.paths.root) ?: GuestLog.latestMirroredTombstone(vm.paths.bin)
+
     @Composable
     private fun LogPanel(onClose: () -> Unit) {
         var guestTab by remember { mutableStateOf(false) }
         val guestLines = remember { mutableStateListOf<String>() }
-        // the tombstone button exists only while this guest's tree holds a tombstone;
-        // refreshed at the panel's own beats: on tab switches and in the guest-tab poll
-        var tombstone by remember { mutableStateOf(GuestLog.latestTombstone(vm.paths.root)) }
+        // the tombstone button exists only while a tombstone is at hand (the guest tree's own,
+        // or a host-side mirror of it); refreshed at the panel's own beats: on tab switches
+        // and in the guest-tab poll
+        var tombstone by remember { mutableStateOf(latestTombstoneAny()) }
         // the real-time guest log stream (run/logcat-stream.log + rotations): the export button
         // exists only while a stream file does; refreshed at the same beats as the tombstone
         var logStream by remember { mutableStateOf(vm.logStreamFiles()) }
         LaunchedEffect(guestTab) {
-            tombstone = GuestLog.latestTombstone(vm.paths.root)
+            tombstone = latestTombstoneAny()
             logStream = vm.logStreamFiles()
             while (guestTab) {
                 val recs = GuestLog.tail(vm.paths.root, 1024 * 1024).takeLast(3000)
                 guestLines.clear(); guestLines.addAll(recs.map { "${it.prio} ${it.tag}: ${it.msg}" })
-                tombstone = GuestLog.latestTombstone(vm.paths.root)
+                tombstone = latestTombstoneAny()
                 logStream = vm.logStreamFiles()
                 delay(1500)
             }
@@ -1226,11 +1235,13 @@ class VmActivity : ComponentActivity() {
                     }
                     if (tombstone != null) {
                         IconButton(onClick = {
-                            val f = GuestLog.latestTombstone(vm.paths.root)
+                            val f = latestTombstoneAny()
                             tombstone = f
                             if (f != null) {
                                 pendingTombstone = f
-                                exportTombstone.launch("aemu-${vm.img.id}-${f.name}.txt")
+                                // a mirror copy's name carries the mirror prefix; the export
+                                // is named after the original tombstone either way
+                                exportTombstone.launch("aemu-${vm.img.id}-${f.name.removePrefix(GuestLog.MIRROR_PREFIX)}.txt")
                             }
                         }) {
                             Icon(Icons.Rounded.BugReport, stringResource(R.string.log_tombstone))
