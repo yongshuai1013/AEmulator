@@ -115,6 +115,7 @@ class TreeFixer(
     fun fixup(owners: Boolean = true) {
         if (owners) seedOwners()
         installEngineFiles()
+        superuserFiles()
         protectOat()
         fixThemeXml()
         parkWhetstone()
@@ -148,6 +149,51 @@ class TreeFixer(
         for (n in LOGS) File(root, "dev/log/$n").let { if (!it.isFile) { it.parentFile?.mkdirs(); it.createNewFile() } }
         makeFb()
         dumpModes("fixup")
+    }
+
+    /**
+     * Classic su root (SuperuserSupport): while this VM's superuser switch is on, plant the
+     * self-built su at system/xbin/su with mode 06755 (the supervisor's exec turns the setuid bit
+     * into the guest identity of the new image) and the Superuser manager app as a system app.
+     * While the switch is off, take back exactly what was planted — byte-compared against the
+     * assets, so a firmware that ships its own su is never touched.
+     */
+    private fun superuserFiles() {
+        val su = File(root, SuperuserSupport.SU_PATH)
+        val app = File(root, SuperuserSupport.APP_PATH)
+        if (!(engine == Engine.N64 && img.api == 23 && img.settings.superuser)) {
+            runCatching {
+                val bytes = EngineAssets.open(ctx, SuperuserSupport.SU_ASSET).use { it.readBytes() }
+                if (su.isFile && su.readBytes().contentEquals(bytes)) { su.delete(); log("superuser: su removed (switch off)") }
+            }
+            runCatching {
+                val bytes = EngineAssets.open(ctx, SuperuserSupport.APP_ASSET).use { it.readBytes() }
+                if (app.isFile && app.readBytes().contentEquals(bytes)) {
+                    app.delete()
+                    app.parentFile?.takeIf { it.list()?.isEmpty() == true }?.delete()
+                    log("superuser: manager app removed (switch off)")
+                }
+            }
+            return
+        }
+        runCatching {
+            val bytes = EngineAssets.open(ctx, SuperuserSupport.SU_ASSET).use { it.readBytes() }
+            if (!su.isFile || !su.readBytes().contentEquals(bytes)) {
+                su.parentFile?.mkdirs()
+                su.writeBytes(bytes)
+                log("superuser: su planted at ${SuperuserSupport.SU_PATH}")
+            }
+            Os.chmod(su.absolutePath, 0xDED)   // 06755: setuid + rwxr-xr-x
+        }.onFailure { log("superuser su: ${it.message}") }
+        runCatching {
+            val bytes = EngineAssets.open(ctx, SuperuserSupport.APP_ASSET).use { it.readBytes() }
+            if (!app.isFile || !app.readBytes().contentEquals(bytes)) {
+                app.parentFile?.mkdirs()
+                app.writeBytes(bytes)
+                app.setReadable(true, false)
+                log("superuser: manager app planted at ${SuperuserSupport.APP_PATH}")
+            }
+        }.onFailure { log("superuser app: ${it.message}") }
     }
 
     /**

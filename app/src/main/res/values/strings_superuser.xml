@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AEmulator: classic su root (SuperuserSupport.kt). English only for now; untranslated locales fall back to these. -->
+<resources>
+    <string name="vm_superuser_title">Root (Superuser)</string>
+    <string name="vm_superuser_sub">Plants su and the Superuser manager app (koush\'s, built from source with this app): an app that runs su is asked by the manager, and an allowed app gets a root shell. Independent of Magisk. Applies at the next full boot. Android 6.0 guests only. Experimental.</string>
+</resources>

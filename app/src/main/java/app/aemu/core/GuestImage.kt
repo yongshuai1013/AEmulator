@@ -115,6 +115,8 @@ data class VmSettings(
     val bluetooth: Boolean = false,
     /** Magisk root (arm64 guests on the native engine): the host starts the daemon at boot, see MagiskCore; applies at the next full VM boot (AEmulator Plus) */
     val magisk: Boolean = false,
+    /** Classic su root (arm64 Android 6.0 guests on the native engine): the host plants a self-built su and the Superuser manager app at boot, see SuperuserSupport; applies at the next full VM boot */
+    val superuser: Boolean = false,
     /** the guest agent (identity sync for the per-app views, the APK import inbox): a guest service the host starts at boot, see AgentSupport; applies at the next full VM boot */
     val agent: Boolean = false,
     /**
@@ -151,6 +153,7 @@ data class VmSettings(
         .put("wifiMirrorHost", wifiMirrorHost)
         .put("bluetooth", bluetooth)
         .put("magisk", magisk)
+        .put("superuser", superuser)
         .put("agent", agent)
         .put("hiddenApps", org.json.JSONArray(hiddenApps))
 
@@ -244,6 +247,7 @@ data class VmSettings(
                 wifiMirrorHost = o.optBoolean("wifiMirrorHost", d.wifiMirrorHost),
                 bluetooth = o.optBoolean("bluetooth", d.bluetooth),
                 magisk = o.optBoolean("magisk", d.magisk),
+                superuser = o.optBoolean("superuser", d.superuser),
                 agent = o.optBoolean("agent", d.agent),
                 hiddenApps = o.optJSONArray("hiddenApps")?.let { a -> (0 until a.length()).mapNotNull { a.optString(it).trim().takeIf { s -> s.isNotEmpty() } }.distinct() } ?: d.hiddenApps,
             )
