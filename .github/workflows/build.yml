@@ -63,6 +63,8 @@ jobs:
           name: aemu-agent-jar
           path: app/src/main/assets/engines/kk/aemu-agent.jar
       - name: Build guest agent inbox app from source
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           sh app/guest-agent-app/build.sh
           ls -l app/src/main/assets/engines/kk/aemu-agent.apk
