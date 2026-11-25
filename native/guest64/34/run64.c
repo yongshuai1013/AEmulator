@@ -600,6 +600,8 @@ static long input_ioctl(u32 cmd, u64 arg) {
 
 static int env_is_ours(const char *e) { return pre(e, "AEMU64_"); }
 
+static void exec_ids(const char *guest, const char *host, int *uid, int *gid);
+
 static long do_exec(const char *path, char *const argv[], char *const envp[]) {
     static char buf[PATH_MAX]; int err = 0;      /* exec replaces the process: nobody else is left to share it */
     // A firmware whose ART module comes without a boot image (Google's own module) has the runtime compile one
@@ -611,6 +613,8 @@ static long do_exec(const char *path, char *const argv[], char *const envp[]) {
     if (!host) return err;
     long r = S4(NR_faccessat, AT_FDCWD, host, 1 /*X_OK*/, 0);
     if (r < 0) return r;
+    int euid = g_uid, egid = g_gid;
+    exec_ids(path, host, &euid, &egid);
     u64 na = 0, ne = 0;
     if (argv) while (argv[na]) na++;
     if (envp) while (envp[ne]) ne++;
@@ -635,9 +639,9 @@ static long do_exec(const char *path, char *const argv[], char *const envp[]) {
     if (g_bsock[0]) { memcpy(e_binder, "AEMU64_BINDER=", 14); memcpy(e_binder + 14, g_bsock, slen(g_bsock) + 1); *a++ = e_binder; }
     if (g_hwbsock[0]) { memcpy(e_hwbinder, "AEMU64_HWBINDER=", 16); memcpy(e_hwbinder + 16, g_hwbsock, slen(g_hwbsock) + 1); *a++ = e_hwbinder; }
     if (g_vndbsock[0]) { memcpy(e_vndbinder, "AEMU64_VNDBINDER=", 17); memcpy(e_vndbinder + 17, g_vndbsock, slen(g_vndbsock) + 1); *a++ = e_vndbinder; }
-    char t[24], *s = utoa((u64)g_uid, t + sizeof t); u64 o = 10;
+    char t[24], *s = utoa((u64)euid, t + sizeof t); u64 o = 10;
     memcpy(e_id, "AEMU64_ID=", 10); memcpy(e_id + o, s, slen(s)); o += slen(s); e_id[o++] = ',';
-    s = utoa((u64)g_gid, t + sizeof t); memcpy(e_id + o, s, slen(s) + 1);
+    s = utoa((u64)egid, t + sizeof t); memcpy(e_id + o, s, slen(s) + 1);
     *a++ = e_id; *a++ = e_f;
     if (g_crash) *a++ = "AEMU64_CRASH=1";
     static char e_input[130];
@@ -696,6 +700,45 @@ static void own_put(long nr, long where, long uid, long gid) {        // nr: NR_
     if ((u32)uid != 0xffffffffu) v[0] = (u32)uid;
     if ((u32)gid != 0xffffffffu) v[1] = (u32)gid;
     S5(nr, where, OWN_ATTR, v, sizeof v, 0);
+}
+
+// The ids a fresh image starts with: the caller's own, unless the file it runs carries the
+// setuid/setgid bits — the classic su mechanism, which the host kernel cannot apply for us (on the
+// phone the file belongs to the app, so its bits would elevate to the app itself). Only files
+// inside the guest tree count, and the owner is read exactly as stat reads it (fake_owner, then
+// the /data owners attribute), so the identity an exec gains is the identity stat shows for the
+// file. A change is logged once; an exec of a file without the bits is untouched.
+static void exec_ids(const char *guest, const char *host, int *uid, int *gid) {
+    if (!pre(host, g_root) || host[g_rootlen] != '/') return;
+    struct kstat st;
+    if (S4(NR_newfstatat, AT_FDCWD, host, &st, 0) != 0) return;
+    u32 mode = st.st_mode;
+    if ((mode & 0170000) != 0100000 || !(mode & 06000)) return;
+    fake_owner(&st);
+    u32 ouid = st.st_uid, ogid = st.st_gid;
+    u32 own[2];
+    if (guest && pre(guest, "/data/") && S4(NR_getxattr, host, OWN_ATTR, own, sizeof own) == (long)sizeof own) {
+        ouid = own[0]; ogid = own[1];
+    } else if (g_uid >= 10000 && st.st_uid == 0 && guest && (pre(guest, "/data/data/") || pre(guest, "/data/user/"))) {
+        ouid = (u32)g_uid; ogid = (u32)g_gid;
+    }
+    int nu = (mode & 04000) ? (int)ouid : *uid;
+    int ng = (mode & 02000) ? (int)ogid : *gid;
+    if (nu == *uid && ng == *gid) return;
+    static char line[PATH_MAX + 128]; u64 o = 0;
+    const char *p = "aemu-exec: ";
+    memcpy(line + o, p, slen(p)); o += slen(p);
+    if (guest) { u64 gl = slen(guest); if (gl > PATH_MAX - 64) gl = PATH_MAX - 64; memcpy(line + o, guest, gl); o += gl; }
+    p = (mode & 03000) == 03000 ? " is setuid+setgid: id " : (mode & 04000) ? " is setuid: id " : " is setgid: id ";
+    memcpy(line + o, p, slen(p)); o += slen(p);
+    char t[24]; char *s = utoa((u64)*uid, t + sizeof t); memcpy(line + o, s, slen(s)); o += slen(s);
+    line[o++] = ','; s = utoa((u64)*gid, t + sizeof t); memcpy(line + o, s, slen(s)); o += slen(s);
+    p = " -> "; memcpy(line + o, p, slen(p)); o += slen(p);
+    s = utoa((u64)nu, t + sizeof t); memcpy(line + o, s, slen(s)); o += slen(s);
+    line[o++] = ','; s = utoa((u64)ng, t + sizeof t); memcpy(line + o, s, slen(s)); o += slen(s);
+    line[o++] = '\n'; line[o] = 0;
+    say(line);
+    *uid = nu; *gid = ng;
 }
 
 #define P(i) ((const char *)a[i])
