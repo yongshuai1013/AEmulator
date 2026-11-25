@@ -33,13 +33,13 @@ enum {
     NR_mknodat = 33, NR_mkdirat = 34, NR_unlinkat = 35, NR_symlinkat = 36, NR_linkat = 37, NR_renameat = 38,
     NR_umount2 = 39, NR_mount = 40, NR_statfs = 43, NR_truncate = 45, NR_ftruncate = 46, NR_faccessat = 48,
     NR_chdir = 49, NR_chroot = 51, NR_fchmodat = 53, NR_fchownat = 54, NR_fchown = 55, NR_openat = 56, NR_close = 57,
-    NR_lseek = 62, NR_read = 63, NR_write = 64, NR_pread64 = 67, NR_pwrite64 = 68, NR_readlinkat = 78, NR_newfstatat = 79, NR_fstat = 80,
+    NR_lseek = 62, NR_read = 63, NR_write = 64, NR_writev = 66, NR_pread64 = 67, NR_pwrite64 = 68, NR_readlinkat = 78, NR_newfstatat = 79, NR_fstat = 80,
     NR_timerfd_create = 85, NR_utimensat = 88, NR_capget = 90, NR_capset = 91, NR_exit_group = 94, NR_unshare = 97,
     NR_ptrace = 117, NR_sched_yield = 124, NR_rt_sigaction = 134, NR_rt_sigprocmask = 135, NR_reboot = 142,
     NR_setregid = 143, NR_setgid = 144, NR_setreuid = 145, NR_setuid = 146, NR_setresuid = 147, NR_getresuid = 148,
     NR_setresgid = 149, NR_getresgid = 150, NR_setfsuid = 151, NR_setfsgid = 152, NR_getgroups = 158, NR_setgroups = 159,
     NR_uname = 160, NR_prctl = 167, NR_getpid = 172, NR_getuid = 174, NR_geteuid = 175, NR_getgid = 176, NR_getegid = 177, NR_gettid = 178,
-    NR_socket = 198, NR_socketpair = 199, NR_bind = 200, NR_connect = 203, NR_getsockname = 204, NR_sendto = 206, NR_setsockopt = 208, NR_getsockopt = 209,
+    NR_socket = 198, NR_socketpair = 199, NR_bind = 200, NR_connect = 203, NR_getsockname = 204, NR_sendto = 206, NR_recvfrom = 207, NR_setsockopt = 208, NR_getsockopt = 209,
     NR_sendmsg = 211, NR_recvmsg = 212, NR_munmap = 215, NR_execve = 221, NR_mmap = 222, NR_mprotect = 226,
     NR_renameat2 = 276, NR_memfd_create = 279, NR_statx = 291,
 };
@@ -93,6 +93,7 @@ static int g_logpipe;
 static u64 g_inino;                 // ...and the pipe on descriptor 0
 static char g_sd[512]; static u64 g_sdlen;   // the shared card folder on the phone (AEMU64_SDCARD)
 static int g_is32;                // this process is qemu-arm running a 32-bit program
+static int g_is_netd;             // this process is the guest's netd (its route requests take the nlreq path below)
 static void (*g_fatal[32])(int, void *, void *);
 static void fatal_relay(int sig, void *info, void *uc);
 // qemu-arm's signal handler blocks every signal in the context it returns to (until the guest's handler is
@@ -539,6 +540,110 @@ static void hub_pump(void);
 // The hub's cached session state lives here, ahead of the tun ioctls: a process that does not
 // own the session's tun (netd above all) answers interface questions from this cache.
 static struct { int up; char name[16]; u32 addr; u32 mtu; int exempt; u32 index; } g_hub_sess;
+
+// ---- netd's route requests: the VPN add/remove transactions
+//
+// netd programs rules and routes through RouteController::sendNetlinkRequest (6.0.1_r81): a
+// fresh NETLINK_ROUTE socket per transaction, connect, writev, and a recv that waits for one
+// 36-byte NLMSG_ERROR ack. Protocol 0 is a real phone socket in this supervisor (see the
+// NR_socket case), and the phone's SELinux refuses an app's nlmsg_write, so netd's writev
+// itself dies with EACCES: the interface is never tabled ("failed to add interface tun0 to
+// VPN netId 101"), the framework's addRoute then finds it assigned to no netId, and the
+// remove side — the same rules with the delete action — can never succeed either. In netd,
+// and only there (its loader installs one extra filter, see install_filter_netd), the writes
+// and receives of its route sockets are trapped. A request that belongs to the hub session's
+// VPN flow is answered here with the ack a kernel would have sent; anything else is passed
+// to the real socket untouched and keeps the refusal it gets today. Belonging is parsed,
+// not assumed: the message must be a rule or a route (RTM_NEWRULE/DELRULE, RTM_NEWROUTE/
+// DELROUTE) and must name the live session — by interface name (FRA_IIFNAME/FRA_OIFNAME),
+// by its route table (FRA_TABLE/RTA_TABLE; the header's own table byte is always 0 in
+// netd's requests, the id travels in the attribute, and the id is the interface index +
+// 1000, RouteController.h), or by output interface index (RTA_OIF).
+#define MAX_NLREQ 8
+static struct { int fd; int pending; u8 req[1024]; } g_nlreq[MAX_NLREQ];
+
+static int nlreq_find(int fd) {
+    for (int i = 0; i < MAX_NLREQ; i++) if (g_nlreq[i].fd == fd) return i;
+    return -1;
+}
+
+static void nlreq_track(int fd) {
+    if (nlreq_find(fd) >= 0) return;
+    for (int i = 0; i < MAX_NLREQ; i++) if (!g_nlreq[i].fd) { g_nlreq[i].fd = fd; g_nlreq[i].pending = 0; return; }
+}
+
+static void nlreq_drop(int fd) {
+    int i = nlreq_find(fd);
+    if (i >= 0) { g_nlreq[i].fd = 0; g_nlreq[i].pending = 0; }
+}
+
+static int nlreq_name_eq(const u8 *p, u64 n) {          // an interface-name attribute payload vs the session's name
+    char name[16];
+    if (n > 15) n = 15;
+    memcpy(name, p, n); name[n] = 0;
+    return seq(name, g_hub_sess.name);
+}
+
+static int nlreq_session_match(const u8 *p, u64 len) {
+    if (len < 28) return 0;
+    u32 mlen = *(const u32 *)p;
+    u16 type = *(const u16 *)(p + 4);
+    if (mlen < 28 || mlen > len) return 0;
+    int rule = type == 26 || type == 27;                // RTM_NEWRULE / RTM_DELRULE
+    int route = type == 24 || type == 25;               // RTM_NEWROUTE / RTM_DELROUTE
+    if (!rule && !route) return 0;
+    if (hub_ensure() < 0) return 0;
+    hub_pump();                                         // the session state, fresh (tun_sioc's pattern)
+    if (!g_hub_sess.up || !g_hub_sess.name[0] || !g_hub_sess.index) return 0;
+    u32 table = g_hub_sess.index + 1000;
+    const u8 *a = p + 28, *end = p + mlen;              // header (16) + rule/route body (12), then attributes
+    while (a + 4 <= end) {
+        u16 alen = *(const u16 *)a, atype = *(const u16 *)(a + 2);
+        if (alen < 4 || a + alen > end) break;
+        const u8 *v = a + 4; u64 vn = alen - 4;
+        if (rule && (atype == 3 || atype == 11) && nlreq_name_eq(v, vn)) return 1;          // FRA_IIFNAME / FRA_OIFNAME
+        if (rule && atype == 14 && vn >= 4 && *(const u32 *)v == table) return 1;           // FRA_TABLE
+        if (route && atype == 15 && vn >= 4 && *(const u32 *)v == table) return 1;          // RTA_TABLE
+        if (route && atype == 4 && vn >= 4 && *(const u32 *)v == g_hub_sess.index) return 1; // RTA_OIF
+        a += (alen + 3) & ~3U;
+    }
+    return 0;
+}
+
+// The request was ours to answer: keep it, and the receive that follows gets the ack.
+static int nlreq_swallow(int fd, const u8 *buf, u64 len) {
+    int i = nlreq_find(fd);
+    if (i < 0 || !buf || !len || len > sizeof g_nlreq[i].req) return 0;
+    if (!nlreq_session_match(buf, len)) return 0;
+    memcpy(g_nlreq[i].req, buf, len);
+    g_nlreq[i].pending = 1;
+    return 1;
+}
+
+// Hand the waiting ack to a receive on a swallowed request: an NLMSG_ERROR with error 0 and
+// the request's own header echoed, the exact 36 bytes sendNetlinkRequest reads.
+static int nlreq_ack(int fd, u8 *buf, u64 cap, u16 *sa, u32 *salen, long *out) {
+    int i = nlreq_find(fd);
+    if (i < 0 || !g_nlreq[i].pending) return 0;
+    g_nlreq[i].pending = 0;
+    struct { struct aemu_nlmsghdr hdr; struct aemu_nlmsgerr err; } m;
+    memset(&m, 0, sizeof m);
+    const struct aemu_nlmsghdr *req = (const struct aemu_nlmsghdr *)g_nlreq[i].req;
+    m.hdr.len = sizeof m; m.hdr.type = 2 /*NLMSG_ERROR*/; m.hdr.flags = 0;
+    m.hdr.seq = req->seq; m.hdr.pid = req->pid;
+    m.err.error = 0;
+    m.err.msg = *req;
+    u64 n = cap < sizeof m ? cap : sizeof m;
+    memcpy(buf, &m, n);
+    if (sa && salen && *salen >= 12) {                  // the kernel's address, if one was asked for
+        u32 *w = (u32 *)sa;
+        sa[0] = 16; sa[1] = 0;
+        w[1] = 0; w[2] = 0;
+        *salen = 12;
+    }
+    *out = (long)n;
+    return 1;
+}
 
 static long tun_open(long flags) {
     if (g_tun_live) tun_drain();                    // reap before allocating
@@ -1090,13 +1195,17 @@ static int nl_listener_recv(int fd, struct msgh *m, long *out) {
     u8 buf[4096];
     long n = S3(NR_read, fd, buf, sizeof buf);
     if (n < 0) { *out = n; return 1; }
-    if (m->name && m->namelen >= 16) {
+    if (m->name && m->namelen >= 12) {
+        // struct sockaddr_nl is 12 bytes, and 12 is exactly what uevent_kernel_recv offers
+        // (its msg_namelen is sizeof(addr)); asking for 16 here meant the address was never
+        // written at all, and the receiver's pid/group gates failed on uninitialised stack
+        // — every injected event died as "recvmsg failed (I/O error)" in the listener.
         u16 *sa = (u16 *)m->name;
         u32 *w = (u32 *)m->name;
         sa[0] = 16; sa[1] = 0;              // AF_NETLINK, no padding
         w[1] = 0;                           // the kernel's pid
         w[2] = nl_groups_of(fd);            // the group this socket subscribed to
-        m->namelen = 16;
+        m->namelen = 12;
     }
     if (m->control && m->controllen >= 32) {
         struct cmsg *c = (struct cmsg *)m->control;
@@ -2039,6 +2148,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         if (is_nl_fd((int)a[0])) nl_close((int)a[0]);
         if (is_tun_fd((int)a[0])) say("aemu-tun: the framework closed its tun descriptor (the session ends when the channel runs dry)");
         sock_forget((int)a[0]);
+        nlreq_drop((int)a[0]);
         hub_linkunreg((int)a[0]);
         return S1(nr, a[0]);
     }
@@ -2134,6 +2244,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             }
         }
         if (r >= 0 && a[0] == 2) sock_track((int)r, (int)a[1]);   // the VPN detour keeps a table of plain IPv4 sockets
+        if (r >= 0 && g_is_netd && a[0] == 16 && a[2] == 0) nlreq_track((int)r);   // netd's route sockets: their writes are answered above, when they belong to the VPN flow
         return r;
     }
     case NR_setsockopt: {
@@ -2163,6 +2274,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             nl_handle_send((int)a[0], (const void *)a[1], (u64)a[2]);
             return a[2];
         }
+        if (g_is_netd && nlreq_swallow((int)a[0], (const u8 *)a[1], (u64)a[2])) return a[2];
         return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
     }
     case NR_sendmsg: {
@@ -2176,7 +2288,38 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             }
             return 0;
         }
+        if (g_is_netd) {
+            struct msgh *m = (struct msgh *)a[1];
+            if (m && m->iov && m->iovlen == 1 && nlreq_swallow((int)a[0], (const u8 *)m->iov[0].base, m->iov[0].len))
+                return (long)m->iov[0].len;
+        }
         return S3(nr, a[0], a[1], a[2]);
+    }
+    case NR_writev: {
+        // trapped in netd only (see install_filter_netd): RouteController's writev on one of
+        // its route sockets. Gather the iovecs; if the request is the VPN flow's, it is
+        // swallowed and its receive gets the fabricated ack. Anything else is the real call.
+        if (g_is_netd && a[1] && nlreq_find((int)a[0]) >= 0) {
+            struct kiov { void *base; u64 len; } *iov = (void *)a[1];
+            u64 total = 0;
+            for (u64 i = 0; i < (u64)a[2]; i++) total += iov[i].len;
+            if (total && total <= 1024) {
+                u8 buf[1024]; u64 done = 0;
+                for (u64 i = 0; i < (u64)a[2]; i++) { memcpy(buf + done, iov[i].base, iov[i].len); done += iov[i].len; }
+                if (nlreq_swallow((int)a[0], buf, total)) return (long)total;
+            }
+        }
+        return S3(nr, a[0], a[1], a[2]);
+    }
+    case NR_recvfrom: {
+        // the other half of a swallowed route request: hand back the ack (see nlreq_ack).
+        // Everything else — including plain receives on the emulated netlink pairs, whose
+        // answers already sit in the pair — is the real call.
+        if (g_is_netd) {
+            long out;
+            if (nlreq_ack((int)a[0], (u8 *)a[1], (u64)a[2], (u16 *)a[4], (u32 *)a[5], &out)) return out;
+        }
+        return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
     }
     case NR_recvmsg: {
         // a hub-registered netlink listener gets its events with a kernel-shaped envelope
@@ -2409,6 +2552,35 @@ static void install_filter(void) {
     if (S3(NR_prctl, 22 /*PR_SET_SECCOMP*/, 2, &prog) < 0) die("seccomp filter refused", "");
 }
 
+// netd alone takes two more traps — the writev and recvfrom of RouteController's route
+// transactions (see the nlreq section) — so its loader stacks this small filter on top of
+// the inherited one. The prologue is the base filter's own: calls from this image pass.
+// No other guest process pays for these two traps; a forked child of netd that execs
+// something else keeps the filter but its handler passes every such call straight through
+// (it tracks no route sockets), which is the shape the base filter already lives with.
+static void install_filter_netd(void) {
+    static struct bpf f[16];
+    int n = 0, pos[L_N - 240];
+#define AT(l) pos[(l) - 240] = n
+    f[n++] = LD(4);  f[n++] = JEQ(0xC00000B7u, 0, L_ALLOW);
+    f[n++] = LD(12); f[n++] = JEQ(IMAGE_HI, 0, L_NR);
+    f[n++] = LD(8);  f[n++] = JGE(IMAGE_SPAN, L_NR, L_ALLOW);
+    AT(L_NR); f[n++] = LD(0);
+    f[n++] = JEQ(NR_writev, L_TRAP, 0);
+    f[n++] = JEQ(NR_recvfrom, L_TRAP, L_ALLOW);
+    AT(L_TRAP); f[n++] = RET(TRAP);
+    AT(L_ALLOW); f[n++] = RET(ALLOW);
+#undef AT
+    for (int i = 0; i < n; i++) {
+        if ((f[i].code & 7) != 5) continue;
+        if (f[i].jt >= 240) f[i].jt = (u8)(pos[f[i].jt - 240] - i - 1);
+        if (f[i].jf >= 240) f[i].jf = (u8)(pos[f[i].jf - 240] - i - 1);
+    }
+    struct { u16 len; struct bpf *f; } prog = { (u16)n, f };
+    S5(NR_prctl, 38 /*PR_SET_NO_NEW_PRIVS*/, 1, 0, 0, 0);
+    if (S3(NR_prctl, 22 /*PR_SET_SECCOMP*/, 2, &prog) < 0) die("netd filter refused", "");
+}
+
 // ---------------------------------------------------------------------------------------------------- loader
 
 struct ehdr { u8 ident[16]; u16 type, machine; u32 version; u64 entry, phoff, shoff; u32 flags; u16 ehsize, phentsize, phnum, shentsize, shnum, shstrndx; };
@@ -2590,6 +2762,10 @@ void aemu_main(u64 *sp) {
         entry = ld.entry; base = ld.bias;
     }
 
+    // this process's own name, for the one process whose route transactions are answered
+    // in the supervisor (netd; see the nlreq section and install_filter_netd)
+    { const char *base = prog; for (const char *p = prog; *p; p++) if (*p == '/') base = p + 1; g_is_netd = seq(base, "netd"); }
+
     // signal handler first, then the filter (once per process tree: it survives exec)
     struct { void *h; u64 flags; void *restorer; u64 mask; } sa = { (void *)on_sigsys, 4 /*SA_SIGINFO*/ | 0x40000000 /*SA_NODEFER*/, 0, 0 };
     if (S4(NR_rt_sigaction, SIGSYS, &sa, 0, 8) < 0) die("sigaction", "");
@@ -2600,6 +2776,7 @@ void aemu_main(u64 *sp) {
         for (int i = 0; i < 5; i++) S4(NR_rt_sigaction, fatal[i], &ca, 0, 8);
     }
     if (!env_get(envp, "AEMU64_F")) install_filter();
+    if (g_is_netd) install_filter_netd();
 
     // the guest's initial stack: argc, argv, envp (without our variables), auxv
     u64 ne = 0; while (envp[ne]) ne++;
