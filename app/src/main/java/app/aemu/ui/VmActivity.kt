@@ -1197,12 +1197,17 @@ class VmActivity : ComponentActivity() {
         // the tombstone button exists only while this guest's tree holds a tombstone;
         // refreshed at the panel's own beats: on tab switches and in the guest-tab poll
         var tombstone by remember { mutableStateOf(GuestLog.latestTombstone(vm.paths.root)) }
+        // the real-time guest log stream (run/logcat-stream.log + rotations): the export button
+        // exists only while a stream file does; refreshed at the same beats as the tombstone
+        var logStream by remember { mutableStateOf(vm.logStreamFiles()) }
         LaunchedEffect(guestTab) {
             tombstone = GuestLog.latestTombstone(vm.paths.root)
+            logStream = vm.logStreamFiles()
             while (guestTab) {
                 val recs = GuestLog.tail(vm.paths.root, 1024 * 1024).takeLast(3000)
                 guestLines.clear(); guestLines.addAll(recs.map { "${it.prio} ${it.tag}: ${it.msg}" })
                 tombstone = GuestLog.latestTombstone(vm.paths.root)
+                logStream = vm.logStreamFiles()
                 delay(1500)
             }
         }
@@ -1229,6 +1234,18 @@ class VmActivity : ComponentActivity() {
                             }
                         }) {
                             Icon(Icons.Rounded.BugReport, stringResource(R.string.log_tombstone))
+                        }
+                    }
+                    if (logStream.isNotEmpty()) {
+                        IconButton(onClick = {
+                            val fs = vm.logStreamFiles()
+                            logStream = fs
+                            if (fs.isNotEmpty()) {
+                                pendingStream = fs
+                                exportStream.launch("aemu-${vm.img.id}-logcat-stream.log")
+                            }
+                        }) {
+                            Icon(Icons.Rounded.History, stringResource(R.string.log_stream))
                         }
                     }
                     FilledTonalIconButton(onClick = onClose) { Icon(Icons.Rounded.Close, stringResource(R.string.close)) }
@@ -1340,6 +1357,18 @@ class VmActivity : ComponentActivity() {
             // Byte-for-byte copy: tombstones are debuggerd text but may carry
             // non-UTF-8 bytes in register/memory dumps, so no line/charset pass.
             val ok = runCatching { contentResolver.openOutputStream(uri)!!.use { out -> f.inputStream().use { it.copyTo(out) } } }.isSuccess
+            runOnUiThread { Toast.makeText(this, if (ok) R.string.log_exported else R.string.log_export_failed, Toast.LENGTH_SHORT).show() }
+        }
+    }
+
+    private var pendingStream: List<File> = emptyList()
+    private val exportStream = registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+        val fs = pendingStream
+        pendingStream = emptyList()
+        if (uri == null || fs.isEmpty()) return@registerForActivityResult
+        thread {
+            // oldest rotation first, the live file last: one continuous stream, byte-for-byte per file
+            val ok = runCatching { contentResolver.openOutputStream(uri)!!.use { out -> fs.forEach { f -> f.inputStream().use { it.copyTo(out) } } } }.isSuccess
             runOnUiThread { Toast.makeText(this, if (ok) R.string.log_exported else R.string.log_export_failed, Toast.LENGTH_SHORT).show() }
         }
     }
