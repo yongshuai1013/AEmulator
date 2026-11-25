@@ -600,12 +600,26 @@ class TreeFixer(
         }
         // 8.0's 32-bit libEGL looks for the "emulation" driver in system/lib/egl only, where the engine's 32-bit
         // SwiftShader is not (it goes with the other EGL drivers to vendor/lib/egl): links there, under SwiftShader's
-        // own names too, by which its libEGL opens its GLES libraries
-        if (kernel.emulationDir != null) File(root, "vendor/lib/egl").listFiles().orEmpty().filter { it.name.endsWith("_swiftshader.so") }.forEach { f ->
-            for (n in listOf(f.name, f.name.replace("_swiftshader.so", "_emulation.so"))) {
-                val link = File(root, "system/lib/egl/$n")
-                link.parentFile?.mkdirs()
-                if (!isLink(link)) { link.delete(); runCatching { Os.symlink("../../../vendor/lib/egl/${f.name}", link.path) } }
+        // own names too, by which its libEGL opens its GLES libraries. 8.1's loader looks in the vendor directory
+        // itself (emulationDir names the 64-bit one there, as eglDir does): the links then stand next to the files
+        // they name, under bare names, and the combined "GLES" name the loader tries first goes to SwiftShader's
+        // libEGL — the one body whose eglGetProcAddress serves the merged load (the GLESv2 body has none to give,
+        // and a driver taken for merged without it leaves null calls behind)
+        if (kernel.emulationDir != null) {
+            val srcDir = "vendor/lib/egl"
+            val linkDir = kernel.emulationDir!!.replace("/lib64/", "/lib/")
+            val sameDir = linkDir == srcDir
+            File(root, srcDir).listFiles().orEmpty().filter { it.name.endsWith("_swiftshader.so") }.forEach { f ->
+                for (n in listOf(f.name, f.name.replace("_swiftshader.so", "_emulation.so"))) {
+                    val link = File(root, "$linkDir/$n")
+                    if (link.absolutePath == f.absolutePath) continue
+                    link.parentFile?.mkdirs()
+                    if (!isLink(link)) { link.delete(); runCatching { Os.symlink(if (sameDir) f.name else "../../../$srcDir/${f.name}", link.path) } }
+                }
+            }
+            if (sameDir) {
+                val link = File(root, "$linkDir/libGLES_emulation.so")
+                if (!isLink(link)) { link.delete(); runCatching { Os.symlink("libEGL_swiftshader.so", link.path) } }
             }
         }
         // A vendor libEGL that still reads egl.cfg (MediaTek on 5.x: "0 1 mtk") asks for the driver by the tag written

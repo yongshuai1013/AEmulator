@@ -188,7 +188,8 @@ enum class Kernel64(
      *  bridge up the flag is 1 and the bridge's driver is there under the emulator's name too (32-bit programs still
      *  read 0 through the runner) */
     val bridgeAsEmulation: Boolean = false,
-    /** where that "emulation" driver is looked for, when not in eglDir (8.0's loader: only /system/lib64/egl) */
+    /** where that "emulation" driver is looked for, when not in eglDir (8.0's loader: only /system/lib64/egl).
+     *  8.1's loader looks in eglDir itself; the directory is named all the same, so the 32-bit links are made */
     val emulationDir: String? = null,
     /** 8.0's SystemUI asks for the navigation bar's view when the lock screen shows and dies on a device without one
      *  (fixed in 8.1): the guest's own bar stays even where the app's buttons replace it */
@@ -263,7 +264,7 @@ enum class Kernel64(
         firmwareOwn = listOf("vendor#bin#hw#android.hardware.media.omx@1.0-service", "vendor#etc#init#android.hardware.media.omx@1.0-service.rc",
             "vendor#lib#libmediacodecservice.so")),
     // Android 8.1
-    A8_1("27", 27..27, gpuBridge64 = true, bridgeAsEmulation = true, qcomHandles = true, webViewSingleProcess = true, registeredNetwork = true, treble = true, eglDir = "vendor/lib64/egl", gles = "2",
+    A8_1("27", 27..27, gpuBridge64 = true, bridgeAsEmulation = true, emulationDir = "vendor/lib64/egl", qcomHandles = true, webViewSingleProcess = true, registeredNetwork = true, treble = true, eglDir = "vendor/lib64/egl", gles = "2",
         // MIUI's system_server reads the panel colour from the touch controller's lockdown bytes before anything else
         // and dies closing the reader it never opened when the file is not there
         procFiles = mapOf("tp_lockdown_info" to "4636320131320200\n"),
