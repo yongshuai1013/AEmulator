@@ -55,6 +55,70 @@ object GuestLog {
             .maxWithOrNull(compareBy({ it.lastModified() }, { it.name }))
     }
 
+    /** Host-side mirror copies of the tree's tombstones live next to the host log (the image's
+     *  run/ directory) under this prefix plus the original name: "tombstone-tombstone_00". */
+    const val MIRROR_PREFIX = "tombstone-"
+
+    private const val MIRROR_INDEX = "tombstone-mirror.index"
+
+    /** The file a tree tombstone named [name] is mirrored to inside [bin]. */
+    fun mirrorFile(bin: File, name: String): File = File(bin, MIRROR_PREFIX + name)
+
+    /**
+     * Newest host-side mirror copy in [bin], picked like [latestTombstone]. Null when nothing
+     * was ever mirrored. The copies outlive the guest tree, so this is the fallback for a
+     * tombstone whose original is already gone (tree reset, guest reimported).
+     */
+    fun latestMirroredTombstone(bin: File): File? {
+        val files = runCatching { bin.listFiles() }.getOrNull() ?: return null
+        return files.filter { it.isFile && it.name.startsWith(MIRROR_PREFIX) && it.name != MIRROR_INDEX }
+            .maxWithOrNull(compareBy({ it.lastModified() }, { it.name }))
+    }
+
+    /**
+     * Copies every tombstone in the guest tree that [bin] does not hold yet into [bin]
+     * (see [mirrorFile]); what counts as held is the index file in [bin] (name + size), so
+     * repeated scans copy nothing twice, and a tombstone rewritten under the same name is
+     * picked up again. One host-log line per copy; returns how many were copied. The caller
+     * runs this off the boot/restart path — a slow copy must never wedge either.
+     */
+    fun mirrorTombstones(root: File, bin: File, log: (String) -> Unit): Int {
+        val dir = File(root, "data/tombstones")
+        if (!dir.isDirectory) return 0 // the guest never crashed natively: nothing to mirror
+        val files = runCatching { dir.listFiles() }.getOrNull()
+        if (files == null) { log("tombstone: mirror scan failed: cannot list ${dir.path}"); return 0 }
+        val indexFile = File(bin, MIRROR_INDEX)
+        val held = HashMap<String, Long>()
+        runCatching { indexFile.readLines() }.getOrNull()?.forEach { line ->
+            val tab = line.lastIndexOf('\t')
+            if (tab > 0) line.substring(tab + 1).toLongOrNull()?.let { held[line.substring(0, tab)] = it }
+        }
+        var copied = 0
+        var dirty = false
+        for (f in files) {
+            if (!f.isFile || !f.name.startsWith("tombstone_")) continue
+            val size = f.length()
+            if (held[f.name] == size) continue
+            val dst = mirrorFile(bin, f.name)
+            val ok = runCatching {
+                bin.mkdirs()
+                f.inputStream().use { i -> dst.outputStream().use { o -> i.copyTo(o) } }
+                dst.length() == size
+            }.getOrDefault(false)
+            if (ok) {
+                held[f.name] = size; dirty = true; copied++
+                log("tombstone: mirrored ${f.name} ($size bytes) -> run/${dst.name}")
+            } else {
+                log("tombstone: mirror of ${f.name} failed")
+            }
+        }
+        if (dirty) runCatching {
+            bin.mkdirs()
+            indexFile.writeText(held.entries.sortedBy { it.key }.joinToString("\n") { "${it.key}\t${it.value}" } + "\n")
+        }
+        return copied
+    }
+
     fun parse(data: ByteArray): List<Rec> {
         val out = ArrayList<Rec>()
         var i = 0
