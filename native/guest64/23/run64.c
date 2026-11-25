@@ -278,13 +278,15 @@ struct aemu_nlmsgerr {
 };
 
 #define MAX_NL 32
-static struct { int fd, peer; } g_nl[MAX_NL];
+static struct { int fd, peer, proto; u32 groups; } g_nl[MAX_NL];
 
-static void nl_register(int fd, int peer) {
+static void nl_register(int fd, int peer, int proto) {
     for (int i = 0; i < MAX_NL; i++) {
         if (!g_nl[i].fd) {
             g_nl[i].fd = fd;
             g_nl[i].peer = peer;
+            g_nl[i].proto = proto;
+            g_nl[i].groups = 0;
             return;
         }
     }
@@ -295,6 +297,20 @@ static int nl_find_peer(int fd) {
         if (g_nl[i].fd == fd) return g_nl[i].peer;
     }
     return -1;
+}
+
+static int nl_proto_of(int fd) {
+    for (int i = 0; i < MAX_NL; i++) if (g_nl[i].fd == fd) return g_nl[i].proto;
+    return -1;
+}
+
+static u32 nl_groups_of(int fd) {
+    for (int i = 0; i < MAX_NL; i++) if (g_nl[i].fd == fd) return g_nl[i].groups;
+    return 0;
+}
+
+static void nl_set_groups(int fd, u32 groups) {
+    for (int i = 0; i < MAX_NL; i++) if (g_nl[i].fd == fd) { g_nl[i].groups = groups; return; }
 }
 
 static int is_nl_fd(int fd) {
@@ -310,6 +326,8 @@ static void nl_close(int fd) {
             if (g_nl[i].peer >= 0) S1(NR_close, g_nl[i].peer);
             g_nl[i].fd = 0;
             g_nl[i].peer = -1;
+            g_nl[i].proto = 0;
+            g_nl[i].groups = 0;
         }
     }
 }
@@ -515,6 +533,12 @@ static void tun_drain(void) {
 static void tun_hub_handoff(int s);
 static void hub_session_cfg(int s);
 static void hub_session_up(int s);
+static int hub_ensure(void);
+static void hub_pump(void);
+
+// The hub's cached session state lives here, ahead of the tun ioctls: a process that does not
+// own the session's tun (netd above all) answers interface questions from this cache.
+static struct { int up; char name[16]; u32 addr; u32 mtu; int exempt; u32 index; } g_hub_sess;
 
 static long tun_open(long flags) {
     if (g_tun_live) tun_drain();                    // reap before allocating
@@ -589,7 +613,7 @@ static long tun_ioctl(int fd, u32 cmd, u64 arg) {
 // registry: an interface exists because a session is registered, and its flags, MTU and addresses
 // are what the framework itself set. Returns 1 (and *out) when the name is one of ours.
 static int tun_sioc(u32 cmd, u64 arg, long *out) {
-    if ((cmd & 0xffffff00u) != 0x8900u || !arg || !g_tun_live) return 0;
+    if ((cmd & 0xffffff00u) != 0x8900u || !arg) return 0;
     char *ifr = (char *)arg;
     char name[16];
     memcpy(name, ifr, 16);
@@ -597,7 +621,25 @@ static int tun_sioc(u32 cmd, u64 arg, long *out) {
     for (int i = 0; i < 15 && name[i]; i++) if (name[i] == ':') { name[i] = 0; break; }   // tun0:1 aliases
     int s = -1;
     for (int i = 0; i < MAX_TUN; i++) if (g_tun[i].live && g_tun[i].name[0] && seq(g_tun[i].name, name)) s = i;
-    if (s < 0) return 0;
+    if (s < 0) {
+        // Not a tun this process owns — but the session's tun belongs to the framework's
+        // process, and every other process that resolves the interface by name lands here
+        // with an empty local registry. netd is the one that matters: bionic's
+        // if_nametoindex is exactly this ioctl (SIOCGIFINDEX), and a miss is why netd
+        // logged "cannot find interface tun0", refused to table the interface, and then
+        // had nothing to remove when the session ended. Answer the read-only questions
+        // from the hub's cached session state; the write ioctls stay the owner's alone.
+        if (cmd != 0x8933 && cmd != 0x8913 && cmd != 0x8921) return 0;
+        if (hub_ensure() < 0) return 0;
+        hub_pump();
+        if (!g_hub_sess.up || !g_hub_sess.name[0] || !seq(g_hub_sess.name, name)) return 0;
+        switch (cmd) {
+        case 0x8933: if (!g_hub_sess.index) return 0; *(int *)(ifr + 16) = (int)g_hub_sess.index; *out = 0; return 1;  // SIOGIFINDEX
+        case 0x8913: *(u16 *)(ifr + 16) = 0x80d1; *out = 0; return 1;   // SIOCGIFFLAGS: the owner's up answer
+        case 0x8921: *(int *)(ifr + 16) = (int)g_hub_sess.mtu; *out = 0; return 1;  // SIOCGIFMTU
+        }
+        return 0;
+    }
     switch (cmd) {
     case 0x8914: g_tun[s].up = *(u16 *)(ifr + 16) & 1; *out = 0; return 1;                  // SIOCSIFFLAGS
     case 0x8913: *(u16 *)(ifr + 16) = (u16)((g_tun[s].up ? 0x41 : 0) | 0x10 | 0x80 | 0x8000); *out = 0; return 1;  // SIOCGIFFLAGS: UP|RUNNING, POINTOPOINT|NOARP|MULTICAST
@@ -636,7 +678,7 @@ static int tun_sioc(u32 cmd, u64 arg, long *out) {
 // byte; ports are host-order u16.
 enum {
     HUB_HELLO = 1,          // -> (empty)
-    HUB_SESSION_STATE = 2,  // <- u8 up, char name[16], u32 addr, u32 mtu, i32 exempt uid
+    HUB_SESSION_STATE = 2,  // <- u8 up, char name[16], u32 addr, u32 mtu, i32 exempt uid, u32 index
     HUB_TUN_PEER = 3,       // -> (empty) + fd: the channel endpoint of a fresh /dev/tun
     HUB_PEER_OK = 4,        // <-
     HUB_SESSION_CFG = 5,    // -> char name[16], u32 index, u32 mtu
@@ -646,14 +688,13 @@ enum {
     HUB_FLOW_OK = 9,        // <- u32 flow id
     HUB_FLOW_NO = 10,       // <-
     HUB_FLOW_FD = 11,       // -> u32 flow id + fd: the host end of the detoured connection
-    HUB_LINKREG = 12,       // -> (empty) + fd: a netlink listener's peer, to be told about the interface
+    HUB_LINKREG = 12,       // -> u32 netlink protocol + fd: a netlink listener's peer, to be told about the interface
     HUB_LINKREG_OK = 13,    // <- u32 listener id
     HUB_LINKUNREG = 14,     // -> u32 listener id
 };
 
 static int g_hub_fd = -1;
 static int g_hub_pid;                       // the connection belongs to one process; a fork reconnects
-static struct { int up; char name[16]; u32 addr; u32 mtu; int exempt; } g_hub_sess;
 static volatile int g_hub_lock;
 static int g_hub_logged;                    // per process: the detour was announced, a refusal was announced
 
@@ -768,6 +809,7 @@ static void hub_handle(u8 type, const u8 *pl, u64 len) {
         g_hub_sess.addr = hub_get32(pl + 17);
         g_hub_sess.mtu = hub_get32(pl + 21);
         g_hub_sess.exempt = (int)hub_get32(pl + 25);
+        g_hub_sess.index = len >= 33 ? hub_get32(pl + 29) : 0;
     } else if (type == HUB_SESSION_DOWN && len >= 16) {
         char name[16];
         memcpy(name, pl, 16); name[15] = 0;
@@ -994,14 +1036,19 @@ static void hub_linkreg(int fd, const u8 *sa, u64 salen) {
     if (!sa || salen < 12 || sa[0] != 16 /*AF_NETLINK*/) return;
     u32 groups = hub_get32(sa + 8);
     if (!groups) return;                       // a request socket, not a listener: no events for it
+    nl_set_groups(fd, groups);
     for (int i = 0; i < MAX_LINKREG; i++) if (g_linkreg[i].fd == fd) return;
     int peer = nl_find_peer(fd);
     if (peer < 0 || hub_ensure() < 0) return;
     int dup = (int)S2(NR_dup, peer, 0);
     if (dup < 0) return;
+    // the registration carries the socket's protocol: the hub speaks to each listener in the
+    // dialect its consumer parses (kernel uevents for the uevent protocol, rtnetlink for the rest)
+    u8 lp[4];
+    hub_put32(lp, (u32)nl_proto_of(fd));
     hub_lock();
     u32 id = 0;
-    if (hub_send(HUB_LINKREG, 0, 0, dup) == 0) {
+    if (hub_send(HUB_LINKREG, lp, sizeof lp, dup) == 0) {
         u8 pl[64]; u64 ln = 0;
         if (hub_wait(HUB_LINKREG_OK, 2000, pl, sizeof pl, &ln) == 0 && ln >= 4) id = hub_get32(pl);
     }
@@ -1025,6 +1072,50 @@ static void hub_linkunreg(int fd) {
         }
         return;
     }
+}
+
+// A registered listener's events have no kernel behind them: the hub writes them into the
+// socket pair, but the guest's NetlinkListener reads with uevent_kernel_recv, which drops
+// anything that does not arrive shaped as a kernel message — SCM_CREDENTIALS of uid 0, a
+// source pid of 0, a subscribed group in the source address. A plain socket pair provides
+// none of that, so an injected event used to die inside the receive call itself and the
+// framework never heard it (the binary RTM_DELLINK of the M2 teardown among them). The
+// supervisor stands in for the kernel at the receive, as it already does at the tun ioctls:
+// the datagram is the hub's, the envelope is written the way the kernel would have written
+// it. Only fds registered with the hub take this path; every other recvmsg is untouched.
+static int nl_listener_recv(int fd, struct msgh *m, long *out) {
+    int lid = 0;
+    for (int i = 0; i < MAX_LINKREG; i++) if (g_linkreg[i].fd == fd) { lid = 1; break; }
+    if (!lid || !m) return 0;
+    u8 buf[4096];
+    long n = S3(NR_read, fd, buf, sizeof buf);
+    if (n < 0) { *out = n; return 1; }
+    if (m->name && m->namelen >= 16) {
+        u16 *sa = (u16 *)m->name;
+        u32 *w = (u32 *)m->name;
+        sa[0] = 16; sa[1] = 0;              // AF_NETLINK, no padding
+        w[1] = 0;                           // the kernel's pid
+        w[2] = nl_groups_of(fd);            // the group this socket subscribed to
+        m->namelen = 16;
+    }
+    if (m->control && m->controllen >= 32) {
+        struct cmsg *c = (struct cmsg *)m->control;
+        c->len = 28;                        // CMSG_LEN(sizeof(struct ucred))
+        c->level = 1;                       // SOL_SOCKET
+        c->type = 2;                        // SCM_CREDENTIALS
+        u32 *cred = (u32 *)((u8 *)m->control + 16);
+        cred[0] = 0; cred[1] = 0; cred[2] = 0;   // the kernel's own pid/uid/gid
+        m->controllen = 32;                // CMSG_SPACE(sizeof(struct ucred))
+    } else if (m->control) m->controllen = 0;
+    m->flags = 0;
+    long done = 0;
+    for (u64 i = 0; i < m->iovlen && done < n; i++) {
+        u64 take = m->iov[i].len < (u64)(n - done) ? m->iov[i].len : (u64)(n - done);
+        memcpy(m->iov[i].base, buf + done, take);
+        done += (long)take;
+    }
+    *out = done;
+    return 1;
 }
 
 // ---------------------------------------------------------------------------------------------------- exec
@@ -1534,7 +1625,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         if (r < 0 && a[0] == 16) {
             int sv[2];
             if (S4(NR_socketpair, 1 /*AF_UNIX*/, 2 /*SOCK_DGRAM*/ | (a[1] & 02004000), 0, (long)sv) == 0) {
-                nl_register(sv[0], sv[1]);
+                nl_register(sv[0], sv[1], (int)a[2]);
                 return sv[0];
             }
         }
@@ -1581,6 +1672,13 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             }
             return 0;
         }
+        return S3(nr, a[0], a[1], a[2]);
+    }
+    case NR_recvmsg: {
+        // a hub-registered netlink listener gets its events with a kernel-shaped envelope
+        // (see nl_listener_recv); every other receive is the host's own
+        long out;
+        if (is_nl_fd((int)a[0]) && nl_listener_recv((int)a[0], (struct msgh *)a[1], &out)) return out;
         return S3(nr, a[0], a[1], a[2]);
     }
     case NR_rt_sigaction: {
