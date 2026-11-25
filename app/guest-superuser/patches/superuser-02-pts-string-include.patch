@@ -1,0 +1,12 @@
+diff --git a/Superuser/jni/su/pts.c b/Superuser/jni/su/pts.c
+index c810a34..eaba115 100644
+--- a/Superuser/jni/su/pts.c
++++ b/Superuser/jni/su/pts.c
+@@ -30,6 +30,7 @@
+ #include <pthread.h>
+ 
+ #include "pts.h"
++#include <string.h>  /* AEmulator patch: strncpy was used without it; old bionic headers leaked it in */
+ 
+ /**
+  * Helper functions

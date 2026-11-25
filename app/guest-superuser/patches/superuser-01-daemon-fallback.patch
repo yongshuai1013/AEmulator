@@ -1,0 +1,38 @@
+diff --git a/Superuser/jni/su/daemon.c b/Superuser/jni/su/daemon.c
+index c75a5ea..c4014f4 100644
+--- a/Superuser/jni/su/daemon.c
++++ b/Superuser/jni/su/daemon.c
+@@ -558,8 +558,14 @@ int connect_daemon(int argc, char *argv[], int ppid) {
+     memcpy(sun.sun_path, "\0" "SUPERUSER", strlen("SUPERUSER") + 1);
+ 
+     if (0 != connect(socketfd, (struct sockaddr*)&sun, sizeof(sun))) {
++        // AEmulator patch (see patches/superuser-01-daemon-fallback.patch): upstream exits
++        // here when no daemon answers, which assumes install-recovery.sh or init started
++        // `su --daemon` at boot. Nothing does that in an AEmulator guest, so report the
++        // miss to the caller instead and let it serve the request in-process; the same
++        // policy database and the same manager prompt apply on that path.
+         PLOGE("connect");
+-        exit(-1);
++        close(socketfd);
++        return -2;
+     }
+ 
+     LOGD("connecting client %d", getpid());
+diff --git a/Superuser/jni/su/su.c b/Superuser/jni/su/su.c
+index e16baff..1bbfe04 100644
+--- a/Superuser/jni/su/su.c
++++ b/Superuser/jni/su/su.c
+@@ -801,7 +801,12 @@ int su_main(int argc, char *argv[], int need_client) {
+             get_api_version() >= 19) {
+             // attempt to connect to daemon...
+             LOGD("starting daemon client %d %d", getuid(), geteuid());
+-            return connect_daemon(argc, argv, ppid);
++            int daemon_result = connect_daemon(argc, argv, ppid);
++            if (daemon_result != -2)
++                return daemon_result;
++            // AEmulator patch: no daemon is running; fall through and serve the request
++            // in-process (the pre-daemon standalone path below).
++            LOGD("no su daemon; serving the request in-process");
+         }
+     }
+ 

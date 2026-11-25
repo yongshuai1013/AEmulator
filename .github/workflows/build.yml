@@ -15,7 +15,7 @@ jobs:
           SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | sort -V | tail -1)
           echo "sdkmanager: $SDKMANAGER"
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" "platforms;android-36" "platforms;android-19" "build-tools;36.0.0" "build-tools;35.0.0"
+          "$SDKMANAGER" "platforms;android-36" "platforms;android-21" "platforms;android-19" "build-tools;36.0.0" "build-tools;35.0.0"
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
@@ -73,6 +73,19 @@ jobs:
         with:
           name: aemu-agent-apk
           path: app/src/main/assets/engines/kk/aemu-agent.apk
+      - name: Build guest superuser stack from source
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          sh app/guest-superuser/build.sh
+          ls -l app/src/main/assets/engines/kk/aemu-su app/src/main/assets/engines/kk/aemu-superuser.apk
+          sha256sum app/src/main/assets/engines/kk/aemu-su app/src/main/assets/engines/kk/aemu-superuser.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aemu-superuser-assets
+          path: |
+            app/src/main/assets/engines/kk/aemu-su
+            app/src/main/assets/engines/kk/aemu-superuser.apk
       - name: Build APK
         run: |
           chmod +x gradlew

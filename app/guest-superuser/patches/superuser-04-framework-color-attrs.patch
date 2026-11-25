@@ -1,0 +1,17 @@
+diff --git a/Superuser/res/values/styles.xml b/Superuser/res/values/styles.xml
+index 728da58..71e883c 100644
+--- a/Superuser/res/values/styles.xml
++++ b/Superuser/res/values/styles.xml
+@@ -35,9 +35,9 @@
+     </style>
+ 
+     <style name="SuperuserLight" parent="@style/AppTheme">
+-        <item name="colorPrimary">#4CAF50</item>
+-        <item name="colorPrimaryDark">#4CAF50</item>
+-        <item name="colorAccent">#F44336</item>
++        <item name="android:colorPrimary">#4CAF50</item>
++        <item name="android:colorPrimaryDark">#4CAF50</item>
++        <item name="android:colorAccent">#F44336</item>
+ 
+         <item name="bottomButtonBar">@color/background_dark</item>
+         <item name="bottomButtonBarText">?android:attr/textColorPrimaryInverse</item>

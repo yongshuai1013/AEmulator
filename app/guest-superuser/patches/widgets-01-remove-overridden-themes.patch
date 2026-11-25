@@ -1,0 +1,20 @@
+diff --git a/Widgets/res/values/styles.xml b/Widgets/res/values/styles.xml
+index 1593016..6c35ddc 100644
+--- a/Widgets/res/values/styles.xml
++++ b/Widgets/res/values/styles.xml
+@@ -56,11 +56,10 @@
+         
+     </style>
+     
+-    <style name="AppActivityBaseTheme" parent="AppTheme">
+-    </style>
+-    
+-    <style name="AppDarkActivityBaseTheme" parent="AppDarkTheme">
+-    </style>
++    <!-- AEmulator patch: AppActivityBaseTheme and AppDarkActivityBaseTheme are removed here
++         because every consumer of this library (the Superuser app included) overrides both
++         with its own parents; aapt2 refuses the duplicate definitions that the old
++         library-project build resolved by overlay. -->
+     
+     <style name="AppActivityTheme" parent="AppActivityBaseTheme">
+         <item name="listPreferredItemPaddingLeft_">@dimen/activity_horizontal_margin</item>

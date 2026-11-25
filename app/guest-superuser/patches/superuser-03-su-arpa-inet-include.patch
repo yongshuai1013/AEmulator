@@ -1,0 +1,11 @@
+diff --git a/Superuser/jni/su/su.c b/Superuser/jni/su/su.c
+--- a/Superuser/jni/su/su.c
++++ b/Superuser/jni/su/su.c
+@@ -35,6 +35,7 @@
+ 
+ #include "su.h"
+ #include "utils.h"
++#include <arpa/inet.h>  /* AEmulator patch: htonl was used without it; old bionic headers leaked it in */
+ 
+ extern int is_daemon;
+ extern int daemon_from_uid;

@@ -22,4 +22,6 @@ release-apks/
 .kotlin/
 /app/src/main/assets/engines/kk/aemu-agent.jar
 /app/src/main/assets/engines/kk/aemu-agent.apk
+# built by CI from app/guest-superuser sources (see the workflow), never committed
+/app/src/main/assets/engines/kk/aemu-su
 *.idsig
