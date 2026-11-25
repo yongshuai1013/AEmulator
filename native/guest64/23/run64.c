@@ -1252,6 +1252,53 @@ static long trap(long nr, long *a, void *uc) {
 
 #include "../vmount.h"
 
+// ---------------------------------------------------------------------------------------------------- isolation observation
+
+// Observe-only (the isolation measurement batch): when an open lands outside the guest root, one
+// line goes to the host log — who opened what, and where it actually landed. Nothing is refused,
+// nothing is altered: the call has already returned whatever it returned. The landing is read back
+// from the descriptor itself (/proc/self/fd), so symlink escapes and dirfd-relative climbs are
+// seen where they end, not where the path string pointed. Landings on the layer's designed
+// surfaces are not reported: the phone's device nodes, the shared card folder (g_sd), and the
+// /proc + /sys fallthrough — all deliberate, all visible in xl. Set ISO_OBSERVE to 0 to silence.
+#define ISO_OBSERVE 1
+
+static void iso_cat(char *t, u64 *o, const char *s) {
+    u64 n = slen(s);
+    if (*o + n > PATH_MAX - 2) n = PATH_MAX - 2 - *o;
+    memcpy(t + *o, s, n); *o += n; t[*o] = 0;
+}
+
+static void iso_observe(int fd, const char *guest, char *t, char *line) {
+    if (!ISO_OBSERVE) return;
+    char lp[40] = "/proc/self/fd/", num[24];
+    char *d = utoa((u64)(u32)fd, num + sizeof num);
+    memcpy(lp + 14, d, slen(d) + 1);
+    long r = S4(NR_readlinkat, AT_FDCWD, lp, t, PATH_MAX - 1);
+    if (r <= 0) return;
+    t[r] = 0;
+    if (t[0] != '/') return;                                                // socket:[..], pipe:[..], anon_inode:..
+    if (pre(t, g_root) && (t[g_rootlen] == '/' || !t[g_rootlen])) return;   // landed inside the root
+    if (g_sdlen && pre(t, g_sd) && (t[g_sdlen] == '/' || !t[g_sdlen])) return;  // the shared card folder, by design
+    if (pre(t, "/dev/") || pre(t, "/proc/") || pre(t, "/sys/") || pre(t, "/memfd:")) return;   // designed surfaces
+    char comm[32];
+    u64 cl = 0;
+    long cf = S4(NR_openat, AT_FDCWD, "/proc/self/comm", 0, 0);
+    if (cf >= 0) { long n = S3(NR_read, cf, comm, sizeof comm - 1); S1(NR_close, cf); if (n > 0) cl = (u64)n; }
+    while (cl && (comm[cl - 1] == '\n' || comm[cl - 1] == ' ')) cl--;
+    comm[cl] = 0;
+    if (!cl) { memcpy(comm, "?", 2); cl = 1; }
+    u64 o = 0;
+    iso_cat(line, &o, "iso-obs: ");
+    iso_cat(line, &o, comm);
+    iso_cat(line, &o, " opened ");
+    iso_cat(line, &o, guest ? guest : "?");
+    iso_cat(line, &o, " and landed outside the root at ");
+    iso_cat(line, &o, t);
+    iso_cat(line, &o, "\n");
+    say(line);
+}
+
 static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     int err = 0;
     if (g_tun_live) tun_drain();
@@ -1296,7 +1343,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         }
         NEEDX(1);
         if ((a[2] & (3 | 0100 | 01000)) && in_system(a[0], h1, PB(2))) return -EROFS;
-        return S4(nr, a[0], h1, a[2], a[3]);
+        { long r = S4(nr, a[0], h1, a[2], a[3]); if (r >= 0) iso_observe((int)r, P(1), PB(1), PB(2)); return r; }
     }
     case NR_newfstatat: {
         // fstat as newer C libraries make it (qemu-arm's does): the same answers as for fstat
