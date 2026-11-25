@@ -3,6 +3,7 @@ package app.aemu.agent;
 import android.content.Intent;
 import android.net.VpnService;
 import android.os.ParcelFileDescriptor;
+import android.util.Log;
 
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -114,6 +115,22 @@ public final class VpnTestService extends VpnService {
     }
 
     private void shutdown() {
+        // Tell the hub the session is over, explicitly, before anything is closed. The hub
+        // used to learn it from the channel running dry, but the framework keeps its own
+        // duplicate of the tun descriptor, so the channel never runs dry on a stop — the hub
+        // heard nothing, the framework's session stayed registered, and the next establish()
+        // stacked a second interface on the corpse of the first. The signal rides the tunnel
+        // itself, the same way EXEMPT does; every exit funnels through here (the stop action,
+        // onDestroy, onRevoke), so one send covers all three. Sent once per session: the
+        // tunnel reference is dropped at the end of this method, so repeat calls skip it.
+        if (tunnel != null) {
+            try {
+                FileOutputStream out = new FileOutputStream(tunnel.getFileDescriptor());
+                out.write("SESSION_END\n".getBytes("UTF-8"));
+                out.flush();
+                Log.i("aemu-vpn", "SESSION_END written into the tunnel: the hub is told the session is over");
+            } catch (Throwable ignored) { }
+        }
         if (reader != null) {
             reader.interrupt();
             reader = null;
