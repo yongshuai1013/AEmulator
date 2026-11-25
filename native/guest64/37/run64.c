@@ -105,14 +105,19 @@ static void relay32(int sig, void *info, void *uc) {
     if ((unsigned long)h > 1) h(sig, info, uc);
     *(unsigned long *)((char *)uc + 40) &= ~(1UL << 30);    // uc_sigmask, SIGSYS
 }
-// The image has the engine's 32-bit SwiftShader (system/lib/egl): 32-bit programs then have GLES 2 like the 64-bit
-// ones (WebView, a vendor browser on its own Chromium), and nothing is hidden from them.
+// The image has the engine's 32-bit SwiftShader (vendor/lib/egl; system/lib/egl in images set up before it moved
+// there): 32-bit programs then have GLES 2 like the 64-bit ones (WebView, a vendor browser on its own Chromium),
+// and nothing is hidden from them.
 static int gles2_for_32(void) {
     static int known = -1;
     if (known < 0) {
         static char p[600];
-        memcpy(p, g_root, g_rootlen); memcpy(p + g_rootlen, "/system/lib/egl/libGLESv2_swiftshader.so", 41);
+        memcpy(p, g_root, g_rootlen); memcpy(p + g_rootlen, "/vendor/lib/egl/libGLESv2_swiftshader.so", 41);
         known = S4(NR_faccessat, AT_FDCWD, p, 0, 0) == 0;
+        if (!known) {
+            memcpy(p + g_rootlen, "/system/lib/egl/libGLESv2_swiftshader.so", 41);
+            known = S4(NR_faccessat, AT_FDCWD, p, 0, 0) == 0;
+        }
     }
     return known;
 }
