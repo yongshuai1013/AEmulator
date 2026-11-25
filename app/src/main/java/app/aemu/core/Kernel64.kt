@@ -189,7 +189,9 @@ enum class Kernel64(
      *  read 0 through the runner) */
     val bridgeAsEmulation: Boolean = false,
     /** where that "emulation" driver is looked for, when not in eglDir (8.0's loader: only /system/lib64/egl).
-     *  8.1's loader looks in eglDir itself; the directory is named all the same, so the 32-bit links are made */
+     *  8.1's loader looks in eglDir itself; the directory is named all the same, so the 32-bit links are made.
+     *  9's loader is 8.1's in this (its setEmulatorGlesValue and the exact "/vendor/lib/egl/lib<kind>_emulation.so"
+     *  path for status 1 checked line by line against android-9.0.0_r1's Loader.cpp), so 9 names it too */
     val emulationDir: String? = null,
     /** 8.0's SystemUI asks for the navigation bar's view when the lock screen shows and dies on a device without one
      *  (fixed in 8.1): the guest's own bar stays even where the app's buttons replace it */
@@ -282,7 +284,7 @@ enum class Kernel64(
     // Android 9 over the vendor side of 8.1, which is what a generic system image of 9 is made for: the HALs are the
     // ones of kernel 27 (copied, so that the two can part), and the system finds its copy of their libraries by the
     // VNDK version the vendor side declares.
-    A9("28", 28..28, gpuBridge64 = true, webView64 = true, bridgeAsEmulation = true, qcomHandles = true, webViewSingleProcess = true, registeredNetwork = true, treble = true, eglDir = "vendor/lib64/egl", gles = "2",
+    A9("28", 28..28, gpuBridge64 = true, webView64 = true, bridgeAsEmulation = true, emulationDir = "vendor/lib64/egl", qcomHandles = true, webViewSingleProcess = true, registeredNetwork = true, treble = true, eglDir = "vendor/lib64/egl", gles = "2",
         // (MIUI's system_server and the touch controller's lockdown bytes: as on 8.1)
         procFiles = mapOf("tp_lockdown_info" to "4636320131320200\n"),
         absentFeatures = listOf("consumerir", "fingerprint", "nfc", "nfc.hce", "nfc.hcef"), trafficAccounting = true, noQemuPipe = true, binderVold = true,
