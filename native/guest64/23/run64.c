@@ -567,6 +567,8 @@ static int nlreq_find(int fd) {
     return -1;
 }
 
+static int g_nlreq_full;
+
 static void nlreq_track(int fd) {
     if (nlreq_find(fd) >= 0) return;
     for (int i = 0; i < MAX_NLREQ; i++) if (!g_nlreq[i].fd) {
@@ -577,6 +579,16 @@ static void nlreq_track(int fd) {
         tun_cat(line, &o, "\n");
         say(line);
         return;
+    }
+    // the table is full: say so (capped) instead of dropping the fd in silence — an
+    // untracked route socket is otherwise indistinguishable from a swallowed log line
+    if (g_nlreq_full < 8) {
+        g_nlreq_full++;
+        char line[96]; u64 o = 0;
+        tun_cat(line, &o, "aemu-nlreq: table full, fd ");
+        tun_catn(line, &o, (u64)fd);
+        tun_cat(line, &o, " NOT tracked\n");
+        say(line);
     }
 }
 

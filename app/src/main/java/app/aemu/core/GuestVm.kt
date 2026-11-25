@@ -1034,12 +1034,19 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         // init publishes every service's state; the framework waits on it (SystemService.waitForState: the WebView
         // zygote, the boot animation)
         props.put("init.svc.$name", "running")
+        // netd's VPN intervention lines (aemu-nlreq:/aemu-nllink:) are mirrored into this log
+        // verbatim as they arrive: they used to reach it only through NetdTrace's one-shot
+        // digest, which closes a minute into the boot — long before any VPN session starts
+        val nlMirror = name == "netd"
         Thread({
             if (!direct) runCatching {
                 OutputStreamWriter(FileOutputStream(log, true)).use { w ->
                     w.write("\n=== $name ${stamp()} ===\n")
                     if (trace == null && acoreTrace == null && installdTrace == null) {
-                        p.inputStream.bufferedReader().forEachLine { w.write(it); w.write("\n"); w.flush() }
+                        p.inputStream.bufferedReader().forEachLine {
+                            w.write(it); w.write("\n"); w.flush()
+                            if (nlMirror && (it.startsWith("aemu-nlreq:") || it.startsWith("aemu-nllink:"))) log(it)
+                        }
                     } else {
                         var rawLines = 0
                         var rawCapped = false
@@ -1061,6 +1068,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                             }
                             if (installdTrace != null && installdTrace.isMatch(line)) {
                                 log(String.format(java.util.Locale.US, "installd-trace: [+%d.%03d] %s", el / 1000, el % 1000, line.take(300)))
+                            }
+                            if (nlMirror && (line.startsWith("aemu-nlreq:") || line.startsWith("aemu-nllink:"))) {
+                                log(line)
                             }
                         }
                     }
