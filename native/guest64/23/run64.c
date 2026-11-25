@@ -35,7 +35,7 @@ enum {
     NR_chdir = 49, NR_chroot = 51, NR_fchmodat = 53, NR_fchownat = 54, NR_fchown = 55, NR_openat = 56, NR_close = 57,
     NR_lseek = 62, NR_read = 63, NR_write = 64, NR_pread64 = 67, NR_pwrite64 = 68, NR_readlinkat = 78, NR_newfstatat = 79, NR_fstat = 80,
     NR_timerfd_create = 85, NR_utimensat = 88, NR_capget = 90, NR_capset = 91, NR_exit_group = 94, NR_unshare = 97,
-    NR_sched_yield = 124, NR_rt_sigaction = 134, NR_rt_sigprocmask = 135, NR_reboot = 142,
+    NR_ptrace = 117, NR_sched_yield = 124, NR_rt_sigaction = 134, NR_rt_sigprocmask = 135, NR_reboot = 142,
     NR_setregid = 143, NR_setgid = 144, NR_setreuid = 145, NR_setuid = 146, NR_setresuid = 147, NR_getresuid = 148,
     NR_setresgid = 149, NR_getresgid = 150, NR_setfsuid = 151, NR_setfsgid = 152, NR_getgroups = 158, NR_setgroups = 159,
     NR_uname = 160, NR_prctl = 167, NR_getpid = 172, NR_getuid = 174, NR_geteuid = 175, NR_getgid = 176, NR_getegid = 177, NR_gettid = 178,
@@ -2026,6 +2026,15 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         }
         { long r = S3(nr, a[0], a[1], a[2]); if (r >= 0) { sock_forget((int)a[1]); hub_linkunreg((int)a[1]); } return r; }
     }
+    case NR_ptrace: {
+        // observed, never mediated (iso-shadow): the request is performed exactly as made, and
+        // only the attach family (traceme 0, attach 16, seize 0x4206) is written down, with its
+        // result. Until now the call was not trapped at all and went straight to the phone's
+        // kernel — a guest process could take over its own child, proot-style, unseen.
+        long r = S4(nr, a[0], a[1], a[2], a[3]);
+        if (a[0] == 0 || a[0] == 16 || a[0] == 0x4206) iso_shadow_ptrace(a[0], a[1], r);
+        return r;
+    }
     case NR_close: {
         if (is_nl_fd((int)a[0])) nl_close((int)a[0]);
         if (is_tun_fd((int)a[0])) say("aemu-tun: the framework closed its tun descriptor (the session ends when the channel runs dry)");
@@ -2352,7 +2361,7 @@ static const u8 trapped[] = {
     NR_rt_sigaction, NR_reboot, NR_setregid, NR_setgid, NR_setreuid, NR_setuid, NR_setresuid, NR_getresuid,
     NR_setresgid, NR_getresgid, NR_setfsuid, NR_setfsgid, NR_getgroups, NR_setgroups, NR_getuid, NR_geteuid,
     NR_getgid, NR_getegid, NR_bind, NR_connect, NR_execve, NR_setsockopt, NR_unshare, NR_timerfd_create,
-    NR_close, NR_getsockopt, NR_sendto, NR_sendmsg, NR_getsockname, NR_socket, NR_dup3,
+    NR_close, NR_getsockopt, NR_sendto, NR_sendmsg, NR_getsockname, NR_socket, NR_dup3, NR_ptrace,
 };
 
 enum { L_TRAP = 240, L_ALLOW, L_SIG, L_MMAP, L_NR, L_PRCTL, L_N };
