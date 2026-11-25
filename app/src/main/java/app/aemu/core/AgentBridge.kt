@@ -2,9 +2,11 @@ package app.aemu.core
 
 import android.net.LocalSocket
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
+import java.security.SecureRandom
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -21,13 +23,17 @@ import java.util.concurrent.TimeUnit
  *                                          DENYERR = the attempt failed)
  *   host  -> agent  SYNC                   re-read the settings file and re-resolve the hide list
  *   host  -> agent  PUT <bytes> <name>     followed by exactly <bytes> raw bytes
+ *   agent -> host   ISOBEGIN               the isolation probe page asked for its markers: the host
+ *                                          plants a fresh marker outside the guest root and a decoy
+ *                                          at the same path string inside it, and answers
+ *   host  -> agent  ISOSETUP <host path> <out token> <in token>   (or ISOERR <message>)
  *   agent -> host   OK <guest path>        the file is in the guest's import inbox
  *   agent -> host   ERR <message>
  *
  * One connection at a time; a new agent replaces the old one, like the other bridges. Everything the agent
  * reports lands in the VM log: a failed import says so here and to the caller, never a silent success.
  */
-class AgentBridge(paths: VmPaths, private val enabled: () -> Boolean,
+class AgentBridge(private val paths: VmPaths, private val enabled: () -> Boolean,
                   private val deny: (pkg: String, on: Boolean) -> DenyAnswer,
                   private val log: (String) -> Unit) {
 
@@ -113,6 +119,28 @@ class AgentBridge(paths: VmPaths, private val enabled: () -> Boolean,
         }
     }
 
+    /**
+     * The isolation measurement's markers, planted fresh on every ISOBEGIN: a marker file in the
+     * image's own directory — inside the app sandbox but OUTSIDE the guest root — whose content is
+     * this run's OUT token, and a decoy at the same path string INSIDE the root with the IN token.
+     * A guest open of the marker's path that is translated correctly reads the decoy; only an open
+     * that escapes the root can read the marker itself, which is exactly what the probe tells apart.
+     */
+    private fun plantIsoMarkers(): String {
+        val raw = ByteArray(6)
+        SecureRandom().nextBytes(raw)
+        val suffix = raw.joinToString("") { "%02x".format(it) }
+        val outText = "AEMU-ISO-OUT-$suffix"
+        val inText = "AEMU-ISO-IN-$suffix"
+        val marker = File(paths.dir, "iso-probe-marker.txt")
+        marker.writeText("$outText\n")
+        val decoy = File(paths.root, marker.absolutePath.removePrefix("/"))
+        decoy.parentFile?.mkdirs()
+        decoy.writeText("$inText\n")
+        log("agent: iso-probe markers planted (host marker outside the root, decoy at the same path inside it)")
+        return "ISOSETUP ${marker.absolutePath} $outText $inText"
+    }
+
     private inner class Session(val out: OutputStream) {
         val putLock = Any()
         @Volatile var pendingPut: ((String) -> Unit)? = null
@@ -155,6 +183,14 @@ class AgentBridge(paths: VmPaths, private val enabled: () -> Boolean,
                         val p = mine.pendingPut
                         if (p != null) p(line) else log("agent: $line")
                     }
+                    line.startsWith("ISOBEGIN") -> Thread {
+                        val reply = runCatching { plantIsoMarkers() }.fold(
+                            onSuccess = { it },
+                            onFailure = { "ISOERR ${it.message ?: "the markers could not be planted"}" }
+                        )
+                        if (reply.startsWith("ISOERR")) log("agent: iso-probe setup failed: ${reply.substring(7)}")
+                        runCatching { mine.send(reply) }
+                    }.start()
                     line.startsWith("LOG ") -> log("agent: ${line.substring(4)}")
                     else -> log("agent: $line")
                 }
