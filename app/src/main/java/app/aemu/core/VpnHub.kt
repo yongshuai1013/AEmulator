@@ -16,8 +16,10 @@ import java.io.OutputStream
  *
  * What the hub holds:
  *  - the tun channel endpoint, handed over by the supervisor at /dev/tun open. Reading it is
- *    how packets the guest writes into the tunnel are seen at all; the channel running dry
- *    (every guest-side descriptor closed) is the authoritative end of the session.
+ *    how packets the guest writes into the tunnel are seen at all. A session ends when the
+ *    VPN app says so (a SESSION_END line written into the tunnel before it closes anything);
+ *    the channel running dry is only the fallback, because the framework keeps its own
+ *    duplicate of the tun descriptor and may hold the channel open past the app's stop.
  *  - the host ends of guest connections the supervisor detoured at their connect() call. A
  *    synthesizer turns their byte stream into TCP segments and writes them into the tunnel.
  *    Only the synthesizing half exists in M2: nothing is read back out of the tunnel and
@@ -125,6 +127,17 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
             T_HELLO -> conn.send(T_SESSION_STATE, statePayload())
             T_TUN_PEER -> {
                 if (fd == null) return false
+                // A new channel while the old session is still registered means the old
+                // session's end never reached us (its stop signal was lost, or the app was
+                // killed mid-session). Never stack the new session on the corpse: run the
+                // old one through the full teardown first — registry cleared, SESSION_DOWN
+                // broadcast, link event — so the framework buries the old interface before
+                // the new one is announced.
+                val stale = synchronized(lock) { session }
+                if (stale != null) {
+                    log("aemu-vpn: a new tun channel arrived while session ${stale.name} was still registered; replacing stale session ${stale.name}")
+                    sessionDown(stale)
+                }
                 val s = Session("")
                 s.peerFd = fd
                 s.tunIn = FileInputStream(fd)
@@ -248,6 +261,21 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                     }
                     continue
                 }
+                // The app's explicit word that the session is over, sent before it closes
+                // anything. This — not the channel running dry — is the reliable end: the
+                // framework keeps its own duplicate of the tun descriptor, so on a stop the
+                // channel may never run dry at all, and a hub that waits for dryness keeps a
+                // dead session registered (and lets the next one stack on it).
+                if (n >= 11 && buf[0] == 'S'.code.toByte() && buf[1] == 'E'.code.toByte() &&
+                    buf[2] == 'S'.code.toByte() && buf[3] == 'S'.code.toByte() &&
+                    buf[4] == 'I'.code.toByte() && buf[5] == 'O'.code.toByte() &&
+                    buf[6] == 'N'.code.toByte() && buf[7] == '_'.code.toByte() &&
+                    buf[8] == 'E'.code.toByte() && buf[9] == 'N'.code.toByte() &&
+                    buf[10] == 'D'.code.toByte()
+                ) {
+                    log("aemu-vpn: SESSION_END from the VPN app on session ${s.name}: ending the session on its word")
+                    break
+                }
                 s.appPkts++
                 if (s.appPkts == 1L) log("aemu-vpn: first packet into the tunnel: " + describe(buf, n))
             }
@@ -270,21 +298,32 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         return "IPv4/$pname $src -> $dst ($n bytes)"
     }
 
-    // The channel ran dry: the session is over, authoritatively. Order matters and is fixed:
-    // the supervisors hear about it first (they clear their registries, so the framework's own
-    // interface check reads "gone"), the link event goes to the listeners only after that.
+    // The session is over — the app said so, or the channel ran dry behind it. Order matters
+    // and is fixed: the supervisors hear about it first (they clear their registries, so the
+    // framework's own interface check reads "gone"), the link event goes to the listeners
+    // only after that. Every step is logged: a teardown that cannot be read line by line in
+    // the field is indistinguishable from the silent non-teardown this replaces.
     private fun sessionDown(s: Session) {
+        val flowCount: Int
+        val listenerCount: Int
+        val hadExempt: Int
         synchronized(lock) {
             if (session !== s) return
             session = null
             s.alive = false
+            flowCount = flows.size
             for (f in flows.values) { f.open = false; closeFd(f.fd) }
             flows.clear()
+            listenerCount = listeners.size
+            hadExempt = exemptUid
+            exemptUid = -1
         }
         closeFd(s.peerFd)
         broadcastState()
         broadcastDown(s.name)
+        log("aemu-vpn: session ${s.name} registry cleared (tun registration, $flowCount flow(s), exempt uid $hadExempt released); SESSION_DOWN broadcast")
         linkEvent(false, s)
+        log("aemu-vpn: RTM_DELLINK for ${s.name} injected to $listenerCount link listener(s)")
         log("aemu-vpn: session ${s.name} over: ${s.appPkts} packets from the app, ${s.synthPkts} synthesized packets back")
     }
 
