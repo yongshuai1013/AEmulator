@@ -96,6 +96,17 @@ jobs:
           path: |
             app/src/main/assets/engines/kk/aemu-su
             app/src/main/assets/engines/kk/aemu-superuser.apk
+      - name: Build guest terminal app from source
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          sh app/guest-terminal/build.sh
+          ls -l app/src/main/assets/engines/kk/aemu-terminal.apk
+          sha256sum app/src/main/assets/engines/kk/aemu-terminal.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aemu-terminal-apk
+          path: app/src/main/assets/engines/kk/aemu-terminal.apk
       - name: Build APK
         run: |
           chmod +x gradlew

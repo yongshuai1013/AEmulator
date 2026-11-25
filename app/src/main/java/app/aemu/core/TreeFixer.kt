@@ -116,6 +116,7 @@ class TreeFixer(
         if (owners) seedOwners()
         installEngineFiles()
         superuserFiles()
+        terminalFiles()
         gatekeeperFiles()
         protectOat()
         fixThemeXml()
@@ -195,6 +196,40 @@ class TreeFixer(
                 log("superuser: manager app planted at ${SuperuserSupport.APP_PATH}")
             }
         }.onFailure { log("superuser app: ${it.message}") }
+    }
+
+    /**
+     * Guest terminal (TerminalSupport): the self-built Terminal Emulator app, planted as
+     * a system app in every guest that can run it — the KK and N64 engines at api 14+ —
+     * with no switch. The path follows the generation's system-app layout (see
+     * TerminalSupport). Byte-compared like the superuser plant: repeat fixups are no-ops,
+     * and the copy at the other generation's path, or any copy in an out-of-range guest,
+     * is taken back only when it is byte-identical to the asset — a firmware that ships
+     * its own terminal is never touched.
+     */
+    private fun terminalFiles() {
+        val bytes = runCatching { EngineAssets.open(ctx, TerminalSupport.ASSET).use { it.readBytes() } }
+            .getOrElse { log("terminal app: ${it.message}"); return }
+        val wanted = if ((engine == Engine.N64 || engine == Engine.KK) && img.api >= 14)
+            TerminalSupport.pathFor(img.api) else null
+        for (rel in listOf(TerminalSupport.APP_PATH_DIR, TerminalSupport.APP_PATH_FLAT)) {
+            val f = File(root, rel)
+            runCatching {
+                if (rel == wanted) {
+                    if (!f.isFile || !f.readBytes().contentEquals(bytes)) {
+                        f.parentFile?.mkdirs()
+                        f.writeBytes(bytes)
+                        f.setReadable(true, false)
+                        log("terminal: app planted at $rel")
+                    }
+                } else if (f.isFile && f.readBytes().contentEquals(bytes)) {
+                    f.delete()
+                    if (rel == TerminalSupport.APP_PATH_DIR)
+                        f.parentFile?.takeIf { it.list()?.isEmpty() == true }?.delete()
+                    log("terminal: app removed from $rel")
+                }
+            }.onFailure { log("terminal app: ${it.message}") }
+        }
     }
 
     /**
