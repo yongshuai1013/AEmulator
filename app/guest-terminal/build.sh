@@ -103,8 +103,15 @@ javac --release 8 -encoding UTF-8 -cp "$JAR:$work/annotations.jar" -d "$work/cla
 cp "$work/ate/LICENSE" "$work/ate/NOTICE" "$work/stage/"
 cp "$work/base.apk" "$work/app.apk"
 (cd "$work/dex" && zip -q "$work/app.apk" classes.dex)
-(cd "$work/stage" && zip -q -r "$work/app.apk" lib LICENSE NOTICE)
-"${BT}zipalign" -f 4 "$work/app.apk" "$work/aligned.apk"
+# The JNI libraries go in STORED (uncompressed) and page-aligned: the guest loads them
+# straight out of the APK (the classloader's search path includes Terminal.apk!/lib/<abi>,
+# and the guest's package manager does not extract a lib/ directory next to the planted
+# system app), and a deflated .so cannot be mapped in place — the first field run died
+# with UnsatisfiedLinkError on libjackpal-termexec2.so. LICENSE/NOTICE keep the default
+# compression; they are read as streams, not mapped.
+(cd "$work/stage" && zip -q -0 -r "$work/app.apk" lib)
+(cd "$work/stage" && zip -q "$work/app.apk" LICENSE NOTICE)
+"${BT}zipalign" -f -p 4 "$work/app.apk" "$work/aligned.apk"
 KS="$here/terminal.keystore"
 if [ ! -f "$KS" ]; then
     keytool -genkeypair -keystore "$KS" -storepass android -keypass android -alias terminal \
@@ -112,4 +119,16 @@ if [ ! -f "$KS" ]; then
 fi
 "${BT}apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android \
     --out "$out/aemu-terminal.apk" "$work/aligned.apk"
+# Guard the stored-.so rule above: fail the build if any packaged native library ended
+# up compressed, so this defect class cannot ship silently again.
+python3 - "$out/aemu-terminal.apk" <<'PYEOF'
+import sys, zipfile
+bad = [i.filename for i in zipfile.ZipFile(sys.argv[1]).infolist()
+       if i.filename.startswith("lib/") and i.filename.endswith(".so")
+       and i.compress_type != zipfile.ZIP_STORED]
+if bad:
+    print("guest-terminal: compressed native libraries in APK: " + ", ".join(bad),
+          file=sys.stderr)
+    sys.exit(1)
+PYEOF
 echo "guest-terminal: built $out/aemu-terminal.apk from jackpal/Android-Terminal-Emulator $TERMINAL_COMMIT"
