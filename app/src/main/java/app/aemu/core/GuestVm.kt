@@ -34,6 +34,16 @@ private val NETD_STRACE = true
  * build without it. */
 private val ACORE_STRACE = true
 
+/** TEMPORARY diagnostic build (magisk-daemon-diag-desk.md): probes P0–P4/P6 around the unchanged
+ * daemon start of #103, so the daemon's silent exit has to name itself — P0 proves the binary
+ * execs, P1 checks the binary's own tmpfs path against the one the socket poll watches, P2 runs
+ * --daemon in the foreground with its output kept, P3/P4 sample /proc and the fall-out points
+ * while the background start runs, P6 retries the start at boot-complete when logd is up.
+ * Observation only: own threads, bounded timeouts, fail-open, no behaviour path touched; with
+ * this off the file is #103 verbatim. On in this build (the field phone cannot flip it); remove
+ * the constant and every MAGISK_DIAG block once the verdict is in. */
+private val MAGISK_DIAG = true
+
 /** Native arm64 engine: vendor daemons that only poll hardware the phone does not have (modem, DSP, TrustZone). */
 private val N64_SKIP = setOf("audiod", "ATFWD-daemon", "imsqmidaemon", "loc_launcher", "cnd", "dpmd", "cnss-daemon",
     "tftp_server", "qcom-system-daemon", "hvdcp_opti", "pm-service", "mtd", "mlipayd", "vsimd", "fdpp", "perfd", "ipacm",
@@ -1771,6 +1781,54 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }.onFailure { log("magisk: daemon start failed: ${it.message}") }
     }
 
+    // ---- TEMPORARY Magisk daemon diagnostic (MAGISK_DIAG; magisk-daemon-diag-desk.md) ----------------
+    // Observation only: the probes run on their own threads beside the unchanged magiskStartDaemon,
+    // every call is timeout-bounded and wrapped, and nothing here alters a stage command, a file or
+    // a return value. All output lands in the host log with the magisk-diag: prefix — the only
+    // channel that survives the reboot.
+
+    /** Kicks off the two probe threads: P0–P2 (foreground probes) and P3/P4 (survival sampling timed
+     * against the background start magiskStartDaemon is about to issue). Returns at once. */
+    private fun magiskDiagStart() {
+        val t0 = System.currentTimeMillis()
+        Thread {
+            runCatching {
+                val p0 = guestShell("/${MagiskCore.TMP}/magisk -c; echo rc=$?", 15_000).trim().replace('\n', ' ')
+                log("magisk-diag: P0 exec-alive -> ${p0.take(600)}")
+                val p1 = guestShell("/${MagiskCore.TMP}/magisk --path; echo rc=$?", 15_000).trim().replace('\n', ' ')
+                log("magisk-diag: P1 binary tmpfs path -> ${p1.take(600)}")
+                val t2 = System.currentTimeMillis()
+                val p2 = guestShell("/${MagiskCore.TMP}/magisk --daemon; echo rc=$?", 8_000).trim().replace('\n', ' ')
+                log("magisk-diag: P2 foreground --daemon returned after ${System.currentTimeMillis() - t2} ms -> ${p2.take(600)}")
+            }.onFailure { log("magisk-diag: P0-P2 probes failed: ${it.message}") }
+        }.start()
+        Thread {
+            runCatching {
+                for ((label, atMs) in listOf("+0.5s" to 500L, "+2s" to 2_000L, "+10s" to 10_000L)) {
+                    val wait = t0 + atMs - System.currentTimeMillis()
+                    if (wait > 0) Thread.sleep(wait)
+                    magiskDiagSample(label, t0)
+                }
+                log("magisk-diag: P3/P4 sampling done, ${System.currentTimeMillis() - t0} ms after probe start")
+            }.onFailure { log("magisk-diag: P3/P4 sampling failed: ${it.message}") }
+        }.start()
+    }
+
+    /** One P3/P4 sample: every process whose cmdline mentions magisk (pid, state, ppid — the sampler
+     * itself excluded), the socket directory, and the P4 fall-out points (a magisk.log.bak rotation
+     * shows the daemon reached its logging stage; anything beside the socket in device/ marks how
+     * far the start got). */
+    private fun magiskDiagSample(label: String, t0: Long) {
+        val cmd = "self=\$\$; for d in /proc/[0-9]*; do p=\${d#/proc/}; [ \"\$p\" = \"\$self\" ] && continue; " +
+            "c=\$(tr '\\0' ' ' < \$d/cmdline 2>/dev/null); case \"\$c\" in *magisk*) " +
+            "echo \"proc \$p: \$c | \$(grep '^State:' \$d/status 2>/dev/null) | \$(grep '^PPid:' \$d/status 2>/dev/null)\";; esac; done; " +
+            "echo device:; ls -la /${MagiskCore.TMP}/.magisk/device/ 2>&1; " +
+            "echo cache:; ls -la /cache/magisk.log* 2>&1; " +
+            "echo magiskdir:; ls -la /${MagiskCore.TMP}/.magisk/ 2>&1"
+        val out = runCatching { guestShell(cmd, 20_000).trim() }.getOrDefault("sample shell failed")
+        log("magisk-diag: P3/P4 sample $label (at +${System.currentTimeMillis() - t0} ms):\n$out")
+    }
+
     /** Before the first service: the stand-in tmpfs and the su links, the daemon itself (magiskinit's job on a
      * phone), "magisk --post-fs-data" (merges module updates, runs post-fs-data scripts), then the modules' files
      * are copied into the tree. Never fails the boot. */
@@ -1784,6 +1842,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             MagiskCore.Overlay.revert(paths.root, ::log)
             MagiskCore.prepareTmp(paths.root)
             MagiskCore.linkSystem(paths.root, ::log)
+            if (MAGISK_DIAG) magiskDiagStart()
             magiskStartDaemon()
             log("magisk: post-fs-data -> ${magiskExec("--post-fs-data", 45_000)}")
             MagiskCore.unlockTmp(paths.root)    // its magic mount leaves directories at mode 000
@@ -1855,6 +1914,14 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             if (on) {
                 MagiskCore.unlockTmp(paths.root)
                 magiskManagerSetup()
+            }
+            if (on && MAGISK_DIAG) {
+                // P6 of the diag design: at boot-complete logd is up, so a daemon that dies now has
+                // somewhere to leave its words (logcat). Re-issue the #103 start in its original
+                // shape; if it lives here, the early-boot environment was the wall.
+                log("magisk-diag: P6 late restart at boot-complete (logd is up)")
+                magiskStartDaemon()
+                log("magisk-diag: P6 late restart done; /cache/magisk.log: ${magiskLogTail()}")
             }
         }.onFailure { log("magisk: boot-complete stage failed: ${it.message}") }
     }
