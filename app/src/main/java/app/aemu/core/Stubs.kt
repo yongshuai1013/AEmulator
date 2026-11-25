@@ -681,3 +681,176 @@ class LogdSink(paths: VmPaths, private val log: (String) -> Unit) {
 
     fun stop() { runCatching { s?.close() }; s = null; sock.delete() }
 }
+
+/**
+ * Real-time host-side copy of the guest log (run/logcat-stream.log, next to the host log aemu.log).
+ *
+ * The guest's records already land on host storage as they are written — LogdSink appends them to
+ * dev/log/<buffer> (older guests write those files directly) — but nothing durable is made of them:
+ * the panel and the export read only a tail window (1 MB / 3000 records), so the flood of a fresh
+ * boot pushes a crash's death segment out of reach within minutes, and the next VM start clears the
+ * buffers entirely. This follower tails the buffer files and writes every record, formatted as the
+ * export formats it, into its own file the moment it lands (one poll is 150 ms), flushing each
+ * batch straight to the file — a zygote death can no longer take the segment with it, and the file
+ * survives VM restarts (it is appended to, never truncated; rotation bounds it instead).
+ *
+ * Host-side by construction: for api >= 21 there is no guest logd to read (logcat inside the guest
+ * has no logdr to talk to) — the records' only road is the one LogdSink already serves. The thread
+ * is a daemon, supervises itself (a failed follower is restarted after a second, one host-log line
+ * per failure) and never blocks the boot: every step is runCatching.
+ */
+class GuestLogStream(private val paths: VmPaths, private val log: (String) -> Unit) {
+    /** the live stream file; rotated siblings are "<name>.1" (newest) .. "<name>.3" (oldest) */
+    val file: File = paths.log("logcat-stream")
+    @Volatile private var active = false
+    private var thread: Thread? = null
+    private var out: java.io.FileOutputStream? = null
+    private var outSize = 0L
+    private val writeLock = Any()
+
+    /** every stream file there is, oldest first — what the panel's export concatenates */
+    fun filesOldestFirst(): List<File> {
+        val list = ArrayList<File>()
+        for (i in BACKUPS downTo 1) { val f = File(paths.bin, "${file.name}.$i"); if (f.isFile) list.add(f) }
+        if (file.isFile) list.add(file)
+        return list
+    }
+
+    fun start() {
+        if (active) return
+        active = true
+        runCatching {
+            thread = Thread({
+                while (active) {
+                    runCatching { follow() }
+                        .onFailure { if (active) log("guest log stream: follower failed: ${it.message}; restarting it") }
+                    if (active) runCatching { Thread.sleep(1000) }
+                }
+            }, "aemu-logstream").apply { isDaemon = true; start() }
+        }.onFailure { active = false; log("guest log stream: failed to start: ${it.message}") }
+    }
+
+    fun stop() {
+        active = false
+        thread?.interrupt(); thread = null
+        synchronized(writeLock) { runCatching { out?.close() }; out = null }
+    }
+
+    /** a segment marker inside the stream: what a crash left is whatever stands above its restart marker */
+    fun mark(text: String) = writeLines(listOf("===== $text (${stampFull()}) ====="))
+
+    private fun follow() {
+        val offsets = HashMap<String, Long>()
+        val pending = HashMap<String, ByteArray>()
+        // doBoot cleared the buffers before services start, so offset 0 is the whole run
+        for (b in GuestLog.BUFFERS) { offsets[b] = 0L; pending[b] = ByteArray(0) }
+        writeLines(listOf("===== guest log stream: segment start (${stampFull()}) ====="))
+        log("guest log stream: following ${GuestLog.BUFFERS.joinToString()} into ${file.name}")
+        val batch = ArrayList<String>()
+        while (active) {
+            batch.clear()
+            for (b in GuestLog.BUFFERS) {
+                val f = File(paths.root, "dev/log/$b")
+                val len = if (f.isFile) f.length() else 0L
+                var off = offsets[b] ?: 0L
+                if (len < off) { off = 0L; offsets[b] = 0L; pending[b] = ByteArray(0) } // truncated under us (logcat -c)
+                if (len <= off) continue
+                val want = minOf(len - off, CHUNK.toLong()).toInt()
+                val data = runCatching {
+                    java.io.RandomAccessFile(f, "r").use { r -> r.seek(off); ByteArray(want).also { r.readFully(it) } }
+                }.getOrNull() ?: continue
+                off += data.size; offsets[b] = off
+                val merged = (pending[b] ?: ByteArray(0)) + data
+                val (lines, consumed) = scan(b, merged)
+                pending[b] = merged.copyOfRange(consumed, merged.size)
+                batch.addAll(lines)
+            }
+            if (batch.isNotEmpty()) writeLines(batch)
+            else runCatching { Thread.sleep(POLL_MS) }
+        }
+    }
+
+    /**
+     * Walks complete "[prio][tag]\0[msg]\0" records out of [a] (the same form GuestLog.parse reads),
+     * returning the formatted lines and how many bytes they consumed; a record that is still
+     * arriving stays unconsumed, garbage is skipped a byte at a time, as in GuestLog.parse.
+     */
+    private fun scan(buffer: String, a: ByteArray): Pair<List<String>, Int> {
+        val lines = ArrayList<String>()
+        var i = 0
+        while (i < a.size) {
+            val p = a[i].toInt() and 0xff
+            if (p !in 2..8) { i++; continue }
+            var tagEnd = -1
+            val tagLimit = minOf(a.size, i + 1 + 48)
+            for (k in i + 1 until tagLimit) if (a[k] == 0.toByte()) { tagEnd = k; break }
+            if (tagEnd < 0) {
+                if (a.size - (i + 1) >= 48) { i++; continue } // no NUL within a tag's reach: not a record
+                break // the tag is still arriving
+            }
+            if (tagEnd == i + 1) { i++; continue }
+            val tag = String(a, i + 1, tagEnd - i - 1, Charsets.UTF_8)
+            if (tag.any { it < ' ' }) { i++; continue }
+            var msgEnd = -1
+            for (k in tagEnd + 1 until a.size) if (a[k] == 0.toByte()) { msgEnd = k; break }
+            if (msgEnd < 0) {
+                if (a.size - (tagEnd + 1) > MAX_MSG) { i++; continue } // unterminated monster: resync
+                break // the message is still arriving
+            }
+            val msg = String(a, tagEnd + 1, msgEnd - tagEnd - 1, Charsets.UTF_8)
+            lines.add("$buffer ${"??VDIWEFS"[p]} $tag: $msg")
+            i = msgEnd + 1
+        }
+        return lines to i
+    }
+
+    /**
+     * Appends [lines] to the stream file and flushes. FileOutputStream.write hands the bytes to the
+     * OS at once — that, not an fsync, is the durability promised here: the records survive the app
+     * and the guest dying, just not the phone losing power in the same instant.
+     */
+    private fun writeLines(lines: List<String>) {
+        if (!active || lines.isEmpty()) return
+        synchronized(writeLock) {
+            runCatching {
+                val text = lines.joinToString("") { it + "\n" }
+                val bytes = text.toByteArray()
+                if (outSize > 0 && outSize + bytes.size > MAX_FILE) rotate()
+                val o = ensureOut()
+                o.write(bytes)
+                o.flush()
+                outSize += bytes.size
+            }.onFailure { log("guest log stream: write failed: ${it.message}") }
+        }
+    }
+
+    private fun ensureOut(): java.io.FileOutputStream {
+        out?.let { return it }
+        file.parentFile?.mkdirs()
+        val o = java.io.FileOutputStream(file, true)
+        out = o
+        outSize = file.length()
+        return o
+    }
+
+    /** current -> .1 -> .2 -> .3, the oldest falling off: at most (BACKUPS + 1) * MAX_FILE per guest */
+    private fun rotate() {
+        runCatching { out?.close() }; out = null
+        for (i in BACKUPS downTo 1) {
+            val src = if (i == 1) file else File(paths.bin, "${file.name}.${i - 1}")
+            val dst = File(paths.bin, "${file.name}.$i")
+            if (src.isFile) { dst.delete(); src.renameTo(dst) }
+        }
+        outSize = 0
+    }
+
+    private fun stampFull() = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+
+    companion object {
+        private const val POLL_MS = 150L
+        private const val CHUNK = 256 * 1024
+        private const val MAX_MSG = 64 * 1024
+        private const val MAX_FILE = 4L * 1024 * 1024
+        private const val BACKUPS = 3
+    }
+}
