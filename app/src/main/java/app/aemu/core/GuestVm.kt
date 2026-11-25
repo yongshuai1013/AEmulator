@@ -412,7 +412,10 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         val s = settings
         val overrides = LinkedHashMap<String, String>()
         // 2.3: ro.kernel.qemu=1 включает в фреймворке режим эмулятора — ставим его только mediaserver
-        overrides["ro.kernel.qemu"] = if (engine == Engine.GB) "0" else "1"
+        // trial flip (per-VM setting qemuZero): boot with 0 instead of 1, so firmware components take
+        // their real-device paths. run/props.extra below is applied after this and still wins over
+        // both values; mediaserver's private copy forces =1 for itself either way (startServices).
+        overrides["ro.kernel.qemu"] = if (engine == Engine.GB || s.qemuZero) "0" else "1"
         overrides["ro.kernel.qemu.gles"] = if (s.gpu && (s.hwui || engine == Engine.GB)) "1" else "0"
         overrides["qemu.gles"] = if (s.gpu) "1" else "0"
         if (engine == Engine.N64) {             // SwiftShader (GLES 2/3 on the CPU) where the engine has it for this release

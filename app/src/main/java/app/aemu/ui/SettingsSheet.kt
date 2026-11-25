@@ -205,6 +205,7 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             var magiskBusy by remember { mutableStateOf(false) }
             MagiskSection(img, s.magisk, magiskBusy, { magiskBusy = it }) { s = s.copy(magisk = it) }
             SuperuserSection(img, s.superuser) { s = s.copy(superuser = it) }
+            QemuZeroSection(img, s.qemuZero) { s = s.copy(qemuZero = it) }
             AgentSection(img, s) { s = it }
 
             Spacer(Modifier.height(8.dp))

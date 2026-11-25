@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AEmulator: ro.kernel.qemu trial flip (VmSettings.qemuZero). English only for now; untranslated locales fall back to these. -->
+<resources>
+    <string name="vm_qemu_zero_title">Boot with ro.kernel.qemu = 0 (trial)</string>
+    <string name="vm_qemu_zero_sub">The guest boots with ro.kernel.qemu=0 instead of 1, so firmware components take their real-device paths. Applies at the next full boot; switch off and reboot to go back to 1. Bluetooth may behave differently (the guest may try to start its real Bluetooth service), and host-to-guest clipboard sharing stops — that is expected, real devices do not share a clipboard; copying inside the guest is unaffected. Sound should not change: the media server keeps its private copy of the old value. Experimental.</string>
+</resources>

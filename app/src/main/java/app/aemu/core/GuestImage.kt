@@ -117,6 +117,13 @@ data class VmSettings(
     val magisk: Boolean = false,
     /** Classic su root (arm64 Android 6.0 guests on the native engine): the host plants a self-built su and the Superuser manager app at boot, see SuperuserSupport; applies at the next full VM boot */
     val superuser: Boolean = false,
+    /**
+     * Trial flip of the emulator marker: the guest boots with ro.kernel.qemu=0 instead of 1, so
+     * firmware components take their real-device paths. Applies at the next full boot; mediaserver
+     * keeps its private =1 copy either way. Not offered on the legacy (GB) engine, which already
+     * boots its guests with 0.
+     */
+    val qemuZero: Boolean = false,
     /** the guest agent (identity sync for the per-app views, the APK import inbox): a guest service the host starts at boot, see AgentSupport; applies at the next full VM boot */
     val agent: Boolean = false,
     /**
@@ -154,6 +161,7 @@ data class VmSettings(
         .put("bluetooth", bluetooth)
         .put("magisk", magisk)
         .put("superuser", superuser)
+        .put("qemuZero", qemuZero)
         .put("agent", agent)
         .put("hiddenApps", org.json.JSONArray(hiddenApps))
 
@@ -248,6 +256,7 @@ data class VmSettings(
                 bluetooth = o.optBoolean("bluetooth", d.bluetooth),
                 magisk = o.optBoolean("magisk", d.magisk),
                 superuser = o.optBoolean("superuser", d.superuser),
+                qemuZero = o.optBoolean("qemuZero", d.qemuZero),
                 agent = o.optBoolean("agent", d.agent),
                 hiddenApps = o.optJSONArray("hiddenApps")?.let { a -> (0 until a.length()).mapNotNull { a.optString(it).trim().takeIf { s -> s.isNotEmpty() } }.distinct() } ?: d.hiddenApps,
             )
