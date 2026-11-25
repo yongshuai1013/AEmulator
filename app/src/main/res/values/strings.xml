@@ -104,6 +104,7 @@
     <string name="as_about">AEmulator runs classic Android firmware on modern phones. Free and open source.</string>
     <string name="log_copy">Copy</string>
     <string name="log_export">Export .log</string>
+    <string name="log_tombstone">Export tombstone</string>
     <string name="log_copied">Copied to clipboard</string>
     <string name="log_exported">Log saved</string>
     <string name="log_export_failed">Could not save log</string>

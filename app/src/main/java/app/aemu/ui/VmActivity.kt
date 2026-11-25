@@ -12,6 +12,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.rounded.BatteryStd
+import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material.icons.rounded.InstallMobile
@@ -1193,10 +1194,15 @@ class VmActivity : ComponentActivity() {
     private fun LogPanel(onClose: () -> Unit) {
         var guestTab by remember { mutableStateOf(false) }
         val guestLines = remember { mutableStateListOf<String>() }
+        // the tombstone button exists only while this guest's tree holds a tombstone;
+        // refreshed at the panel's own beats: on tab switches and in the guest-tab poll
+        var tombstone by remember { mutableStateOf(GuestLog.latestTombstone(vm.paths.root)) }
         LaunchedEffect(guestTab) {
+            tombstone = GuestLog.latestTombstone(vm.paths.root)
             while (guestTab) {
                 val recs = GuestLog.tail(vm.paths.root, 1024 * 1024).takeLast(3000)
                 guestLines.clear(); guestLines.addAll(recs.map { "${it.prio} ${it.tag}: ${it.msg}" })
+                tombstone = GuestLog.latestTombstone(vm.paths.root)
                 delay(1500)
             }
         }
@@ -1209,10 +1215,21 @@ class VmActivity : ComponentActivity() {
                     IconButton(onClick = { copyLog(list.toList()) }) { Icon(Icons.Rounded.ContentCopy, stringResource(R.string.log_copy)) }
                     IconButton(onClick = {
                         pendingExport = if (guestTab) GuestLog.exportLines(vm.paths.root) else list.toList()
-                        pendingTombstone = if (guestTab) GuestLog.latestTombstone(vm.paths.root) else null
                         exportLog.launch("aemu-${vm.img.id}-${if (guestTab) "logcat" else "host"}.log")
                     }) {
                         Icon(Icons.Rounded.Download, stringResource(R.string.log_export))
+                    }
+                    if (tombstone != null) {
+                        IconButton(onClick = {
+                            val f = GuestLog.latestTombstone(vm.paths.root)
+                            tombstone = f
+                            if (f != null) {
+                                pendingTombstone = f
+                                exportTombstone.launch("aemu-${vm.img.id}-${f.name}.txt")
+                            }
+                        }) {
+                            Icon(Icons.Rounded.BugReport, stringResource(R.string.log_tombstone))
+                        }
                     }
                     FilledTonalIconButton(onClick = onClose) { Icon(Icons.Rounded.Close, stringResource(R.string.close)) }
                 }
@@ -1304,17 +1321,12 @@ class VmActivity : ComponentActivity() {
 
     private var pendingExport: List<String> = emptyList()
     private val exportLog = registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
-        if (uri == null) { pendingTombstone = null; return@registerForActivityResult }
+        if (uri == null) return@registerForActivityResult
         val lines = pendingExport
         thread {
             val ok = runCatching { contentResolver.openOutputStream(uri)!!.bufferedWriter().use { w -> lines.forEach { w.write(it); w.write("\n") } } }.isSuccess
             runOnUiThread {
                 Toast.makeText(this, if (ok) R.string.log_exported else R.string.log_export_failed, Toast.LENGTH_SHORT).show()
-                // Guest-tab exports also offer the newest guest tombstone as a second
-                // document; host-tab exports never set pendingTombstone.
-                val ts = pendingTombstone
-                if (ok && ts != null) exportTombstone.launch("aemu-${vm.img.id}-${ts.name}.txt")
-                else pendingTombstone = null
             }
         }
     }
