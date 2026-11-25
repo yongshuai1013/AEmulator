@@ -116,6 +116,7 @@ class TreeFixer(
         if (owners) seedOwners()
         installEngineFiles()
         superuserFiles()
+        gatekeeperFiles()
         protectOat()
         fixThemeXml()
         parkWhetstone()
@@ -194,6 +195,55 @@ class TreeFixer(
                 log("superuser: manager app planted at ${SuperuserSupport.APP_PATH}")
             }
         }.onFailure { log("superuser app: ${it.message}") }
+    }
+
+    /**
+     * Software GateKeeper (api 27 only): the 8.1 gatekeeper HIDL implementation is a
+     * passthrough to the legacy gatekeeper.*.so module, which on real hardware is backed
+     * by the TEE (QSEE on angler). In the guest its open() fails, the HIDL service aborts
+     * with "Unable to open GateKeeper HAL", gatekeeperd never registers, and system_server
+     * dies in LockSettingsService on a null IGateKeeperService. Plant the self-built
+     * software module (native/gatekeeperhal: the 8.1 handle layout, scrypt signatures,
+     * libgatekeeper throttling, HMAC auth tokens) over every legacy module the firmware
+     * ships — under the firmware's own file name, so the stock hw_get_module variant
+     * search keeps finding it first. Byte-compared, so repeat fixups are no-ops and an
+     * already-imported VM picks the fix up on its next boot. A firmware with no legacy
+     * module at all gets gatekeeper.default.so, the last variant the search tries.
+     */
+    private fun gatekeeperFiles() {
+        if (engine != Engine.N64 || img.api != 27) return
+        runCatching {
+            val bytes64 = EngineAssets.open(ctx, "engines/n64-27/aemu-gatekeeper.so").use { it.readBytes() }
+            val bytes32 = runCatching {
+                EngineAssets.open(ctx, "engines/n64-27/aemu-gatekeeper32.so").use { it.readBytes() }
+            }.getOrNull()
+            var found = false
+            for ((dirs, bytes) in listOf(
+                listOf("vendor/lib64/hw", "system/vendor/lib64/hw", "system/lib64/hw") to bytes64,
+                listOf("vendor/lib/hw", "system/vendor/lib/hw", "system/lib/hw") to bytes32
+            )) {
+                if (bytes == null) continue
+                for (dir in dirs) {
+                    File(root, dir).listFiles()?.forEach { f ->
+                        if (f.isFile && f.name.startsWith("gatekeeper.") && f.name.endsWith(".so")) {
+                            found = true
+                            if (!f.readBytes().contentEquals(bytes)) {
+                                f.writeBytes(bytes)
+                                f.setReadable(true, false)
+                                log("gatekeeper: software module planted over $dir/${f.name}")
+                            }
+                        }
+                    }
+                }
+            }
+            if (!found) {
+                val dst = File(root, "vendor/lib64/hw/gatekeeper.default.so")
+                dst.parentFile?.mkdirs()
+                dst.writeBytes(bytes64)
+                dst.setReadable(true, false)
+                log("gatekeeper: no legacy module in the firmware, planted vendor/lib64/hw/gatekeeper.default.so")
+            }
+        }.onFailure { log("gatekeeper: ${it.message}") }
     }
 
     /**
