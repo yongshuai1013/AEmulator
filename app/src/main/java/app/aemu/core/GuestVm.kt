@@ -1756,8 +1756,24 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     private fun magiskLogTail(): String =
         runCatching { File(paths.root, "cache/magisk.log").readLines().takeLast(12).joinToString(" | ") }.getOrDefault("")
 
-    /** Before the first service: the stand-in tmpfs and the su links, "magisk --post-fs-data" (starts the daemon, merges
-     * module updates, runs post-fs-data scripts), then the modules' files are copied into the tree. Never fails the boot. */
+    /** magiskinit's early-init job, which the stage commands assume has already happened: start the daemon itself,
+     * in the background as guest root with its output kept in /cache/magisk.log (the daemon's own log file), then
+     * wait briefly for its socket. Fail-open: whatever happens here, the stage commands below still run. */
+    private fun magiskStartDaemon() {
+        runCatching {
+            val answer = guestShell("/${MagiskCore.TMP}/magisk --daemon </dev/null >>/cache/magisk.log 2>&1 & echo daemon-start-issued", 15_000).trim()
+            log("magisk: daemon start issued as guest root: /${MagiskCore.TMP}/magisk --daemon (background, output >>/cache/magisk.log) -> $answer")
+            val socket = File(paths.root, "${MagiskCore.TMP}/.magisk/device/socket")
+            val t0 = System.currentTimeMillis()
+            while (!socket.exists() && System.currentTimeMillis() - t0 < 10_000) Thread.sleep(200)
+            if (socket.exists()) log("magisk: daemon socket up after ${System.currentTimeMillis() - t0} ms")
+            else log("magisk: daemon socket did not appear within 10 s; /cache/magisk.log: ${magiskLogTail()}")
+        }.onFailure { log("magisk: daemon start failed: ${it.message}") }
+    }
+
+    /** Before the first service: the stand-in tmpfs and the su links, the daemon itself (magiskinit's job on a
+     * phone), "magisk --post-fs-data" (merges module updates, runs post-fs-data scripts), then the modules' files
+     * are copied into the tree. Never fails the boot. */
     private fun magiskPostFsData() {
         runCatching {
             if (!magiskOn) {
@@ -1768,6 +1784,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             MagiskCore.Overlay.revert(paths.root, ::log)
             MagiskCore.prepareTmp(paths.root)
             MagiskCore.linkSystem(paths.root, ::log)
+            magiskStartDaemon()
             log("magisk: post-fs-data -> ${magiskExec("--post-fs-data", 45_000)}")
             MagiskCore.unlockTmp(paths.root)    // its magic mount leaves directories at mode 000
             val version = guestShell("/${MagiskCore.TMP}/magisk -v; /${MagiskCore.TMP}/magisk -V", 15_000).trim().replace('\n', ' ')
