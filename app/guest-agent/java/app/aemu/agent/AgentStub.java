@@ -20,10 +20,15 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -74,6 +79,11 @@ public final class AgentStub {
     private static volatile Object hostLock;
     /** what the host last answered to a DENY, per package: "applied on", "deferred off", "error: ..." */
     private static final ConcurrentHashMap<String, String> denyState = new ConcurrentHashMap<String, String>();
+
+    /** the isolation probe's setup: the host's ISOSETUP answer, and the marker set it names */
+    private static volatile String isoSetup;
+    private static volatile CountDownLatch isoLatch;
+    private static volatile String isoMarker, isoOut, isoIn;
 
     private AgentStub() { }
 
@@ -170,6 +180,10 @@ public final class AgentStub {
                 handlePut(line, in, out, sendLock);
             } else if (line.startsWith("DENIED ") || line.startsWith("DENYDEFER ") || line.startsWith("DENYERR ")) {
                 recordDeny(line);
+            } else if (line.startsWith("ISOSETUP ") || line.startsWith("ISOERR")) {
+                isoSetup = line;
+                CountDownLatch l = isoLatch;
+                if (l != null) l.countDown();
             } else {
                 send(out, sendLock, "ERR unknown command");
             }
@@ -243,6 +257,165 @@ public final class AgentStub {
             try { send(out, lock, "ERR " + e.getMessage()); } catch (Throwable ignored) { }
             throw e;   // a short payload desyncs the protocol; reconnect instead of guessing
         }
+    }
+
+    // ---- the isolation probe ----------------------------------------------------------------------------
+
+    /**
+     * ISOPROBE: asks the host (ISOBEGIN) to plant this run's markers — one outside the guest root,
+     * one decoy at the same path string inside it — and reports where they are. The agent cannot
+     * plant them itself: the outside marker is outside by definition. The answer is the host's own
+     * ISOSETUP line, taken apart; a host that does not answer is reported as such.
+     */
+    private static List<String> isoProbe() {
+        List<String> out = new ArrayList<String>();
+        OutputStream ho = hostOut;
+        Object hl = hostLock;
+        if (ho == null || hl == null) {
+            out.add("ERR the host link is down; the isolation markers cannot be planted");
+            return out;
+        }
+        CountDownLatch latch = new CountDownLatch(1);
+        isoLatch = latch;
+        isoSetup = null;
+        try {
+            send(ho, hl, "ISOBEGIN");
+        } catch (Throwable t) {
+            out.add("ERR ISOBEGIN could not be sent: " + t.getMessage());
+            return out;
+        }
+        boolean answered;
+        try {
+            answered = latch.await(20, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            answered = false;
+        }
+        String setup = isoSetup;
+        if (!answered || setup == null) {
+            out.add("ERR the host did not answer ISOBEGIN");
+            return out;
+        }
+        if (setup.startsWith("ISOERR")) {
+            out.add("ERR the host refused to plant the markers: " + setup.substring(6).trim());
+            return out;
+        }
+        String[] parts = setup.split(" ");
+        if (parts.length != 4 || !parts[0].equals("ISOSETUP")) {
+            out.add("ERR unexpected answer to ISOBEGIN: " + setup);
+            return out;
+        }
+        isoMarker = parts[1];
+        isoOut = parts[2];
+        isoIn = parts[3];
+        out.add("marker " + isoMarker);
+        out.add("out " + isoOut);
+        out.add("in " + isoIn);
+        return out;
+    }
+
+    /**
+     * ISORUN: runs the probe binary the manager app carries (it is inside the agent app copy the
+     * host delivered to /data/adb) against the markers ISOPROBE planted, returns its lines to the
+     * manager, and mirrors every verdict line to the host log. A probe that cannot be started, or
+     * does not finish, is reported in the same channel — never as a quiet success.
+     */
+    private static List<String> isoRun() {
+        final List<String> lines = Collections.synchronizedList(new ArrayList<String>());
+        if (isoMarker == null || isoOut == null || isoIn == null) {
+            lines.add("ERR ISOPROBE has not planted the markers yet");
+            return lines;
+        }
+        final String bin;
+        try {
+            bin = extractProbe();
+        } catch (Throwable t) {
+            lines.add("ERR the probe binary could not be staged: " + t.getMessage());
+            return lines;
+        }
+        final Process proc;
+        try {
+            proc = new ProcessBuilder(bin, isoMarker, isoOut, isoIn, "/data/local/tmp")
+                .redirectErrorStream(true)
+                .start();
+        } catch (Throwable t) {
+            lines.add("ERR the probe binary could not be started: " + t.getMessage());
+            return lines;
+        }
+        Thread reader = new Thread("aemu-isoprobe-out") {
+            @Override public void run() {
+                try {
+                    BufferedReader r = new BufferedReader(new InputStreamReader(proc.getInputStream(), "UTF-8"));
+                    String l;
+                    while ((l = r.readLine()) != null) lines.add(l);
+                } catch (Throwable ignored) { }
+            }
+        };
+        reader.setDaemon(true);
+        reader.start();
+        Thread waiter = new Thread("aemu-isoprobe-wait") {
+            @Override public void run() {
+                try { proc.waitFor(); } catch (Throwable ignored) { }
+            }
+        };
+        waiter.start();
+        try {
+            waiter.join(90000);
+        } catch (InterruptedException ignored) { }
+        if (waiter.isAlive()) {
+            try { proc.destroy(); } catch (Throwable ignored) { }
+            lines.add("ERR the probe did not finish in 90 s and was destroyed");
+        }
+        try {
+            reader.join(5000);
+        } catch (InterruptedException ignored) { }
+        int exit = -1;
+        try { exit = proc.exitValue(); } catch (Throwable ignored) { }
+        if (lines.isEmpty()) {
+            lines.add("ERR the probe produced no output (exit " + exit + ")");
+            return lines;
+        }
+        if (exit != 0) lines.add("note: the probe exited with code " + exit);
+        OutputStream ho = hostOut;
+        Object hl = hostLock;
+        int cells = 0;
+        for (String l : new ArrayList<String>(lines)) {
+            if (!l.startsWith("ISO ")) continue;
+            String[] p = l.split(" ", 4);
+            if (p.length >= 3 && (p[2].equals("PASS") || p[2].equals("LEAK") || p[2].equals("NA"))) cells++;
+            if (ho != null && hl != null) {
+                try { send(ho, hl, "LOG iso-probe: " + l.substring(4)); } catch (Throwable ignored) { }
+            }
+        }
+        if (ho != null && hl != null) {
+            try { send(ho, hl, "LOG iso-probe run complete: " + cells + " cell(s) reported"); } catch (Throwable ignored) { }
+        }
+        return lines;
+    }
+
+    /** The probe binary out of the delivered agent app copy, into /data/local/tmp, executable. */
+    private static String extractProbe() throws IOException {
+        File apk = new File("/data/adb/aemu-agent.apk");
+        if (!apk.isFile()) throw new IOException("the agent app copy is not in the guest (" + apk + ")");
+        File dst = new File("/data/local/tmp/aemu-isoprobe");
+        ZipFile zip = new ZipFile(apk);
+        try {
+            ZipEntry e = zip.getEntry("aemu-isoprobe");
+            if (e == null) throw new IOException("this agent app build does not carry the probe binary");
+            InputStream in = zip.getInputStream(e);
+            FileOutputStream fos = new FileOutputStream(dst);
+            try {
+                byte[] buf = new byte[64 * 1024];
+                int r;
+                while ((r = in.read(buf)) > 0) fos.write(buf, 0, r);
+            } finally {
+                fos.close();
+                in.close();
+            }
+        } finally {
+            zip.close();
+        }
+        if (!dst.setExecutable(true)) throw new IOException("the probe binary could not be made executable");
+        return dst.getAbsolutePath();
     }
 
     // ---- the hide list --------------------------------------------------------------------------------
@@ -449,6 +622,12 @@ public final class AgentStub {
                 send(out, lock, setHide(line));
             } else if (line.startsWith("SELFTEST ")) {
                 for (String l : selfTest(line.substring(9).trim())) send(out, lock, l);
+                send(out, lock, "END");
+            } else if (line.equals("ISOPROBE")) {
+                for (String l : isoProbe()) send(out, lock, l);
+                send(out, lock, "END");
+            } else if (line.equals("ISORUN")) {
+                for (String l : isoRun()) send(out, lock, l);
                 send(out, lock, "END");
             } else {
                 send(out, lock, "ERR unknown command");
