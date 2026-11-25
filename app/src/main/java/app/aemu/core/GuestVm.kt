@@ -57,8 +57,10 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     /** the guest Wi-Fi service is up for this run: its network replaces the Ethernet stand-in */
     @Volatile private var wifiOn = false
 
-    /** host Bluetooth bridge (AEmulator-Plus #18) can serve this image: the 4.4 engine, API 9–25, not a recovery boot */
-    private val bluetoothSupported get() = engine == Engine.KK && img.api in 9..25 && !recoveryMode
+    /** host Bluetooth bridge (AEmulator-Plus #18) can serve this image: the 4.4 engine, API 9–25, or a
+     * 64-bit guest at API 23–27 (per-generation jars from guest-bt-n64), not a recovery boot */
+    private val bluetoothSupported get() =
+        (engine == Engine.KK && img.api in 9..25 || engine == Engine.N64 && img.api in 23..27) && !recoveryMode
     private val bluetooth = BluetoothBridge(ctx, paths, { settings.bluetooth && bluetoothSupported }, ::log)
     private val agentSupported get() = AgentSupport.offered(paths.root, engine, img.api, recoveryMode)
     private val agent = AgentBridge(paths, { settings.agent && AgentSupport.supported(engine, img.api, recoveryMode) },
@@ -776,14 +778,22 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 // 2.3–4.1 look up "bluetooth" instead; without it BluetoothAdapter is null and the vendor's Bluetooth apps crash
                 val btName = if (img.api >= 17) "bluetooth_manager" else "bluetooth"
                 // Android 4.4 (API 19) with the host bridge on: the real bridge client from aemu-bt.jar;
+                // the 64-bit generations take their per-generation jar from guest-bt-n64 (API 23, 24-25, 26-27);
                 // every other case keeps the placeholder above (AEmulator-Plus #18)
-                val btJar = File(paths.root, "system/framework/aemu-bt.jar")
-                val bridgeJar = settings.bluetooth && bluetoothSupported && img.api == 19 && btJar.isFile
-                if (settings.bluetooth && bluetoothSupported && img.api == 19 && !btJar.isFile)
-                    log("bluetooth: aemu-bt.jar is not installed (build guest-bt/build.sh), the guest keeps the placeholder")
+                val btJarName = when {
+                    img.api == 19 -> "aemu-bt.jar"
+                    engine == Engine.N64 && img.api == 23 -> "aemu-bt23.jar"
+                    engine == Engine.N64 && img.api in 24..25 -> "aemu-bt24.jar"
+                    engine == Engine.N64 && img.api in 26..27 -> "aemu-bt26.jar"
+                    else -> null
+                }
+                val btJar = btJarName?.let { File(paths.root, "system/framework/$it") }
+                val bridgeJar = settings.bluetooth && bluetoothSupported && btJar != null && btJar.isFile
+                if (settings.bluetooth && bluetoothSupported && btJarName != null && btJar != null && !btJar.isFile)
+                    log("bluetooth: $btJarName is not installed (build guest-bt/build.sh or guest-bt-n64/build.sh), the guest keeps the placeholder")
                 synchronized(procs) { procs.remove("aemu-bt") }?.let { runCatching { it.destroyForcibly() } }
                 startService(GuestService("aemu-bt", listOf("/system/bin/app_process",
-                    "-Djava.class.path=/system/framework/${if (bridgeJar) "aemu-bt.jar" else "aemu-stubs.jar"}", "/system/bin",
+                    "-Djava.class.path=/system/framework/${if (bridgeJar) btJarName else "aemu-stubs.jar"}", "/system/bin",
                     if (bridgeJar) "app.aemu.stub.BtService" else "app.aemu.stub.BtStub", btName), optional = true))
             }
             // (well before zygote: apexd of 10+ looks for vold first and only then registers its own service, which the
@@ -1584,7 +1594,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             val pid = d.name.toIntOrNull() ?: return@forEach
             val cmd = runCatching { String(File(d, "cmdline").readBytes(), Charsets.ISO_8859_1) }.getOrNull() ?: return@forEach
             // app_process с aemu-stubs.jar / aemu-wifi.jar / aemu-bt.jar / aemu-agent.jar — наши службы (bluetooth_manager, Wi-Fi, агент), не приложения зиготы
-            if (cmd.contains(marker) && cmd.contains("/system/bin/app_process") && !cmd.contains("aemu-stubs.jar") && !cmd.contains("aemu-wifi.jar") && !cmd.contains("aemu-bt.jar") && !cmd.contains("aemu-agent.jar")) {
+            if (cmd.contains(marker) && cmd.contains("/system/bin/app_process") && !cmd.contains("aemu-stubs.jar") && !cmd.contains("aemu-wifi.jar") && !cmd.contains("aemu-bt") && !cmd.contains("aemu-agent.jar")) {
                 runCatching { AProcess.sendSignal(pid, 9) }; n++
             } else if (orphanOfThisImage(d)) {
                 // 7.0+: a zygote child rewrites its whole command line ("system_server"), so the path is gone from it;

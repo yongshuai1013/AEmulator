@@ -1,6 +1,10 @@
 # built by CI from app/guest-wifi sources (see the workflow), never committed
 /app/src/main/assets/engines/kk/aemu-wifi.jar
 /app/src/main/assets/engines/kk/aemu-bt.jar
+# built by CI from app/guest-bt-n64 sources (see the workflow), never committed
+/app/src/main/assets/engines/kk/aemu-bt23.jar
+/app/src/main/assets/engines/kk/aemu-bt24.jar
+/app/src/main/assets/engines/kk/aemu-bt26.jar
 *.apk
 *_apktool/
 *_jadx/

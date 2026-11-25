@@ -757,6 +757,17 @@ class TreeFixer(
                 apk.setReadable(true, false); copied++
             }
         }.onFailure { log("aemu-agent.apk: ${it.message}") }
+        // the per-generation Bluetooth bridge jars (guest-bt-n64): API 23, 24-25 and 26-27 guests each link
+        // their own; GuestVm picks the one for the image when the Bluetooth setting is on, the rest stay unused
+        for (name in listOf("aemu-bt23.jar", "aemu-bt24.jar", "aemu-bt26.jar")) runCatching {
+            val jar = File(root, "system/framework/$name")
+            val bytes = EngineAssets.open(ctx, "engines/kk/$name").use { it.readBytes() }
+            if (!jar.isFile || !jar.readBytes().contentEquals(bytes)) {
+                jar.parentFile?.mkdirs()
+                jar.writeBytes(bytes)
+                jar.setReadable(true, false); copied++
+            }
+        }.onFailure { log("aemu-bt jars: ${it.message}") }
         if (copied > 0) log("engine n64 files updated: $copied")
         // qemu-arm (the firmware's 32-bit programs) asks for the lowest mappable address; the phone hides the real file
         runCatching { File(root, "proc/sys/vm").mkdirs(); File(root, "proc/sys/vm/mmap_min_addr").writeText("65536") }

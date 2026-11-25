@@ -15,7 +15,7 @@ jobs:
           SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | sort -V | tail -1)
           echo "sdkmanager: $SDKMANAGER"
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" "platforms;android-36" "platforms;android-21" "platforms;android-19" "build-tools;36.0.0" "build-tools;35.0.0"
+          "$SDKMANAGER" "platforms;android-36" "platforms;android-21" "platforms;android-19" "platforms;android-23" "platforms;android-25" "platforms;android-27" "build-tools;36.0.0" "build-tools;35.0.0"
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
@@ -51,6 +51,16 @@ jobs:
         with:
           name: aemu-bt-jar
           path: app/src/main/assets/engines/kk/aemu-bt.jar
+      - name: Build guest Bluetooth jars (N64, API 23-27) from source
+        run: |
+          export JAR23="$ANDROID_HOME/platforms/android-23/android.jar"
+          export JAR24="$ANDROID_HOME/platforms/android-25/android.jar"
+          export JAR26="$ANDROID_HOME/platforms/android-27/android.jar"
+          export D8_JAR="$ANDROID_HOME/build-tools/36.0.0/lib/d8.jar"
+          export PATH="$ANDROID_HOME/build-tools/36.0.0:$PATH"
+          sh app/guest-bt-n64/build.sh
+          ls -l app/src/main/assets/engines/kk/aemu-bt23.jar app/src/main/assets/engines/kk/aemu-bt24.jar app/src/main/assets/engines/kk/aemu-bt26.jar
+          sha256sum app/src/main/assets/engines/kk/aemu-bt23.jar app/src/main/assets/engines/kk/aemu-bt24.jar app/src/main/assets/engines/kk/aemu-bt26.jar
       - name: Build guest agent jar from source
         run: |
           export ANDROID_JAR="$ANDROID_HOME/platforms/android-19/android.jar"
