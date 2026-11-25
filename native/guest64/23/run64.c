@@ -569,7 +569,15 @@ static int nlreq_find(int fd) {
 
 static void nlreq_track(int fd) {
     if (nlreq_find(fd) >= 0) return;
-    for (int i = 0; i < MAX_NLREQ; i++) if (!g_nlreq[i].fd) { g_nlreq[i].fd = fd; g_nlreq[i].pending = 0; return; }
+    for (int i = 0; i < MAX_NLREQ; i++) if (!g_nlreq[i].fd) {
+        g_nlreq[i].fd = fd; g_nlreq[i].pending = 0;
+        char line[96]; u64 o = 0;
+        tun_cat(line, &o, "aemu-nlreq: tracking route socket fd ");
+        tun_catn(line, &o, (u64)fd);
+        tun_cat(line, &o, "\n");
+        say(line);
+        return;
+    }
 }
 
 static void nlreq_drop(int fd) {
@@ -584,37 +592,116 @@ static int nlreq_name_eq(const u8 *p, u64 n) {          // an interface-name att
     return seq(name, g_hub_sess.name);
 }
 
+// Verdicts: >0 matched (1 by interface name, 2 by route table, 3 by output interface),
+// 0 the request parsed but names the session in no attribute, -1 not a rule/route
+// request at all, -2 no live session to match against.
 static int nlreq_session_match(const u8 *p, u64 len) {
-    if (len < 28) return 0;
+    if (len < 28) return -1;
     u32 mlen = *(const u32 *)p;
     u16 type = *(const u16 *)(p + 4);
-    if (mlen < 28 || mlen > len) return 0;
+    if (mlen < 28 || mlen > len) return -1;
     int rule = type == 26 || type == 27;                // RTM_NEWRULE / RTM_DELRULE
     int route = type == 24 || type == 25;               // RTM_NEWROUTE / RTM_DELROUTE
-    if (!rule && !route) return 0;
-    if (hub_ensure() < 0) return 0;
+    if (!rule && !route) return -1;
+    if (hub_ensure() < 0) return -2;
     hub_pump();                                         // the session state, fresh (tun_sioc's pattern)
-    if (!g_hub_sess.up || !g_hub_sess.name[0] || !g_hub_sess.index) return 0;
+    if (!g_hub_sess.up || !g_hub_sess.name[0] || !g_hub_sess.index) return -2;
     u32 table = g_hub_sess.index + 1000;
     const u8 *a = p + 28, *end = p + mlen;              // header (16) + rule/route body (12), then attributes
     while (a + 4 <= end) {
         u16 alen = *(const u16 *)a, atype = *(const u16 *)(a + 2);
         if (alen < 4 || a + alen > end) break;
         const u8 *v = a + 4; u64 vn = alen - 4;
-        if (rule && (atype == 3 || atype == 11) && nlreq_name_eq(v, vn)) return 1;          // FRA_IIFNAME / FRA_OIFNAME
-        if (rule && atype == 14 && vn >= 4 && *(const u32 *)v == table) return 1;           // FRA_TABLE
-        if (route && atype == 15 && vn >= 4 && *(const u32 *)v == table) return 1;          // RTA_TABLE
-        if (route && atype == 4 && vn >= 4 && *(const u32 *)v == g_hub_sess.index) return 1; // RTA_OIF
+        // attribute types are the kernel's own (uapi/linux/fib_rules.h, uapi/linux/rtnetlink.h):
+        // FRA_IIFNAME 3, FRA_TABLE 15, FRA_OIFNAME 17; RTA_TABLE 15, RTA_OIF 4. (An earlier
+        // version of this matcher read FRA_TABLE as 14 and FRA_OIFNAME as 11 — those are
+        // FRA_SUPPRESS_PREFIXLEN and FRA_FLOW, so a rule naming the session only by its table
+        // could never match; see vpn-diag-desk.md.)
+        if (rule && (atype == 3 || atype == 17) && nlreq_name_eq(v, vn)) return 1;          // FRA_IIFNAME / FRA_OIFNAME
+        if (rule && atype == 15 && vn >= 4 && *(const u32 *)v == table) return 2;           // FRA_TABLE
+        if (route && atype == 15 && vn >= 4 && *(const u32 *)v == table) return 2;          // RTA_TABLE
+        if (route && atype == 4 && vn >= 4 && *(const u32 *)v == g_hub_sess.index) return 3; // RTA_OIF
         a += (alen + 3) & ~3U;
     }
     return 0;
+}
+
+static const char *nlreq_type_name(u16 type) {
+    switch (type) {
+    case 24: return "NEWROUTE";
+    case 25: return "DELROUTE";
+    case 26: return "NEWRULE";
+    case 27: return "DELRULE";
+    }
+    return "other";
+}
+
+static int g_nlreq_logged;
+// One host-log line per transaction on a tracked route socket: what it was and what was
+// decided, so a field run shows whether the trap fires at all and, if it does, exactly
+// which request is refused and why. Capped; the boot-time flush alone spends dozens.
+static void nlreq_log(int fd, const u8 *buf, u64 len, int verdict) {
+    if (g_nlreq_logged >= 128) return;
+    g_nlreq_logged++;
+    u16 type = buf && len >= 6 ? *(const u16 *)(buf + 4) : 0;
+    char line[224]; u64 o = 0;
+    tun_cat(line, &o, "aemu-nlreq: fd ");
+    tun_catn(line, &o, (u64)fd);
+    tun_cat(line, &o, " type ");
+    tun_cat(line, &o, nlreq_type_name(type));
+    if (verdict > 0) {
+        tun_cat(line, &o, " -> answered (matched by ");
+        tun_cat(line, &o, verdict == 1 ? "name" : verdict == 2 ? "table" : "oif");
+        tun_cat(line, &o, ")");
+    } else {
+        tun_cat(line, &o, " -> passed (");
+        tun_cat(line, &o, verdict == -1 ? "not a rule/route request" : verdict == -2 ? "session down" : "no session attribute");
+        tun_cat(line, &o, ")");
+    }
+    tun_cat(line, &o, "\n");
+    say(line);
+}
+
+static int g_nlreq_untrk;
+// A writev in netd on a socket this instance never tracked, shaped like a route
+// transaction: the one shape that would prove the tracking itself missed a socket.
+static void nlreq_log_untracked(int fd, const void *iovp, u64 iovcnt) {
+    if (g_nlreq_untrk >= 8 || !iovp || !iovcnt) return;
+    struct kiov { const void *base; u64 len; };
+    const struct kiov *iov = (const struct kiov *)iovp;
+    if (!iov[0].base || iov[0].len < 6) return;
+    const u8 *p = (const u8 *)iov[0].base;
+    u32 mlen = *(const u32 *)p;
+    u16 type = *(const u16 *)(p + 4);
+    if (mlen < 28 || (type != 24 && type != 25 && type != 26 && type != 27)) return;
+    g_nlreq_untrk++;
+    char line[192]; u64 o = 0;
+    tun_cat(line, &o, "aemu-nlreq: fd ");
+    tun_catn(line, &o, (u64)fd);
+    tun_cat(line, &o, " writev on untracked socket, type ");
+    tun_cat(line, &o, nlreq_type_name(type));
+    tun_cat(line, &o, " (passed)\n");
+    say(line);
+}
+
+static int g_nlreq_acked;
+static void nlreq_log_ack(int fd) {
+    if (g_nlreq_acked >= 128) return;
+    g_nlreq_acked++;
+    char line[96]; u64 o = 0;
+    tun_cat(line, &o, "aemu-nlreq: fd ");
+    tun_catn(line, &o, (u64)fd);
+    tun_cat(line, &o, " ack delivered\n");
+    say(line);
 }
 
 // The request was ours to answer: keep it, and the receive that follows gets the ack.
 static int nlreq_swallow(int fd, const u8 *buf, u64 len) {
     int i = nlreq_find(fd);
     if (i < 0 || !buf || !len || len > sizeof g_nlreq[i].req) return 0;
-    if (!nlreq_session_match(buf, len)) return 0;
+    int verdict = nlreq_session_match(buf, len);
+    nlreq_log(fd, buf, len, verdict);
+    if (verdict <= 0) return 0;
     memcpy(g_nlreq[i].req, buf, len);
     g_nlreq[i].pending = 1;
     return 1;
@@ -1137,6 +1224,35 @@ static int hub_maybe_detour(int fd, const u8 *sa, u64 salen, long *out) {
 #define MAX_LINKREG 16
 static struct { int fd; u32 id; } g_linkreg[MAX_LINKREG];
 
+// One host-log line per listener registration attempt and its outcome, with the program
+// that owns the listener: whether the hub ever hears of a listener decides whether its
+// receive path below is even in play, and a field run has to be able to see it.
+static void nllink_log_reg(int fd, u32 proto, u32 groups, u32 id, const char *fail) {
+    const char *b = g_exe; for (const char *p = g_exe; *p; p++) if (*p == '/') b = p + 1;
+    char line[256]; u64 o = 0;
+    tun_cat(line, &o, "aemu-nllink: listener ");
+    if (fail) {
+        tun_cat(line, &o, "registration FAILED (");
+        tun_cat(line, &o, fail);
+        tun_cat(line, &o, "): fd ");
+    } else {
+        tun_cat(line, &o, "registered: fd ");
+    }
+    tun_catn(line, &o, (u64)fd);
+    tun_cat(line, &o, " proto ");
+    tun_catn(line, &o, proto);
+    tun_cat(line, &o, " groups ");
+    tun_catn(line, &o, groups);
+    if (!fail) {
+        tun_cat(line, &o, " hub id ");
+        tun_catn(line, &o, id);
+    }
+    tun_cat(line, &o, " (");
+    tun_cat(line, &o, b);
+    tun_cat(line, &o, ")\n");
+    say(line);
+}
+
 static void hub_linkreg(int fd, const u8 *sa, u64 salen) {
     if (!sa || salen < 12 || sa[0] != 16 /*AF_NETLINK*/) return;
     u32 groups = hub_get32(sa + 8);
@@ -1144,9 +1260,9 @@ static void hub_linkreg(int fd, const u8 *sa, u64 salen) {
     nl_set_groups(fd, groups);
     for (int i = 0; i < MAX_LINKREG; i++) if (g_linkreg[i].fd == fd) return;
     int peer = nl_find_peer(fd);
-    if (peer < 0 || hub_ensure() < 0) return;
+    if (peer < 0 || hub_ensure() < 0) { nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, 0, "no hub connection"); return; }
     int dup = (int)S2(NR_dup, peer, 0);
-    if (dup < 0) return;
+    if (dup < 0) { nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, 0, "peer dup failed"); return; }
     // the registration carries the socket's protocol: the hub speaks to each listener in the
     // dialect its consumer parses (kernel uevents for the uevent protocol, rtnetlink for the rest)
     u8 lp[4];
@@ -1159,8 +1275,9 @@ static void hub_linkreg(int fd, const u8 *sa, u64 salen) {
     }
     hub_unlock();
     S1(NR_close, dup);
-    if (!id) return;
-    for (int i = 0; i < MAX_LINKREG; i++) if (!g_linkreg[i].fd) { g_linkreg[i].fd = fd; g_linkreg[i].id = id; return; }
+    if (!id) { nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, 0, "hub did not confirm"); return; }
+    for (int i = 0; i < MAX_LINKREG; i++) if (!g_linkreg[i].fd) { g_linkreg[i].fd = fd; g_linkreg[i].id = id; nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, id, 0); return; }
+    nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, 0, "listener table full");
 }
 
 static void hub_linkunreg(int fd) {
@@ -1188,10 +1305,27 @@ static void hub_linkunreg(int fd) {
 // supervisor stands in for the kernel at the receive, as it already does at the tun ioctls:
 // the datagram is the hub's, the envelope is written the way the kernel would have written
 // it. Only fds registered with the hub take this path; every other recvmsg is untouched.
+static int g_nllink_delivered;
+static int g_nllink_unserved;
+// A netlink fd whose recvmsg the synthesised path did not serve: with the recvmsg trap
+// in place this can only mean the fd was never registered with the hub, so the datagram
+// (if any) is read plain — the exact shape that used to die as EIO in the listener.
+static void nllink_log_notserved(int fd) {
+    if (g_nllink_unserved >= 8) return;
+    g_nllink_unserved++;
+    char line[160]; u64 o = 0;
+    tun_cat(line, &o, "aemu-nllink: fd ");
+    tun_catn(line, &o, (u64)fd);
+    tun_cat(line, &o, " recvmsg NOT served (not registered with the hub)\n");
+    say(line);
+}
+
 static int nl_listener_recv(int fd, struct msgh *m, long *out) {
     int lid = 0;
     for (int i = 0; i < MAX_LINKREG; i++) if (g_linkreg[i].fd == fd) { lid = 1; break; }
     if (!lid || !m) return 0;
+    int offered = (int)m->namelen;
+    int env = 0;
     u8 buf[4096];
     long n = S3(NR_read, fd, buf, sizeof buf);
     if (n < 0) { *out = n; return 1; }
@@ -1206,6 +1340,7 @@ static int nl_listener_recv(int fd, struct msgh *m, long *out) {
         w[1] = 0;                           // the kernel's pid
         w[2] = nl_groups_of(fd);            // the group this socket subscribed to
         m->namelen = 12;
+        env = 1;
     }
     if (m->control && m->controllen >= 32) {
         struct cmsg *c = (struct cmsg *)m->control;
@@ -1222,6 +1357,27 @@ static int nl_listener_recv(int fd, struct msgh *m, long *out) {
         u64 take = m->iov[i].len < (u64)(n - done) ? m->iov[i].len : (u64)(n - done);
         memcpy(m->iov[i].base, buf + done, take);
         done += (long)take;
+    }
+    if (g_nllink_delivered < 24) {
+        g_nllink_delivered++;
+        char line[224]; u64 o = 0;
+        tun_cat(line, &o, "aemu-nllink: fd ");
+        tun_catn(line, &o, (u64)fd);
+        tun_cat(line, &o, " proto ");
+        tun_catn(line, &o, (u64)nl_proto_of(fd));
+        tun_cat(line, &o, " delivered ");
+        tun_catn(line, &o, (u64)done);
+        if (env) {
+            tun_cat(line, &o, " bytes, envelope written (namelen 12, groups ");
+            tun_catn(line, &o, nl_groups_of(fd));
+            tun_cat(line, &o, ")");
+        } else {
+            tun_cat(line, &o, " bytes, envelope NOT written (namelen offered ");
+            tun_catn(line, &o, (u64)offered);
+            tun_cat(line, &o, ")");
+        }
+        tun_cat(line, &o, "\n");
+        say(line);
     }
     *out = done;
     return 1;
@@ -2309,6 +2465,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
                 if (nlreq_swallow((int)a[0], buf, total)) return (long)total;
             }
         }
+        if (g_is_netd && a[1] && nlreq_find((int)a[0]) < 0) nlreq_log_untracked((int)a[0], (const void *)a[1], (u64)a[2]);
         return S3(nr, a[0], a[1], a[2]);
     }
     case NR_recvfrom: {
@@ -2317,15 +2474,22 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         // answers already sit in the pair — is the real call.
         if (g_is_netd) {
             long out;
-            if (nlreq_ack((int)a[0], (u8 *)a[1], (u64)a[2], (u16 *)a[4], (u32 *)a[5], &out)) return out;
+            if (nlreq_ack((int)a[0], (u8 *)a[1], (u64)a[2], (u16 *)a[4], (u32 *)a[5], &out)) { nlreq_log_ack((int)a[0]); return out; }
         }
         return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
     }
     case NR_recvmsg: {
         // a hub-registered netlink listener gets its events with a kernel-shaped envelope
-        // (see nl_listener_recv); every other receive is the host's own
+        // (see nl_listener_recv); every other receive is the host's own. This case is only
+        // reachable because NR_recvmsg is in the base filter's trap list — it was missing
+        // there until the VPN diagnosis batch, which left nl_listener_recv dead code and
+        // every injected event to be read plain off the pair, without credentials, to die
+        // as EIO in uevent_kernel_recv (see vpn-diag-desk.md).
         long out;
-        if (is_nl_fd((int)a[0]) && nl_listener_recv((int)a[0], (struct msgh *)a[1], &out)) return out;
+        if (is_nl_fd((int)a[0])) {
+            if (nl_listener_recv((int)a[0], (struct msgh *)a[1], &out)) return out;
+            nllink_log_notserved((int)a[0]);
+        }
         return S3(nr, a[0], a[1], a[2]);
     }
     case NR_rt_sigaction: {
@@ -2504,7 +2668,7 @@ static const u8 trapped[] = {
     NR_rt_sigaction, NR_reboot, NR_setregid, NR_setgid, NR_setreuid, NR_setuid, NR_setresuid, NR_getresuid,
     NR_setresgid, NR_getresgid, NR_setfsuid, NR_setfsgid, NR_getgroups, NR_setgroups, NR_getuid, NR_geteuid,
     NR_getgid, NR_getegid, NR_bind, NR_connect, NR_execve, NR_setsockopt, NR_unshare, NR_timerfd_create,
-    NR_close, NR_getsockopt, NR_sendto, NR_sendmsg, NR_getsockname, NR_socket, NR_dup3, NR_ptrace,
+    NR_close, NR_getsockopt, NR_sendto, NR_sendmsg, NR_recvmsg, NR_getsockname, NR_socket, NR_dup3, NR_ptrace,
 };
 
 enum { L_TRAP = 240, L_ALLOW, L_SIG, L_MMAP, L_NR, L_PRCTL, L_N };
@@ -2777,6 +2941,7 @@ void aemu_main(u64 *sp) {
     }
     if (!env_get(envp, "AEMU64_F")) install_filter();
     if (g_is_netd) install_filter_netd();
+    if (g_is_netd) say("aemu-nlreq: netd process: route-request filter installed\n");
 
     // the guest's initial stack: argc, argv, envp (without our variables), auxv
     u64 ne = 0; while (envp[ne]) ne++;
