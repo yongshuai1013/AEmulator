@@ -612,7 +612,7 @@ static int nlreq_session_match(const u8 *p, u64 len) {
     u32 mlen = *(const u32 *)p;
     u16 type = *(const u16 *)(p + 4);
     if (mlen < 28 || mlen > len) return -1;
-    int rule = type == 26 || type == 27;                // RTM_NEWRULE / RTM_DELRULE
+    int rule = type == 32 || type == 33;                // RTM_NEWRULE / RTM_DELRULE
     int route = type == 24 || type == 25;               // RTM_NEWROUTE / RTM_DELROUTE
     if (!rule && !route) return -1;
     if (hub_ensure() < 0) return -2;
@@ -642,8 +642,8 @@ static const char *nlreq_type_name(u16 type) {
     switch (type) {
     case 24: return "NEWROUTE";
     case 25: return "DELROUTE";
-    case 26: return "NEWRULE";
-    case 27: return "DELRULE";
+    case 32: return "NEWRULE";
+    case 33: return "DELRULE";
     }
     return "other";
 }
@@ -685,7 +685,7 @@ static void nlreq_log_untracked(int fd, const void *iovp, u64 iovcnt) {
     const u8 *p = (const u8 *)iov[0].base;
     u32 mlen = *(const u32 *)p;
     u16 type = *(const u16 *)(p + 4);
-    if (mlen < 28 || (type != 24 && type != 25 && type != 26 && type != 27)) return;
+    if (mlen < 28 || (type != 24 && type != 25 && type != 32 && type != 33)) return;
     g_nlreq_untrk++;
     char line[192]; u64 o = 0;
     tun_cat(line, &o, "aemu-nlreq: fd ");
