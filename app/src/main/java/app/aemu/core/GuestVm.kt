@@ -509,6 +509,10 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             }
         }
         overrides["dalvik.vm.execution-mode"] = if (s.jit) "int:jit" else "int:fast"
+        // execution-mode is a Dalvik property; ART's zygote turns it into "-Xint:jit" / "-Xint:fast" and still starts
+        // with -Xusejit:true, so the JIT switch alone did nothing on an ART guest. ART's own switch is dalvik.vm.usejit
+        // (ported from AEmulator Plus, GuestVm.kt).
+        if (!s.jit && img.api >= 21) overrides["dalvik.vm.usejit"] = "false"
         if (s.lowRam || s.ramMb in 1..768) overrides["ro.config.low_ram"] = "true"
         if (s.ramMb > 0) {
             // Dalvik heap sized from the guest RAM budget (like a real device of that class)
@@ -557,6 +561,11 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 // installd's dex2oat starts its own runtime: without this it tries patchoat too and fails every app
                 overrides["dalvik.vm.dex2oat-flags"] = overrides["dalvik.vm.dex2oat-flags"] + " --runtime-arg -Xnorelocate"
             }
+            // The stock 5.x/6.0 installd hands the whole dex2oat-flags property to dex2oat as one argument, which then
+            // fails to parse ("-j" value '4 --runtime-arg -Xnorelocate'): split it in a dex2oat wrapper (ported from
+            // AEmulator Plus, Dex2oatArgSplit).
+            if (img.api in 21..23 && Dex2oatArgSplit.install(paths.root))
+                log("dex2oat: wrapper splits the combined dex2oat-flags argument (API 21-23 installd)")
         }
         // порты MIUI правят framework на smali так, что Dalvik-верификатор отвергает классы ядра
         // (зигота падает на VerifyError) — на телефонах они живут с выключенной проверкой байткода
