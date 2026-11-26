@@ -115,6 +115,8 @@ data class VmSettings(
     val bluetooth: Boolean = false,
     /** Classic su root (arm64 Android 6.0 guests on the native engine): the host plants a self-built su and the Superuser manager app at boot, see SuperuserSupport; applies at the next full VM boot */
     val superuser: Boolean = false,
+    /** Magisk substitute (arm64 Android 6.0 guests on the native engine): our daemon in the official Magisk app's clothes, deployed into /data/adb and given its own boot seats, see SubstituteSupport; while it is on it owns the guest's su names, so the classic Superuser plant stays out; applies at the next full VM boot */
+    val magiskSub: Boolean = false,
     /**
      * Trial flip of the emulator marker: the guest boots with ro.kernel.qemu=0 instead of 1, so
      * firmware components take their real-device paths. Applies at the next full boot; mediaserver
@@ -158,6 +160,7 @@ data class VmSettings(
         .put("wifiMirrorHost", wifiMirrorHost)
         .put("bluetooth", bluetooth)
         .put("superuser", superuser)
+        .put("magiskSub", magiskSub)
         .put("qemuZero", qemuZero)
         .put("agent", agent)
         .put("hiddenApps", org.json.JSONArray(hiddenApps))
@@ -252,6 +255,7 @@ data class VmSettings(
                 wifiMirrorHost = o.optBoolean("wifiMirrorHost", d.wifiMirrorHost),
                 bluetooth = o.optBoolean("bluetooth", d.bluetooth),
                 superuser = o.optBoolean("superuser", d.superuser),
+                magiskSub = o.optBoolean("magiskSub", d.magiskSub),
                 qemuZero = o.optBoolean("qemuZero", d.qemuZero),
                 agent = o.optBoolean("agent", d.agent),
                 hiddenApps = o.optJSONArray("hiddenApps")?.let { a -> (0 until a.length()).mapNotNull { a.optString(it).trim().takeIf { s -> s.isNotEmpty() } }.distinct() } ?: d.hiddenApps,
