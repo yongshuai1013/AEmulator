@@ -18,7 +18,6 @@ typedef unsigned char u8;
 
 long sc(long nr, long a, long b, long c, long d, long e, long f);
 void enter_guest(void *entry, void *sp) __attribute__((noreturn));
-long watch_clone(long flags, void *stack, void (*fn)(void));
 #define S0(n) sc(n, 0, 0, 0, 0, 0, 0)
 #define S1(n, a) sc(n, (long)(a), 0, 0, 0, 0, 0)
 #define S2(n, a, b) sc(n, (long)(a), (long)(b), 0, 0, 0, 0)
@@ -33,16 +32,16 @@ enum {
     NR_inotify_add_watch = 27, NR_ioctl = 29,
     NR_mknodat = 33, NR_mkdirat = 34, NR_unlinkat = 35, NR_symlinkat = 36, NR_linkat = 37, NR_renameat = 38,
     NR_umount2 = 39, NR_mount = 40, NR_statfs = 43, NR_truncate = 45, NR_ftruncate = 46, NR_faccessat = 48,
-    NR_chdir = 49, NR_chroot = 51, NR_fchmodat = 53, NR_fchownat = 54, NR_fchown = 55, NR_openat = 56, NR_close = 57, NR_pipe2 = 59,
+    NR_chdir = 49, NR_chroot = 51, NR_fchmodat = 53, NR_fchownat = 54, NR_fchown = 55, NR_openat = 56, NR_close = 57,
     NR_lseek = 62, NR_read = 63, NR_write = 64, NR_writev = 66, NR_pread64 = 67, NR_pwrite64 = 68, NR_pselect6 = 72, NR_readlinkat = 78, NR_newfstatat = 79, NR_fstat = 80,
     NR_timerfd_create = 85, NR_utimensat = 88, NR_capget = 90, NR_capset = 91, NR_exit = 93, NR_exit_group = 94, NR_unshare = 97,
     NR_futex = 98, NR_nanosleep = 101, NR_clock_nanosleep = 115, NR_setsid = 157,
-    NR_ptrace = 117, NR_sched_yield = 124, NR_tgkill = 131, NR_sigaltstack = 132, NR_rt_sigaction = 134, NR_rt_sigprocmask = 135, NR_reboot = 142,
+    NR_ptrace = 117, NR_sched_yield = 124, NR_rt_sigaction = 134, NR_rt_sigprocmask = 135, NR_reboot = 142,
     NR_setregid = 143, NR_setgid = 144, NR_setreuid = 145, NR_setuid = 146, NR_setresuid = 147, NR_getresuid = 148,
     NR_setresgid = 149, NR_getresgid = 150, NR_setfsuid = 151, NR_setfsgid = 152, NR_getgroups = 158, NR_setgroups = 159,
     NR_uname = 160, NR_prctl = 167, NR_getpid = 172, NR_getppid = 173, NR_getuid = 174, NR_geteuid = 175, NR_getgid = 176, NR_getegid = 177, NR_gettid = 178,
     NR_socket = 198, NR_socketpair = 199, NR_bind = 200, NR_listen = 201, NR_connect = 203, NR_getsockname = 204, NR_sendto = 206, NR_recvfrom = 207, NR_setsockopt = 208, NR_getsockopt = 209,
-    NR_sendmsg = 211, NR_recvmsg = 212, NR_munmap = 215, NR_clone = 220, NR_execve = 221, NR_mmap = 222, NR_mprotect = 226,
+    NR_sendmsg = 211, NR_recvmsg = 212, NR_munmap = 215, NR_execve = 221, NR_mmap = 222, NR_mprotect = 226,
     NR_accept4 = 242, NR_wait4 = 260, NR_renameat2 = 276, NR_memfd_create = 279, NR_statx = 291,
 };
 
@@ -100,8 +99,6 @@ static int g_is32;                // this process is qemu-arm running a 32-bit p
 static int g_is_netd;             // this process is the guest's netd (its route requests take the nlreq path below)
 static void (*g_fatal[32])(int, void *, void *);
 static void fatal_relay(int sig, void *info, void *uc);
-static long g_home_pid;                 // the pid aemu_main ran in; a forked descendant has another (ptrace watcher)
-static void watch_note_name(const char *nm);    // ptrace watcher: a forked child renamed "system_server" offers itself up (below)
 // qemu-arm's signal handler blocks every signal in the context it returns to (until the guest's handler is
 // entered); with SIGSYS blocked the next trapped call would kill the process, so that bit is taken back out.
 static void (*g_h32[65])(int, void *, void *);
@@ -2217,7 +2214,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             if (pre(P(1), "/proc/") && pl >= 14 && seq(P(1) + pl - 8, "/cmdline") && !(a[2] & 3)) {
                 long f = S4(nr, AT_FDCWD, P(1), 0, 0);
                 if (f >= 0) {
-                    char *t = pb_get(); long n = S3(NR_read, f, t, 4095), o = 0;   // scratch from the pb pool, not the frame: trap2_base's stack stays small wherever the chain runs (see the trap stacks section)
+                    char t[4096]; long n = S3(NR_read, f, t, sizeof t - 1), o = 0;
                     S1(NR_close, f);
                     if (n < 0) n = 0;
                     t[n] = 0;
@@ -2227,7 +2224,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
                         if (o < n && g_qemu[0] && seq(t + o, g_qemu)) o += (long)slen(g_qemu) + 1;
                         if (o > n) o = n;
                     }
-                    { long fr = fake_memfile("aemu-cmdline", t + o, (u64)(n - o)); pb_put(t); return fr; }
+                    return fake_memfile("aemu-cmdline", t + o, (u64)(n - o));
                 }
             }
             if (seq(P(1), "/sys/fs/selinux/enforce")) {
@@ -2532,13 +2529,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         }
         return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
     case NR_mount: case NR_umount2: case NR_chroot: case NR_capset: case NR_setgroups: case NR_unshare: case 268 /* setns */: return 0;
-    case NR_prctl:
-        if (a[0] == 15 /*PR_SET_NAME*/) {       // the rename event itself is the ptrace watcher's only hook:
-            long r = S5(nr, a[0], a[1], 0, 0, 0);   // it runs for real, then the new name is classified (below)
-            if (r == 0) watch_note_name((const char *)a[1]);
-            return r;
-        }
-        return 0;                               // only PR_CAPBSET_DROP gets here
+    case NR_prctl: return 0;                    // only PR_CAPBSET_DROP gets here
     case NR_timerfd_create: {                   // the *_ALARM clocks need CAP_WAKE_ALARM, vendor clocks (power-off alarm)
         long r = S2(nr, a[0], a[1]);            // do not exist here: the plain clocks tick the same
         if (r < 0) r = S2(nr, a[0] == 9 ? 7 : 0, a[1]);
@@ -2662,9 +2653,9 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             u64 total = 0;
             for (u64 i = 0; i < (u64)a[2]; i++) total += iov[i].len;
             if (total && total <= 1024) {
-                char *buf = pb_get(); u64 done = 0;   // pb pool, not the frame (see the trap stacks section)
+                u8 buf[1024]; u64 done = 0;
                 for (u64 i = 0; i < (u64)a[2]; i++) { memcpy(buf + done, iov[i].base, iov[i].len); done += iov[i].len; }
-                { int sw = nlreq_swallow((int)a[0], (const u8 *)buf, total); pb_put(buf); if (sw) return (long)total; }
+                if (nlreq_swallow((int)a[0], buf, total)) return (long)total;
             }
         }
         if (g_is_netd && a[1] && nlreq_find((int)a[0]) < 0) nlreq_log_untracked((int)a[0], (const void *)a[1], (u64)a[2]);
@@ -2969,398 +2960,9 @@ static void fatal_relay(int sig, void *info, void *uc) {
     if (g_is32) *(u64 *)((char *)uc + 40) &= ~SYSBIT;
 }
 
-// ---------------------------------------------------------------------------------------------------- ptrace watcher
-//
-// 137 naming, from outside the process: two in-process generations failed to name system_server's
-// SIGSEGV — the tombstone mirror produced nothing, and fatal_relay's aemu-crash never printed even
-// with the mask mediation unconditional (#111) — while system_server itself never blocks the fatal
-// set, so delivery was never the problem. The remaining suspect is the handler chain: ART installs
-// its own SIGSEGV handler as the child specialises, and this image's relay is simply not on it.
-// The capture therefore moves outside the dying process: a watcher thread inside the zygote's own
-// supervisor instance, ptrace-observing the one child that becomes system_server.
-//
-// Shape: the watcher is spawned in aemu_main when this process is the zygote (app_process64 with
-// --zygote in argv; the aemu-* stand-ins run app_process with a class name instead) and announces
-// itself with a marker file, <root>/dev/.aemu-watch-<pid>, plus one aemu-watch line. system_server
-// is not exec'd — zygote forks and the child specialises in place — so the arm happens on the child
-// side, at the rename itself: the filter traps PR_SET_NAME, and when a forked descendant's main
-// thread takes the name "system_server" (watch_note_name, in the prctl case) it looks for its
-// parent's marker and only then asks to be traced — a byte on the watcher's wake pipe first, then
-// PTRACE_TRACEME + a SIGSTOP announce. No marker, no trace: a supervisor that failed to spot the
-// zygote leaves system_server exactly as it was. The watcher sets PTRACE_O_TRACECLONE at the
-// announce stop, so every later thread of system_server is observed too. Until that byte arrives
-// the watcher thread sleeps on the pipe: it runs no wait4 at all, so zygote's own reaper keeps
-// every one of its children and the thread costs nothing.
-//
-// Coexistence with the in-process supervisor is the sharp edge: the tracee's own seccomp traps are
-// SIGSYS deliveries, and under ptrace every one of them stops here first. The watcher hands SIGSYS
-// straight back (wait4 -> PTRACE_CONT, nothing read, nothing printed) and the in-process handler
-// then runs exactly as before. Any other signal is re-injected unchanged — except the fatal set
-// (SIGSEGV/SIGABRT/SIGBUS/SIGILL), where the watcher first takes the naming record from outside
-// (GETSIGINFO's si_addr, GETREGSET's registers, the tracee's own maps) in the aemu-crash format,
-// marked [watcher], and only then lets the signal through: the process dies down its own chain,
-// exactly as it did unobserved. Any watcher-side failure detaches everything and ends the thread —
-// fail-open; the guest never waits on us.
-//
-// Known costs, accepted for a diagnostic: once armed, a wait4/CONT round trip rides on every
-// trapped call system_server makes, so its boot is slower than unobserved; and from the arm on,
-// this thread's wait4(-1) can reap a foreign zygote child before zygote's own lazy reaper sees it
-// (dead-app bookkeeping lives in system_server over binder; zygote's own list is bookkeeping
-// only). Before the arm there is no cost anywhere by construction: the trap path gained nothing
-// (the classification sits inside the prctl case, on renames only), and the watcher thread sleeps
-// on its pipe. The first version instead polled the name on every trapped call of every process —
-// one getpid per trap in the home process, three syscalls per trap in an undecided fork child —
-// and the whole guest's boot paid for it (60 s to the boot animation became 89 s and counting);
-// that is why the hook lives on the rename event now.
-
-#define WATCH_CLONE_FLAGS 0x50f00        // CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM
-#define WATCH_PTR_SETOPTIONS 0x4200
-#define WATCH_PTR_GETEVENTMSG 0x4201
-#define WATCH_PTR_GETSIGINFO 0x4202
-#define WATCH_PTR_GETREGSET 0x4204
-#define WATCH_PTR_CONT 7
-#define WATCH_PTR_DETACH 17
-#define WATCH_O_TRACECLONE 0x8
-#define WATCH_EVENT_CLONE 3
-#define WATCH_NT_PRSTATUS 1
-#define WATCH_WALL 0x40000000
-
-static void watch_marker(char *mp, long pid) {          // <root>/dev/.aemu-watch-<pid>
-    u64 o = 0; for (u64 i = 0; i < g_rootlen; i++) mp[o++] = g_root[i];
-    const char *mid = "/dev/.aemu-watch-"; for (const char *p = mid; *p; p++) mp[o++] = *p;
-    char t[24]; const char *pp = utoa((u64)pid, t + sizeof t); for (const char *p = pp; *p; p++) mp[o++] = *p;
-    mp[o] = 0;
-}
-
-// ---- child side: notice that this forked process became system_server, and offer it to the watcher.
-// The notice is the rename itself: trap2_base's prctl case calls watch_note_name once a PR_SET_NAME
-// has run, so nothing is polled and the trap path pays nothing for the watcher. The flags below are
-// inherited across a fork like everything else in this image; that is safe here because what matters
-// is re-derived at the rename — the pid from the kernel, the parent from its marker — and a child
-// born to an already-armed parent is never the target anyway.
-
-static int g_warmed, g_wdone;            // this process: TRACEME sent / the offer is settled
-static long g_watch_wake_r = -1, g_watch_wake_w = -1;   // the watcher's wake pipe (watch_spawn); children inherit the write end
-
-static void watch_arm(void) {
-    char mp[600];
-    watch_marker(mp, S0(NR_getppid));
-    if (S4(NR_faccessat, AT_FDCWD, mp, 0, 0) != 0) { g_wdone = 1; return; }   // no watcher in the parent: stay unobserved
-    // Wake the watcher before asking to be traced, and only if the wake can be delivered: a
-    // watcher that never wakes would leave this process stopped forever. The byte string is the
-    // announcer's pid, so the watcher can tell its exit from a foreign child's.
-    if (g_watch_wake_w < 0) { g_wdone = 1; return; }
-    { char t[24]; const char *pp = utoa((u64)S0(NR_getpid), t + sizeof t);
-      u64 n = slen(pp);
-      if (S3(NR_write, g_watch_wake_w, pp, n) != (long)n || S3(NR_write, g_watch_wake_w, "\n", 1) != 1) { g_wdone = 1; return; } }
-    if (S4(NR_ptrace, 0 /*PTRACE_TRACEME*/, 0, 0, 0) < 0) { g_wdone = 1; return; }
-    g_warmed = 1;
-    S3(NR_tgkill, S0(NR_getpid), S0(NR_gettid), 19 /*SIGSTOP*/);              // announce: the watcher arms on this stop
-}
-
-static void watch_note_name(const char *nm) {
-    if (g_is32 || g_warmed || g_wdone) return;
-    if (!seq(nm, "system_server")) return;               // every other rename is not the target
-    long me = S0(NR_getpid);
-    if (me == g_home_pid) return;                        // the process aemu_main ran in: its watcher thread does the work
-    if (S0(NR_gettid) != me) return;                     // the name that matters is the main thread's
-    watch_arm();
-}
-
-// ---- parent side: the watcher thread in the zygote. Everything below runs on that thread alone.
-
-static volatile int g_watch_lock;
-static void watch_lock(void) { while (__atomic_exchange_n(&g_watch_lock, 1, __ATOMIC_ACQUIRE)) S0(NR_sched_yield); }
-static void watch_unlock(void) { __atomic_store_n(&g_watch_lock, 0, __ATOMIC_RELEASE); }
-
-// addr -> "<map path>+0x<offset in the file>" from the TRACEE's maps: cc_mod's parser, another
-// process's file. out always ends up as the resolution, "unmapped" or "no-maps", as in cc_mod.
-static void watch_mod(long pid, u64 addr, char *out, u64 cap) {
-    static char buf[1 << 16];
-    const char *miss = "unmapped";
-    char mp[48], t[24]; u64 o = 0;
-    const char *pre = "/proc/"; for (const char *p = pre; *p; p++) mp[o++] = *p;
-    const char *pp = utoa((u64)pid, t + sizeof t); for (const char *p = pp; *p; p++) mp[o++] = *p;
-    const char *suf = "/maps"; for (const char *p = suf; *p; p++) mp[o++] = *p;
-    mp[o] = 0;
-    long fd = S4(NR_openat, AT_FDCWD, mp, 0x80000, 0);
-    if (fd < 0) miss = "no-maps";
-    u64 keep = 0; long n; int lines = 0, found = 0;
-    while (!found && fd >= 0 && lines < 8192 && (n = S3(NR_read, fd, buf + keep, sizeof buf - 1 - keep)) > 0) {
-        u64 len = keep + (u64)n; buf[len] = 0;
-        char *l = buf;
-        for (;;) {
-            char *e = l; while (*e && *e != '\n') e++;
-            if (!*e) break;
-            *e = 0; lines++;
-            u64 lo = 0, hi = 0; char *q = l;
-            for (; *q && *q != '-'; q++) lo = lo * 16 + cc_hv(*q);
-            if (*q) for (q++; *q && *q != ' '; q++) hi = hi * 16 + cc_hv(*q);
-            if (addr >= lo && addr < hi) {
-                u64 off = 0;
-                while (*q == ' ') q++; while (*q && *q != ' ') q++;          // perms
-                while (*q == ' ') q++;
-                for (; *q && *q != ' '; q++) off = off * 16 + cc_hv(*q);    // file offset
-                for (int t2 = 0; t2 < 2; t2++) { while (*q == ' ') q++; while (*q && *q != ' ') q++; }   // dev, inode
-                while (*q == ' ') q++;
-                const char *path = *q ? q : "[anon]";
-                u64 w = 0;
-                for (const char *p = path; *p && w + 1 < cap; p++) out[w++] = *p;
-                char hb[24]; const char *hs = cc_hex(addr - lo + off, hb + sizeof hb);
-                for (const char *p = "+"; *p && w + 1 < cap; p++) out[w++] = *p;
-                for (const char *p = hs; *p && w + 1 < cap; p++) out[w++] = *p;
-                out[w] = 0; found = 1;
-            }
-            l = e + 1;
-            if (found || lines >= 8192) break;
-        }
-        keep = slen(l); memmove(buf, l, keep);
-    }
-    if (fd >= 0) S1(NR_close, fd);
-    if (!found) { u64 w = 0; while (miss[w] && w + 1 < cap) { out[w] = miss[w]; w++; } out[w] = 0; }
-}
-
-// The naming record, taken while the faulting thread stands stopped in front of us: the same
-// fields in the same order as cc_emit's in-process block, marked [watcher]. A field that cannot
-// be read is named as a gap, never invented.
-static void watch_capture(long tgid, long tid, int sig) {
-    struct { u64 regs[31]; u64 sp, pc, pstate; } rg;
-    memset(&rg, 0, sizeof rg);
-    struct { void *b; u64 n; } iov; iov.b = &rg; iov.n = sizeof rg;
-    long rr = S4(NR_ptrace, WATCH_PTR_GETREGSET, tid, WATCH_NT_PRSTATUS, &iov);
-    static u8 si[128]; memset(si, 0, sizeof si);
-    long sr = S4(NR_ptrace, WATCH_PTR_GETSIGINFO, tid, 0, si);
-    u64 fault = sr >= 0 ? *(u64 *)(si + 16) : 0;                 // siginfo's si_addr, as in cc_emit
-    char comm[20]; memset(comm, 0, sizeof comm);
-    { char cp[48], t[24]; u64 o = 0;
-      const char *pre = "/proc/"; for (const char *p = pre; *p; p++) cp[o++] = *p;
-      const char *pp = utoa((u64)tgid, t + sizeof t); for (const char *p = pp; *p; p++) cp[o++] = *p;
-      const char *suf = "/comm"; for (const char *p = suf; *p; p++) cp[o++] = *p;
-      cp[o] = 0;
-      long fd = S4(NR_openat, AT_FDCWD, cp, 0x80000, 0);
-      if (fd >= 0) { long n = S3(NR_read, fd, comm, sizeof comm - 1); S1(NR_close, fd);
-                     if (n > 0) { comm[n] = 0; for (long i = 0; comm[i]; i++) if (comm[i] == '\n') comm[i] = 0; } } }
-    static char pcmod[PATH_MAX + 32], lrmod[PATH_MAX + 32];
-    if (rr >= 0) { watch_mod(tgid, rg.pc, pcmod, sizeof pcmod); watch_mod(tgid, rg.regs[30], lrmod, sizeof lrmod); }
-    else { memcpy(pcmod, "no-regs", 8); memcpy(lrmod, "no-regs", 8); }
-    char t[24];
-    watch_lock();
-    say("aemu-crash: watcher pid="); say(utoa((u64)tgid, t + sizeof t));
-    say(" tid="); say(utoa((u64)tid, t + sizeof t));
-    say(" comm="); say(comm[0] ? comm : "system_server");
-    say(" sig="); say(utoa((u64)sig, t + sizeof t));
-    say(" fault="); hex(fault);
-    say(" pc="); hex(rr >= 0 ? rg.pc : 0); say(" ("); say(pcmod); say(")");
-    say(" lr="); hex(rr >= 0 ? rg.regs[30] : 0); say(" ("); say(lrmod); say(")");
-    say(" sp="); hex(rr >= 0 ? rg.sp : 0);
-    say("\n");
-    watch_unlock();
-}
-
-#define WATCH_MAXTIDS 1024
-static long g_wtids[WATCH_MAXTIDS];
-static int g_wntids;
-static int g_werrs;                      // consecutive hard ptrace errors; the streak that ends the watch
-
-static int watch_tid_known(long tid) { for (int i = 0; i < g_wntids; i++) if (g_wtids[i] == tid) return 1; return 0; }
-static void watch_tid_add(long tid) { if (tid > 0 && !watch_tid_known(tid) && g_wntids < WATCH_MAXTIDS) g_wtids[g_wntids++] = tid; }
-static void watch_tid_drop(long tid) { for (int i = 0; i < g_wntids; i++) if (g_wtids[i] == tid) { g_wtids[i] = g_wtids[--g_wntids]; return; } }
-
-static void watch_detach_all(void) {
-    for (int i = 0; i < g_wntids; i++) S4(NR_ptrace, WATCH_PTR_DETACH, g_wtids[i], 0, 0);
-    g_wntids = 0;
-}
-
-// PTRACE_CONT under the fail-open rule: ESRCH means the thread is already gone (its exit event is
-// queued and collected below), not an error; anything else, repeated, ends the watch.
-static int watch_cont(long tid, long sig) {
-    long r = S4(NR_ptrace, WATCH_PTR_CONT, tid, 0, sig);
-    if (r >= 0) { g_werrs = 0; return 0; }
-    if (r == -3 /*ESRCH*/) return 0;
-    if (++g_werrs > 32) return -1;
-    return 0;
-}
-
-static void watcher_main(void) {
-    u64 chld = 1UL << (17 - 1);          // SIGCHLD is ours to consume via wait4, never as a signal
-    S4(NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, &chld, 0, 8);
-    long tgid = 0; int armed = 0, leader_gone = 0;
-    long announcer = 0;                  // pid read off the wake pipe whose announce stop is owed
-    int pipe_ok = g_watch_wake_r >= 0;
-    for (;;) {
-        if (!armed && !announcer && pipe_ok) {
-            // Before the announce this thread sleeps on the wake pipe and runs no wait4 at
-            // all: zygote's own reaper keeps every one of its children, and the thread costs
-            // nothing. watch_arm writes the announcer's pid before it asks to be traced, so
-            // once a line is read, the wait below owes that child its stop (or its exit).
-            char lb[24]; u64 o = 0; int dead = 0;
-            for (;;) {
-                char b; long n = S3(NR_read, g_watch_wake_r, &b, 1);
-                if (n == -4 /*EINTR*/) continue;
-                if (n <= 0) { dead = 1; break; }
-                if (b == '\n') break;
-                if (o + 1 < sizeof lb) lb[o++] = b;
-            }
-            if (dead) { pipe_ok = 0; continue; }   // a broken wake pipe: fall back to waiting directly
-            lb[o] = 0;
-            long v = 0; for (u64 i = 0; lb[i]; i++) if (lb[i] >= '0' && lb[i] <= '9') v = v * 10 + (lb[i] - '0');
-            announcer = v;
-            continue;
-        }
-        int status = 0;
-        long tid = S4(NR_wait4, -1, &status, WATCH_WALL, 0);
-        if (tid < 0) {
-            if (tid == -4 /*EINTR*/) continue;
-            if (armed) { say("aemu-watch: the tracee is gone; watcher off\n"); return; }
-            if (announcer) { announcer = 0; continue; }   // the announce fizzled (TRACEME refused child-side): back to the pipe
-            if (pipe_ok) continue;                        // not expected; stay off the wait
-            struct { u64 s, ns; } ts = { 0, 50000000 };
-            S2(NR_nanosleep, &ts, 0);
-            continue;
-        }
-        if ((status & 0xff) == 0x7f) {                                   // a stop
-            int sig = (status >> 8) & 0xff;
-            unsigned long event = (unsigned long)status >> 16;
-            if (!armed) {                                                // the announce: the only stop there can be
-                tgid = tid; armed = 1; watch_tid_add(tid);
-                if (S4(NR_ptrace, WATCH_PTR_SETOPTIONS, tid, 0, WATCH_O_TRACECLONE) < 0) {
-                    say("aemu-watch: PTRACE_SETOPTIONS refused; watcher off\n");
-                    watch_detach_all();
-                    return;
-                }
-                char t[24];
-                say("aemu-watch: armed on system_server pid="); say(utoa((u64)tgid, t + sizeof t)); say("\n");
-                if (watch_cont(tid, sig == 19 ? 0 : sig)) goto off;
-                continue;
-            }
-            if (event == WATCH_EVENT_CLONE) {
-                unsigned long nt = 0;
-                S4(NR_ptrace, WATCH_PTR_GETEVENTMSG, tid, 0, &nt);
-                watch_tid_add((long)nt);
-                if (watch_cont(tid, 0)) goto off;
-                continue;
-            }
-            if (sig == 19) { watch_tid_add(tid); if (watch_cont(tid, 0)) goto off; continue; }   // a cloned thread's first stop
-            if (sig == SIGSYS) { if (watch_cont(tid, SIGSYS)) goto off; continue; }              // its own supervisor: straight back
-            if (sig == 11 || sig == 6 || sig == 7 || sig == 4) {
-                watch_capture(tgid, tid, sig);
-                if (watch_cont(tid, sig)) goto off;
-                continue;
-            }
-            if (watch_cont(tid, sig)) goto off;
-            continue;
-        }
-        // an exit — the tracee's threads' once armed; before the arm, either the announcer's
-        // own (it died between its wake byte and its stop: the announce fizzled, so the loop
-        // returns to the pipe sleep) or a foreign child's caught in the brief window after a
-        // wake byte (nothing to say, and the announcer's stop is still owed, so the wait goes on)
-        if (armed) {
-            if (tid == tgid) leader_gone = 1;
-            watch_tid_drop(tid);
-            if (leader_gone && g_wntids == 0) { say("aemu-watch: system_server gone; watcher off\n"); return; }
-        } else if (tid == announcer) announcer = 0;
-    }
-off:
-    say("aemu-watch: ptrace keeps failing; detached, watcher off\n");
-    watch_detach_all();
-}
-
-static int watch_is_zygote(char *const argv[], long argc) {
-    const char *b = g_exe;
-    for (const char *p = g_exe; *p; p++) if (*p == '/') b = p + 1;
-    if (!seq(b, "app_process64") && !seq(b, "app_process")) return 0;
-    for (long i = 1; i < argc; i++) if (seq(argv[i], "--zygote")) return 1;
-    return 0;
-}
-
-static void watch_spawn(void) {
-    long pf[2];
-    if (S2(NR_pipe2, pf, 0) < 0) { say("aemu-watch: no wake pipe for the watcher; off\n"); return; }   // a watcher that cannot be woken must never be waited for
-    g_watch_wake_r = pf[0]; g_watch_wake_w = pf[1];
-    char mp[600];
-    watch_marker(mp, S0(NR_getpid));
-    long fd = S4(NR_openat, AT_FDCWD, mp, 02101 /*O_WRONLY|O_CREAT|O_APPEND*/, 0600);   // the marker first: a child arms only while it exists
-    if (fd >= 0) S1(NR_close, fd);
-    void *stk = (void *)S6(NR_mmap, 0, 1 << 18, 3 /*PROT_READ|PROT_WRITE*/, 0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/, -1, 0);
-    if ((u64)stk >= (u64)-4095) { say("aemu-watch: no stack for the watcher; off\n"); S3(NR_unlinkat, AT_FDCWD, mp, 0); S1(NR_close, g_watch_wake_r); S1(NR_close, g_watch_wake_w); g_watch_wake_r = g_watch_wake_w = -1; return; }
-    if (watch_clone(WATCH_CLONE_FLAGS, (char *)stk + (1 << 18), watcher_main) < 0) {
-        say("aemu-watch: clone refused; watcher off\n");
-        S3(NR_unlinkat, AT_FDCWD, mp, 0);
-        S1(NR_close, g_watch_wake_r); S1(NR_close, g_watch_wake_w); g_watch_wake_r = g_watch_wake_w = -1;
-        return;
-    }
-    char t[24];
-    say("aemu-watch: watcher up in zygote pid="); say(utoa((u64)S0(NR_getpid), t + sizeof t)); say("\n");
-}
-
-// ---------------------------------------------------------------------------------------------------- trap stacks
-//
-// The trap path gets a stack of its own. Until this batch the SIGSYS handler ran on the trapping
-// thread's own stack, and the entry toll is fixed and heavy: the kernel's signal frame, the
-// handler chain's frames, trap2_base's frame (0x1070 while it held a 4 KB scratch buffer) and
-// hub_pump behind it. A thread that arrives with less than the toll left dies in the doorway,
-// before any case runs: the Magisk daemon did exactly that (2026-11-26 field run, named by
-// aemu-crash) — hub_pump's prologue store at sp+0x70, the thread 0xFD0 bytes from the bottom of
-// its stack, the connect case never reached. Two moves, both needed:
-//   1. sigsys_entry (start.S) switches to a per-thread stack from this pool before any C frame
-//      exists, so the guest stack pays only the kernel's frame. The switch is self-provisioning:
-//      clone is not trapped (a newborn thread has no supervisor hook), so the first trap of any
-//      thread claims its slot here. Alongside it, each thread gets a real sigaltstack over the
-//      same memory (trap_altstack_ensure) and both handlers carry SA_ONSTACK, so fatal_relay and
-//      later deliveries land on the same ground; a thread that already has an altstack of its
-//      own keeps it — the entry switch covers the trap path regardless.
-//   2. trap2_base's KB-sized scratch buffers moved to the pb pool (below, at their cases), so
-//      the chain's own frames stay small wherever they run.
-// Sizing: 64 KB per stack. The budget is ~8 KB for the kernel frame (arm64 rt frame with the
-// FPSIMD context), ~2 KB for the whole trap chain after move 2, ~8 KB for a fatal signal nesting
-// inside a trap (fatal_relay + the crash capture), and margin for the binder/vmount detours —
-// ~24 KB worst case, so 64 KB is >2.5x that and >12x the toll that killed the daemon. 128 slots
-// (8 MB of .bss, untouched pages cost nothing); past the last slot the entry stays on the guest
-// stack, which is the pre-batch behaviour, not a new failure.
-#define TSTACK_SIZE (64 * 1024)
-#define TSTACK_N 128
-static char g_tstack[TSTACK_N][TSTACK_SIZE] __attribute__((aligned(16)));
-static volatile int g_tstack_tid[TSTACK_N];        // owning tid per slot, 0 = unclaimed
-static volatile int g_tstack_alt[TSTACK_N];        // sigaltstack settled for the slot's thread
-static volatile int g_tstack_next;
-
-static int tstack_index(u64 tid, int claim) {
-    for (int i = 0; i < TSTACK_N; i++) if (g_tstack_tid[i] == (int)tid) return i;
-    if (!claim) return -1;
-    int i = __atomic_fetch_add(&g_tstack_next, 1, __ATOMIC_ACQ_REL);
-    if (i >= TSTACK_N) return -1;
-    __atomic_store_n(&g_tstack_tid[i], (int)tid, __ATOMIC_RELEASE);
-    return i;
-}
-
-// Called from sigsys_entry (start.S) before any C frame exists on the trapping thread: pure
-// table work, no syscalls, no locks the guest could ever hold.
-void *trap_stack_top(u64 tid) {
-    int i = tstack_index(tid, 1);
-    return i < 0 ? 0 : (void *)(g_tstack[i] + TSTACK_SIZE);
-}
-
-// Settle this thread's sigaltstack onto its trap stack (once per thread). A thread that already
-// has an altstack — its own, or one inherited across fork — keeps it; the entry switch is what
-// guarantees the trap path, this only aligns the kernel's own delivery with the same ground.
-static void trap_altstack_ensure(void) {
-    int i = tstack_index((u64)S0(NR_gettid), 1);
-    if (i < 0 || g_tstack_alt[i]) return;
-    struct { void *sp; int flags; int pad; u64 size; } old;
-    memset(&old, 0, sizeof old);
-    if (S2(NR_sigaltstack, 0, &old) == 0 && (old.flags & 2 /*SS_DISABLE*/)) {
-        struct { void *sp; int flags; int pad; u64 size; } nw = { g_tstack[i], 0, 0, TSTACK_SIZE };
-        S2(NR_sigaltstack, &nw, 0);
-    }
-    __atomic_store_n(&g_tstack_alt[i], 1, __ATOMIC_RELEASE);
-}
-
-void sigsys_entry(int sig, void *info, void *uc);
-
-void on_sigsys_body(int sig, void *info, void *uc) {   // called from sigsys_entry (start.S)
+static void on_sigsys(int sig, void *info, void *uc) {
     struct sigctx *c = (struct sigctx *)((char *)uc + 176);
     (void)sig; (void)info;
-    trap_altstack_ensure();
     mask_mediate((u64 *)((char *)uc + 40));                     // mask mediation: the restored mask never blocks the capture-critical set
     if (g_crash) *(u64 *)((char *)uc + 40) &= ~(1UL << 7);      // AEMU64_CRASH also keeps SIGFPE deliverable
     c->regs[0] = (u64)trap((long)c->regs[8], (long *)c->regs, uc);
@@ -3407,11 +3009,10 @@ static void install_filter(void) {
     f[n++] = JEQ(NR_rt_sigprocmask, L_SIG, 0);
     f[n++] = JEQ(NR_prctl, L_PRCTL, 0);
     f[n++] = JEQ(NR_mmap, L_MMAP, L_ALLOW);
-    AT(L_PRCTL);                                                // PR_CAPBSET_DROP (24), PR_SET_SECCOMP (22), PR_SET_KEEPCAPS (8), PR_SET_NAME (15), PR_CAP_AMBIENT (47)
+    AT(L_PRCTL);                                                // PR_CAPBSET_DROP (24), PR_SET_SECCOMP (22), PR_SET_KEEPCAPS (8), PR_CAP_AMBIENT (47)
     f[n++] = LD(16); f[n++] = JEQ(24, L_TRAP, 0);
     f[n++] = JEQ(22, L_TRAP, 0);
     f[n++] = JEQ(8, L_TRAP, 0);
-    f[n++] = JEQ(15, L_TRAP, 0);                                // renames trap so the ptrace watcher can classify them (trap2_base)
     f[n++] = JEQ(47, L_TRAP, L_ALLOW);
     AT(L_SIG);                                                  // only when a set is given and it is not SIG_UNBLOCK
     f[n++] = LD(16); f[n++] = JEQ(1, L_ALLOW, 0);
@@ -3584,7 +3185,6 @@ void aemu_main(u64 *sp) {
     if (n <= 0) die("cannot find myself", "");
     g_self[n] = 0;
     g_real_uid = (u32)S0(NR_getuid);
-    g_home_pid = S0(NR_getpid);
     { struct kstat st; if (S2(NR_fstat, 2, &st) == 0 && ((st.st_mode & 0170000) == 0100000 || (st.st_mode & 0170000) == 0010000)) {
         g_logdev = st.st_dev; g_logino = st.st_ino; g_logpipe = (st.st_mode & 0170000) == 0010000; }
       if (g_logpipe && S2(NR_fstat, 0, &st) == 0 && (st.st_mode & 0170000) == 0010000 && st.st_dev == g_logdev) g_inino = st.st_ino; }
@@ -3705,17 +3305,12 @@ void aemu_main(u64 *sp) {
     // in the supervisor (netd; see the nlreq section and install_filter_netd)
     { const char *base = prog; for (const char *p = prog; *p; p++) if (*p == '/') base = p + 1; g_is_netd = seq(base, "netd"); }
 
-    // signal handler first, then the filter (once per process tree: it survives exec). The SIGSYS
-    // handler is the asm entry: it moves the trap chain onto the thread's trap stack before any
-    // C runs (see the trap stacks section). SA_ONSTACK on both handlers: threads that have a
-    // sigaltstack (trap_altstack_ensure settles one per thread, starting with this one) get
-    // kernel delivery onto that same ground.
-    struct { void *h; u64 flags; void *restorer; u64 mask; } sa = { (void *)sigsys_entry, 4 /*SA_SIGINFO*/ | 0x40000000 /*SA_NODEFER*/ | 0x08000000 /*SA_ONSTACK*/, 0, 0 };
+    // signal handler first, then the filter (once per process tree: it survives exec)
+    struct { void *h; u64 flags; void *restorer; u64 mask; } sa = { (void *)on_sigsys, 4 /*SA_SIGINFO*/ | 0x40000000 /*SA_NODEFER*/, 0, 0 };
     if (S4(NR_rt_sigaction, SIGSYS, &sa, 0, 8) < 0) die("sigaction", "");
-    trap_altstack_ensure();
     u64 unblock = SYSBIT | FATALMASK; S4(NR_rt_sigprocmask, 1, &unblock, 0, 8);   // deliverable from the first guest instruction (mask mediation)
     {
-        struct { void *h; u64 flags; void *restorer; u64 mask; } ca = { (void *)fatal_relay, 4 /*SA_SIGINFO*/ | 0x40000000 /*SA_NODEFER*/ | 0x08000000 /*SA_ONSTACK*/, 0, 0 };
+        struct { void *h; u64 flags; void *restorer; u64 mask; } ca = { (void *)fatal_relay, 4 /*SA_SIGINFO*/ | 0x40000000 /*SA_NODEFER*/, 0, 0 };
         static const int fatal[] = { 11, 7, 4, 6, 8 };
         for (int i = 0; i < 5; i++) S4(NR_rt_sigaction, fatal[i], &ca, 0, 8);
     }
@@ -3723,7 +3318,6 @@ void aemu_main(u64 *sp) {
     if (g_is_netd) install_filter_netd();
     if (g_mtrace_on) install_filter_mtrace();
     if (g_is_netd) say("aemu-nlreq: netd process: route-request filter installed\n");
-    if (!g_is32 && watch_is_zygote(gargv, gargc)) watch_spawn();   // ptrace watcher: only the zygote gets one
 
     // the guest's initial stack: argc, argv, envp (without our variables), auxv
     u64 ne = 0; while (envp[ne]) ne++;
