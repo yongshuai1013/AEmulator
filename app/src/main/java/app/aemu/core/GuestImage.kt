@@ -113,8 +113,6 @@ data class VmSettings(
     val wifiMirrorHost: Boolean = true,
     /** Experimental host Bluetooth passthrough (scan, RFCOMM, GATT); applies at the next full VM boot. */
     val bluetooth: Boolean = false,
-    /** Magisk root (arm64 guests on the native engine): the host starts the daemon at boot, see MagiskCore; applies at the next full VM boot (AEmulator Plus) */
-    val magisk: Boolean = false,
     /** Classic su root (arm64 Android 6.0 guests on the native engine): the host plants a self-built su and the Superuser manager app at boot, see SuperuserSupport; applies at the next full VM boot */
     val superuser: Boolean = false,
     /**
@@ -159,7 +157,6 @@ data class VmSettings(
         .put("wifiSignal", wifiSignal).put("wifiNeighbors", wifiNeighbors)
         .put("wifiMirrorHost", wifiMirrorHost)
         .put("bluetooth", bluetooth)
-        .put("magisk", magisk)
         .put("superuser", superuser)
         .put("qemuZero", qemuZero)
         .put("agent", agent)
@@ -254,7 +251,6 @@ data class VmSettings(
                 wifiNeighbors = o.optBoolean("wifiNeighbors", d.wifiNeighbors),
                 wifiMirrorHost = o.optBoolean("wifiMirrorHost", d.wifiMirrorHost),
                 bluetooth = o.optBoolean("bluetooth", d.bluetooth),
-                magisk = o.optBoolean("magisk", d.magisk),
                 superuser = o.optBoolean("superuser", d.superuser),
                 qemuZero = o.optBoolean("qemuZero", d.qemuZero),
                 agent = o.optBoolean("agent", d.agent),
