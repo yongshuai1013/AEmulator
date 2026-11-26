@@ -209,6 +209,9 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             AgentSection(img, s) { s = it }
 
             Spacer(Modifier.height(8.dp))
+            ModulesSection(img)
+
+            Spacer(Modifier.height(8.dp))
             Text(stringResource(R.string.vs_archive), style = MaterialTheme.typography.titleMedium)
             var archiveBusy by remember { mutableStateOf(false) }
             VmExportSection(img, s, archiveBusy) { archiveBusy = it }
