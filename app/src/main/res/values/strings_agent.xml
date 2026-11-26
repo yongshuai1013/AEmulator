@@ -3,5 +3,5 @@
      Root Manager app — this page keeps only the agent's master switch, so the list strings are gone. -->
 <resources>
     <string name="vs_agent">Guest agent</string>
-    <string name="vs_agent_sub">A service of ours inside the guest: it resolves the hide list to uids for the per-app views and receives imported APKs. The list itself is managed inside the guest, in the “AEmu Root Manager” app — a listed app reads the guest as if Magisk were not in it, and apps that are not listed always see the full guest. Applies at the next boot.</string>
+    <string name="vs_agent_sub">A service of ours inside the guest: it resolves the hide list to uids for the per-app views and receives imported APKs. The list itself is managed inside the guest, in the “AEmu Root Manager” app — a listed app reads the guest as if the root setup were not in it, and apps that are not listed always see the full guest. Applies at the next boot.</string>
 </resources>
