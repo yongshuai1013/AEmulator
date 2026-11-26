@@ -21,10 +21,12 @@ import java.io.OutputStream
  *    the channel running dry is only the fallback, because the framework keeps its own
  *    duplicate of the tun descriptor and may hold the channel open past the app's stop.
  *  - the host ends of guest connections the supervisor detoured at their connect() call. A
- *    synthesizer turns their byte stream into TCP segments and writes them into the tunnel.
- *    Only the synthesizing half exists in M2: nothing is read back out of the tunnel and
- *    answered, so a detoured connection gets no reply — that half is M3, and the test page
- *    says so rather than pretending otherwise.
+ *    user-space TCP endpoint (VpnTcp.kt, M3) terminates each one: it frames the guest's byte
+ *    stream into segments for the tunnel, completes the handshake with the real server
+ *    through the VPN app's forwarding, and answers the inbound segments back into the guest
+ *    stream — a detoured connection now gets its replies. Termination state lives only
+ *    here, keyed by session generation; the supervisors hold none of it. UDP is not
+ *    detoured and DNS stays on the host-side proxy (the test page says so).
  *  - the netlink listeners (netd above all). A synthesised interface has no kernel to announce
  *    its birth and death, so the hub writes the link events itself — a kernel uevent for a
  *    listener on the uevent protocol (the only dialect netd turns into an interface removal),
@@ -41,16 +43,28 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
     private val conns = ArrayList<Conn>()
     private val listeners = HashMap<Int, Listener>()
     private val flows = HashMap<Int, Flow>()
+    private val flowsByTuple = HashMap<Long, Flow>()
+    private val embers = ArrayList<Ember>()
     private var nextFlow = 1
+    @Volatile private var timerAlive = false
     private var nextListener = 1
     /** VPN 137 measurement: sessions since boot, numbered in registration order */
     private var sessionSeq = 0
     @Volatile private var session: Session? = null
     @Volatile private var exemptUid = -1
 
-    fun ensure() { server.start(log) }
+    fun ensure() {
+        server.start(log)
+        synchronized(lock) {
+            if (!timerAlive) {
+                timerAlive = true
+                Thread({ timerLoop() }, "vpnhub-timer").apply { isDaemon = true; start() }
+            }
+        }
+    }
 
     fun stop() {
+        timerAlive = false
         server.stop()
         session?.let { s ->
             val fc: Int; val lc: Int
@@ -60,8 +74,10 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         synchronized(lock) {
             session?.let { it.alive = false; closeFd(it.peerFd) }
             session = null
-            for (f in flows.values) { f.open = false; closeFd(f.fd) }
+            for (f in flows.values) { f.open = false; f.conn?.abort("session-down"); closeFd(f.fd) }
             flows.clear()
+            flowsByTuple.clear()
+            embers.clear()
             for (l in listeners.values) closeFd(l.fd)
             listeners.clear()
             conns.clear()
@@ -96,6 +112,14 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         val writeLock = Object()
         @Volatile var appPkts = 0L
         @Volatile var synthPkts = 0L
+        /** M3 session totals: payload bytes each way, folded in as flows are reaped. */
+        @Volatile var upBytes = 0L
+        @Volatile var downBytes = 0L
+        /** Inbound segments that matched no live flow of this session (dead generations). */
+        @Volatile var staleDrops = 0L
+        /** Inbound segments dropped for a bad checksum, folded in as flows are reaped. */
+        @Volatile var badDrops = 0L
+        @Volatile var writeFails = 0
     }
 
     private class Listener(val id: Int, val fd: FileDescriptor, val proto: Int) {
@@ -103,12 +127,20 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         val wlock = Object()
     }
 
-    private class Flow(val id: Int, val uid: Int, val dstIp: Int, val dstPort: Int, val srcPort: Int) {
+    private class Flow(val id: Int, val uid: Int, val dstIp: Int, val dstPort: Int, val srcPort: Int,
+                       val session: Session, val tupleKey: Long) {
         var fd: FileDescriptor? = null
         @Volatile var open = true
-        var isn = 0
-        var seq = 0L
+        var conn: VpnTcpConn? = null
+        /** Byte counters already folded into the session totals (reap/sessionDown once). */
+        var counted = false
     }
+
+    /** A closed flow's afterglow (design section 2): the tuple and the closing sequence
+     * values, kept for 30 s so a retransmitted final segment still gets its ACK. Not a live
+     * flow: it holds no descriptor and is never counted in the flow totals. */
+    private class Ember(val key: Long, val gen: Int, val serverIp: Int, val serverPort: Int,
+                        val srcPort: Int, val seq: Long, val rcvNxt: Long, val expiresAt: Long)
 
     private fun serve(c: LocalSocket) {
         val conn = Conn(c)
@@ -203,8 +235,17 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                 val f: Flow
                 val fcount: Int
                 synchronized(lock) {
-                    f = Flow(nextFlow++, le32(pl, 0), le32(pl, 4), le16(pl, 8), le16(pl, 10))
+                    val id = nextFlow++
+                    // Source ports come from the hub's own cursor and are never reused
+                    // across sessions (design section 2): a guest that bound its own port
+                    // keeps it, everyone else gets 40000 + flow id — and flow ids never
+                    // repeat in the hub's lifetime, so neither does the port.
+                    val rawPort = le16(pl, 10)
+                    val effPort = if (rawPort != 0) rawPort else 40000 + id
+                    f = Flow(id, le32(pl, 0), le32(pl, 4), le16(pl, 8), effPort, s,
+                        tupleKey(le32(pl, 4), le16(pl, 8), effPort))
                     flows[f.id] = f
+                    flowsByTuple[f.tupleKey] = f
                     fcount = flows.size
                 }
                 step(s, "flow-new id=${f.id} uid=${f.uid} dst=${ip(f.dstIp)}:${f.dstPort} srcport=${f.srcPort} flows=$fcount")
@@ -218,7 +259,14 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                 if (f == null || s == null) return false
                 step(s, "flow-fd id=${f.id}")
                 f.fd = fd
-                Thread({ flowReader(s, f) }, "vpnhub-flow").apply { isDaemon = true; start() }
+                val tc = VpnTcpConn(f.id, s.seq, f.dstIp, f.dstPort, s.addr, f.srcPort, s.mtu,
+                    { pkt -> writePacket(s, pkt) },
+                    { log("aemu-vpn: flow ${f.id} established dst=${ip(f.dstIp)}:${f.dstPort}") },
+                    log)
+                f.conn = tc
+                tc.open(System.currentTimeMillis())
+                Thread({ flowReader(s, f, tc) }, "vpnhub-flow").apply { isDaemon = true; start() }
+                Thread({ flowWriter(s, f, tc) }, "vpnhub-flow-w").apply { isDaemon = true; start() }
                 return true
             }
             T_LINKREG -> {
@@ -324,6 +372,10 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                 }
                 s.appPkts++
                 if (s.appPkts == 1L) log("aemu-vpn: first packet into the tunnel: " + describe(buf, n))
+                // M3: a real IP packet read back out of the tunnel is the return half of
+                // a detoured connection (or a leftover of a dead one). The control lines
+                // were handled above; IP packets are dispatched, never silently dropped.
+                if (n >= 20 && (buf[0].toInt() ushr 4) == 4) dispatchInbound(s, buf, n)
             }
         } catch (_: Throwable) {
         }
@@ -345,6 +397,42 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         return "IPv4/$pname $src -> $dst ($n bytes)"
     }
 
+    /** Routes one inbound IP packet to its flow's terminator. The dispatch key is the
+     * reverse of the outbound tuple (design section 4): the packet's source is the server,
+     * its destination port is the flow's source port. A packet that matches no live flow
+     * of this session is either answered by an ember (same generation only) or counted as
+     * a stale-generation drop — the design's "a later session inherits nothing" evidence. */
+    private fun dispatchInbound(s: Session, b: ByteArray, n: Int) {
+        val ihl = (b[0].toInt() and 0x0f) * 4
+        if (ihl < 20 || n < ihl + 20) return
+        if ((b[9].toInt() and 0xff) != 6) return   // TCP only; UDP/ICMP stay counted, not detoured (design section 3)
+        val key = tupleKey(be32(b, 12), be16(b, ihl), be16(b, ihl + 2))
+        val f = synchronized(lock) { flowsByTuple[key] }
+        if (f != null && f.session === s) {
+            f.conn?.onPacket(b, n)
+            return
+        }
+        val emb = synchronized(lock) { embers.firstOrNull { it.key == key } }
+        if (emb != null) {
+            if (emb.gen == s.seq) {
+                writePacket(s, buildTcpPacket(s.addr, emb.srcPort, emb.serverIp, emb.serverPort,
+                    emb.seq, emb.rcvNxt, 0x10, 0, ByteArray(0), false, s.mtu, (key and 0xffff).toInt()))
+            } else {
+                s.staleDrops++
+            }
+            return
+        }
+        s.staleDrops++
+    }
+
+    private fun tupleKey(serverIp: Int, serverPort: Int, srcPort: Int): Long =
+        ((serverIp.toLong() and 0xffffffffL) shl 32) or
+            ((serverPort.toLong() and 0xffff) shl 16) or (srcPort.toLong() and 0xffff)
+
+    private fun be32(b: ByteArray, off: Int) =
+        ((b[off].toInt() and 0xff) shl 24) or ((b[off + 1].toInt() and 0xff) shl 16) or
+            ((b[off + 2].toInt() and 0xff) shl 8) or (b[off + 3].toInt() and 0xff)
+
     // The session is over — the app said so, or the channel ran dry behind it. Order matters
     // and is fixed: the supervisors hear about it first (they clear their registries, so the
     // framework's own interface check reads "gone"), the link event goes to the listeners
@@ -359,8 +447,20 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
             session = null
             s.alive = false
             flowCount = flows.size
-            for (f in flows.values) { f.open = false; closeFd(f.fd) }
+            for (f in flows.values) {
+                f.open = false
+                f.conn?.let { c ->
+                    c.abort("session-down")
+                    if (!f.counted) {
+                        f.counted = true
+                        s.upBytes += c.upBytes; s.downBytes += c.downBytes; s.badDrops += c.badCksum
+                    }
+                }
+                closeFd(f.fd)
+            }
             flows.clear()
+            flowsByTuple.clear()
+            embers.clear()
             listenerCount = listeners.size
             hadExempt = exemptUid
             exemptUid = -1
@@ -372,105 +472,128 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         step(s, "registry-cleared flows=$flowCount listeners=$listenerCount exempt=$hadExempt down-broadcast-to=${synchronized(lock) { conns.size }}")
         linkEvent(false, s)
         log("aemu-vpn: RTM_DELLINK for ${s.name} injected to $listenerCount link listener(s)")
-        log("aemu-vpn: session ${s.name} over: ${s.appPkts} packets from the app, ${s.synthPkts} synthesized packets back")
-        step(s, "session-over appPkts=${s.appPkts} synthPkts=${s.synthPkts}")
+        log("aemu-vpn: session ${s.name} over: ${s.appPkts} packets from the app, ${s.synthPkts} synthesized packets back, up ${s.upBytes} bytes, down ${s.downBytes} bytes, stale-gen drops ${s.staleDrops}, bad packets dropped ${s.badDrops}")
+        step(s, "session-over appPkts=${s.appPkts} synthPkts=${s.synthPkts} upBytes=${s.upBytes} downBytes=${s.downBytes} staleDrops=${s.staleDrops}")
     }
 
-    // The synthesizer (M2's half of the terminator): the detoured connection's byte stream is
-    // framed into TCP segments written into the tunnel, so the VPN app sees a real flow. The
-    // acknowledgement number is nominal — nothing is read back and answered in M2 (that is M3),
-    // so a detoured connection's reads wait for the session to end, exactly as the test page says.
-    private fun flowReader(s: Session, f: Flow) {
+    // The guest-stream half of a detoured connection (M3): bytes the guest wrote are fed
+    // to the flow's terminator, which frames them into segments for the tunnel. A read EOF
+    // is the guest's half-close — the terminator queues its FIN behind the data and the
+    // flow lives on until the server's side finishes too. The descriptor is closed by the
+    // reaper or the delivery writer, never here, so the return half can still arrive.
+    private fun flowReader(s: Session, f: Flow, conn: VpnTcpConn) {
         val inp = FileInputStream(f.fd)
-        f.isn = (System.nanoTime() xor (f.id * 0x9e3779b9L)).toInt()
-        f.seq = (f.isn + 1).toLong()
-        writePacket(s, tcpPacket(s, f, FLAG_SYN, ByteArray(0)))
         val buf = ByteArray(65536)
         try {
             while (f.open && s.alive) {
                 val n = inp.read(buf)
                 if (n < 0) break
                 if (n == 0) continue
-                var off = 0
-                val seg = maxOf(64, s.mtu - 40)
-                while (off < n) {
-                    val m = minOf(n - off, seg)
-                    writePacket(s, tcpPacket(s, f, FLAG_PSH or FLAG_ACK, buf.copyOfRange(off, off + m)))
-                    off += m
-                }
+                if (!conn.guestBytes(buf, 0, n)) break
             }
         } catch (_: Throwable) {
         }
-        if (f.open && s.alive) writePacket(s, tcpPacket(s, f, FLAG_FIN or FLAG_ACK, ByteArray(0)))
-        f.open = false
-        synchronized(lock) { flows.remove(f.id) }
-        step(s, "flow-end id=${f.id} flows=${synchronized(lock) { flows.size }}")
-        closeFd(f.fd)
+        conn.guestEof()
+        step(s, "flow-guest-eof id=${f.id}")
     }
 
-    private fun writePacket(s: Session, pkt: ByteArray) {
-        synchronized(s.writeLock) {
-            if (!s.alive) return
-            try {
-                s.tunOut!!.write(pkt); s.tunOut!!.flush()
-                s.synthPkts++
-            } catch (_: Throwable) {
+    // The delivery half: drains the terminator's deliverables into the guest descriptor,
+    // on its own thread, so the tunnel reader never blocks on a slow guest. An Eof
+    // deliverable becomes a write-side shutdown of the descriptor: the guest reads its
+    // EOF while its writes can still be answered (the design's half-close).
+    private fun flowWriter(s: Session, f: Flow, conn: VpnTcpConn) {
+        val fd = f.fd ?: return
+        val out = FileOutputStream(fd)
+        while (true) {
+            when (val d = conn.nextDeliverable()) {
+                is TcpDeliverable.Data -> {
+                    try {
+                        out.write(d.bytes); out.flush()
+                    } catch (_: Throwable) {
+                        conn.guestGone()
+                        break
+                    }
+                }
+                is TcpDeliverable.Eof -> {
+                    runCatching { Os.shutdown(fd, android.system.OsConstants.SHUT_WR) }
+                    return
+                }
+                is TcpDeliverable.Dead -> break
+            }
+        }
+        closeFd(fd)
+    }
+
+    /** The terminator's clock: ticks every live flow (retransmits, connect timeouts),
+     * reaps the finished ones, and retires expired embers. Runs for the hub's lifetime;
+     * a tick only ever touches flows in the live registry, so nothing here can act
+     * inside a later session. */
+    private fun timerLoop() {
+        while (timerAlive) {
+            try { Thread.sleep(100) } catch (_: InterruptedException) { return }
+            val now = System.currentTimeMillis()
+            val fs = synchronized(lock) { flows.values.toList() }
+            for (f in fs) {
+                val c = f.conn ?: continue
+                c.tick(now)
+                if (c.dead || c.fullyClosed()) reapFlow(f)
+            }
+            synchronized(lock) {
+                val it = embers.iterator()
+                while (it.hasNext()) { if (it.next().expiresAt <= now) it.remove() }
             }
         }
     }
 
-    private fun tcpPacket(s: Session, f: Flow, flags: Int, payload: ByteArray): ByteArray {
-        val syn = flags and FLAG_SYN != 0
-        val tcpLen = if (syn) 24 else 20
-        val total = 20 + tcpLen + payload.size
-        val p = ByteArray(total)
-        p[0] = 0x45
-        putBe16(p, 2, total)
-        putBe16(p, 4, f.id and 0xffff)
-        putBe16(p, 6, 0x4000)
-        p[8] = 64
-        p[9] = 6
-        putBe32(p, 12, f.dstIp)            // from the server the guest thinks it is talking to
-        putBe32(p, 16, s.addr)             // to the interface address the framework gave the app
-        putBe16(p, 20, f.dstPort)
-        putBe16(p, 22, if (f.srcPort != 0) f.srcPort else 40000 + f.id)
-        if (syn) {
-            putBe32(p, 24, f.isn)
-            f.seq = (f.isn + 1).toLong()
-        } else {
-            putBe32(p, 24, (f.seq and 0xffffffffL).toInt())
-            f.seq += payload.size + if (flags and FLAG_FIN != 0) 1 else 0
+    /** Takes a finished flow out of every registry, folds its counters into the session
+     * totals, logs its closing line, and — when the close was a clean active one — leaves
+     * the design's 30-second ember behind for late retransmits of the final segment. */
+    private fun reapFlow(f: Flow) {
+        val s = f.session
+        val c = f.conn ?: return
+        if (!c.dead) c.markComplete()
+        synchronized(lock) {
+            if (flows[f.id] !== f) return
+            flows.remove(f.id)
+            if (flowsByTuple[f.tupleKey] === f) flowsByTuple.remove(f.tupleKey)
+            if (!f.counted) {
+                f.counted = true
+                s.upBytes += c.upBytes; s.downBytes += c.downBytes; s.badDrops += c.badCksum
+            }
+            if (c.emberRcvNxt() >= 0) {
+                embers.add(Ember(f.tupleKey, s.seq, f.dstIp, f.dstPort, f.srcPort,
+                    c.emberSeq(), c.emberRcvNxt(), System.currentTimeMillis() + 30_000))
+            }
         }
-        putBe32(p, 28, 1)                  // nominal ack (see flowReader's note)
-        p[32] = ((tcpLen / 4) shl 4).toByte()
-        p[33] = flags.toByte()
-        putBe16(p, 34, 65535)
-        if (syn) {                         // MSS option: 1460, capped by the tunnel MTU
-            p[40] = 2; p[41] = 4
-            putBe16(p, 42, minOf(1460, maxOf(64, s.mtu - 40)))
-        }
-        System.arraycopy(payload, 0, p, 20 + tcpLen, payload.size)
-        putBe16(p, 10, cksumDone(cksumAdd(p, 0, 20, 0)))
-        // pseudo-header: src, dst, zero, protocol, TCP length
-        var sum = cksumAdd(p, 12, 8, 0)
-        sum += 6 + (total - 20)
-        putBe16(p, 36, cksumDone(cksumAdd(p, 20, total - 20, sum)))
-        return p
+        f.open = false
+        closeFd(f.fd)
+        log("aemu-vpn: flow ${f.id} closed reason=${c.closeReason} up=${c.upBytes} down=${c.downBytes}")
+        step(s, "flow-closed id=${f.id} reason=${c.closeReason} flows=${synchronized(lock) { flows.size }}")
     }
 
-    private fun cksumAdd(b: ByteArray, off: Int, len: Int, seed: Long): Long {
-        var sum = seed
-        var i = off
-        val end = off + len
-        while (i + 1 < end) { sum += ((b[i].toInt() and 0xff) shl 8) or (b[i + 1].toInt() and 0xff); i += 2 }
-        if (i < end) sum += (b[i].toInt() and 0xff) shl 8
-        return sum
-    }
-
-    private fun cksumDone(sum0: Long): Int {
-        var sum = sum0
-        while (sum ushr 16 != 0L) sum = (sum and 0xffff) + (sum ushr 16)
-        return sum.toInt().inv() and 0xffff
+    /** Writes one packet into the tunnel; returns false when the write failed.
+     * Consecutive failures are counted, and at the design's threshold the session is
+     * treated as dead — its channel is closed so the reader runs the ordinary teardown —
+     * instead of the hub silently believing in a session the app has stopped reading. */
+    private fun writePacket(s: Session, pkt: ByteArray): Boolean {
+        synchronized(s.writeLock) {
+            if (!s.alive) return false
+            try {
+                s.tunOut!!.write(pkt); s.tunOut!!.flush()
+                s.synthPkts++
+                s.writeFails = 0
+                return true
+            } catch (_: Throwable) {
+                s.writeFails++
+                if (s.writeFails >= 16 && s.alive) {
+                    log("aemu-vpn: session ${s.name}: 16 consecutive tunnel writes failed; treating the session as dead")
+                    step(s, "tun-write-failed x${s.writeFails} (session treated as dead)")
+                    s.alive = false
+                    closeFd(s.peerFd)
+                }
+                return false
+            }
+        }
     }
 
     // ---- the link events a synthesised interface has no kernel to produce
@@ -575,11 +698,6 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
     }
 
     private fun putLe16(b: ByteArray, off: Int, v: Int) { b[off] = v.toByte(); b[off + 1] = (v ushr 8).toByte() }
-    private fun putBe16(b: ByteArray, off: Int, v: Int) { b[off] = (v ushr 8).toByte(); b[off + 1] = v.toByte() }
-    private fun putBe32(b: ByteArray, off: Int, v: Int) {
-        b[off] = (v ushr 24).toByte(); b[off + 1] = (v ushr 16).toByte(); b[off + 2] = (v ushr 8).toByte(); b[off + 3] = v.toByte()
-    }
-
         const val T_HELLO = 1
         const val T_SESSION_STATE = 2
         const val T_TUN_PEER = 3
@@ -598,9 +716,5 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         const val RTM_DELLINK = 17
         const val PROTO_UEVENT = 15   // NETLINK_KOBJECT_UEVENT
         const val IFLA_IFNAME = 3
-        const val FLAG_SYN = 0x02
-        const val FLAG_FIN = 0x01
-        const val FLAG_PSH = 0x08
-        const val FLAG_ACK = 0x10
     }
 }
