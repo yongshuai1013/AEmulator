@@ -34,19 +34,21 @@ private val NETD_STRACE = true
  * build without it. */
 private val ACORE_STRACE = true
 
-/** TEMPORARY diagnostic build (magisk-daemon-diag-desk.md): probes P0–P5/P6 around the unchanged
- * daemon start of #103, so the daemon's silent exit has to name itself — P0 proves the binary
- * execs, P1 checks the binary's own tmpfs path against the one the socket poll watches, P2 runs
- * --daemon in the foreground with its output kept, P3/P4 sample /proc and the fall-out points
- * while the background start runs, P6 retries the start at boot-complete when logd is up.
- * P5 (added once the first field run put the daemon in the "alive but stuck" cell) re-runs
- * --daemon in the foreground with the supervisor's own trap trace armed for that one shell
- * channel (AEMU64_MTRACE, run64 api 23), at both start points, so the call it parks in names
- * itself in the host log. P3's census no longer trusts the guest sh's /proc glob — it silently
- * matched nothing in the first field run — and enumerates /proc with ls instead.
- * Observation only: own threads, bounded timeouts, fail-open, no behaviour path touched; with
- * this off the file is #103 verbatim. On in this build (the field phone cannot flip it); remove
- * the constant and every MAGISK_DIAG block once the verdict is in. */
+/** TEMPORARY diagnostic build (magisk-daemon-diag-desk.md; slimmed by the magisk-shape batch):
+ * probes around the stage commands, so the daemon's silent failure has to name itself — P0 proves
+ * the binary execs, P3/P4 sample /proc and the fall-out points while the post-fs-data stage runs,
+ * P5 re-runs --daemon in the foreground with the supervisor's own trap trace armed for that one
+ * shell channel (AEMU64_MTRACE, run64 api 23), at both start points (post-fs-data and
+ * boot-complete), so the call it parks in names itself in the host log. The harvest keeps the
+ * whole trace (head + tail when it exceeds 800 lines): the first version kept only the tail and
+ * lost the daemon child's first steps with it. P1/P2 are gone (P2 duplicated P5's foreground
+ * attempt, without the trace) and so is P6, which re-issued at boot-complete a background
+ * --daemon start the official flow does not have. P3's census enumerates /proc with ls, reads
+ * comm as well as cmdline (the daemon's comm is "magiskd") and always prints its scan count,
+ * after the first version's census silently matched nothing in the field.
+ * Observation only: own threads, bounded timeouts, fail-open, no behaviour path touched. On in
+ * this build (the field phone cannot flip it); remove the constant and every MAGISK_DIAG block
+ * once the verdict is in. */
 private val MAGISK_DIAG = true
 
 /** Native arm64 engine: vendor daemons that only poll hardware the phone does not have (modem, DSP, TrustZone). */
@@ -1802,42 +1804,38 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     private fun magiskLogTail(): String =
         runCatching { File(paths.root, "cache/magisk.log").readLines().takeLast(12).joinToString(" | ") }.getOrDefault("")
 
-    /** magiskinit's early-init job, which the stage commands assume has already happened: start the daemon itself,
-     * in the background as guest root with its output kept in /cache/magisk.log (the daemon's own log file), then
-     * wait briefly for its socket. Fail-open: whatever happens here, the stage commands below still run. */
-    private fun magiskStartDaemon() {
-        runCatching {
-            val answer = guestShell("/${MagiskCore.TMP}/magisk --daemon </dev/null >>/cache/magisk.log 2>&1 & echo daemon-start-issued", 15_000).trim()
-            log("magisk: daemon start issued as guest root: /${MagiskCore.TMP}/magisk --daemon (background, output >>/cache/magisk.log) -> $answer")
-            val socket = File(paths.root, "${MagiskCore.TMP}/.magisk/device/socket")
-            val t0 = System.currentTimeMillis()
-            while (!socket.exists() && System.currentTimeMillis() - t0 < 10_000) Thread.sleep(200)
-            if (socket.exists()) log("magisk: daemon socket up after ${System.currentTimeMillis() - t0} ms")
-            else log("magisk: daemon socket did not appear within 10 s; /cache/magisk.log: ${magiskLogTail()}")
-        }.onFailure { log("magisk: daemon start failed: ${it.message}") }
+    /** Watches for the daemon's socket from the moment the post-fs-data stage starts. There is no separate
+     * daemon start any more: in the official flow the daemon is created by the post-fs-data stage client
+     * itself (connect_daemon with create=true, core/daemon.rs of the pinned Magisk), so the socket's first
+     * appearance — or its absence after 30 s — is that stage's verdict, timestamped here. Observation only. */
+    private fun magiskSocketWatch() {
+        val socket = File(paths.root, "${MagiskCore.TMP}/.magisk/device/socket")
+        val t0 = System.currentTimeMillis()
+        Thread {
+            while (System.currentTimeMillis() - t0 < 30_000) {
+                if (socket.exists()) { log("magisk: daemon socket appeared at +${System.currentTimeMillis() - t0} ms after the post-fs-data stage started"); return@Thread }
+                Thread.sleep(200)
+            }
+            log("magisk: daemon socket did not appear within 30 s of the post-fs-data stage; /cache/magisk.log: ${magiskLogTail()}")
+        }.start()
     }
 
     // ---- TEMPORARY Magisk daemon diagnostic (MAGISK_DIAG; magisk-daemon-diag-desk.md) ----------------
-    // Observation only: the probes run on their own threads beside the unchanged magiskStartDaemon,
-    // every call is timeout-bounded and wrapped, and nothing here alters a stage command, a file or
-    // a return value. All output lands in the host log with the magisk-diag: prefix — the only
-    // channel that survives the reboot.
+    // Observation only: the probes run on their own threads beside the stage commands, every call is
+    // timeout-bounded and wrapped, and nothing here alters a stage command, a file or a return value.
+    // All output lands in the host log with the magisk-diag: prefix — the only channel that survives
+    // the reboot.
 
-    /** Kicks off the two probe threads: P0–P2 (foreground probes) and P3/P4 (survival sampling timed
-     * against the background start magiskStartDaemon is about to issue). Returns at once. */
+    /** Kicks off the two probe threads: P0 (exec-alive) followed by the P5 traced run at this seat, and
+     * P3/P4 (survival sampling timed against the post-fs-data stage that is about to run). Returns at once. */
     private fun magiskDiagStart() {
         val t0 = System.currentTimeMillis()
         Thread {
             runCatching {
                 val p0 = guestShell("/${MagiskCore.TMP}/magisk -c; echo rc=$?", 15_000).trim().replace('\n', ' ')
                 log("magisk-diag: P0 exec-alive -> ${p0.take(600)}")
-                val p1 = guestShell("/${MagiskCore.TMP}/magisk --path; echo rc=$?", 15_000).trim().replace('\n', ' ')
-                log("magisk-diag: P1 binary tmpfs path -> ${p1.take(600)}")
-                val t2 = System.currentTimeMillis()
-                val p2 = guestShell("/${MagiskCore.TMP}/magisk --daemon; echo rc=$?", 8_000).trim().replace('\n', ' ')
-                log("magisk-diag: P2 foreground --daemon returned after ${System.currentTimeMillis() - t2} ms -> ${p2.take(600)}")
                 magiskDiagTraced("post-fs-data")
-            }.onFailure { log("magisk-diag: P0-P2 probes failed: ${it.message}") }
+            }.onFailure { log("magisk-diag: P0 probe failed: ${it.message}") }
         }.start()
         Thread {
             runCatching {
@@ -1851,17 +1849,23 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }.start()
     }
 
-    /** One P3/P4 sample: every process whose cmdline mentions magisk (pid, state, ppid — the sampler
-     * and its fellow diag shells excluded by the markers their own cmdlines carry), the socket
+    /** One P3/P4 sample: every process whose comm or cmdline mentions magisk (pid, state, ppid — the
+     * sampler and its fellow diag shells excluded by the markers their own cmdlines carry), the socket
      * directory, and the P4 fall-out points (a magisk.log.bak rotation shows the daemon reached
      * its logging stage; anything beside the socket in device/ marks how far the start got).
-     * The census enumerates /proc with ls and a numeric case filter: the first field run's
-     * /proc/[0-9]* glob silently expanded to nothing in the guest sh, so all three samples
-     * listed only the directories below and no process at all. */
+     * The census enumerates /proc with ls and a numeric case filter (the guest sh's /proc/[0-9]*
+     * glob silently expanded to nothing in the first field run), reads cmdline through a cat pipe
+     * instead of a redirection into tr, and falls back to /proc/<pid>/comm — the daemon renames
+     * itself "magiskd", which comm keeps even where cmdline reads empty. Every sample ends with
+     * its scan count, so a census that ran and matched nothing is distinguishable from one that
+     * never ran: the #107 field log carried only the directory sections below, with no way to
+     * tell whether the loop above them had executed at all. */
     private fun magiskDiagSample(label: String, t0: Long) {
-        val cmd = "for p in \$(ls /proc 2>/dev/null); do case \"\$p\" in ''|*[!0-9]*) continue;; esac; " +
-            "c=\$(tr '\\0' ' ' < /proc/\$p/cmdline 2>/dev/null); case \"\$c\" in *MDIAGP3*|*\"export PATH\"*) continue;; *magisk*) " +
-            "echo \"proc \$p: \$c | \$(grep '^State:' /proc/\$p/status 2>/dev/null) | \$(grep '^PPid:' /proc/\$p/status 2>/dev/null)\";; esac; done; " +
+        val cmd = "n=0; m=0; for p in \$(ls /proc 2>/dev/null); do case \"\$p\" in ''|*[!0-9]*) continue;; esac; n=\$((n+1)); " +
+            "cm=\$(cat /proc/\$p/comm 2>/dev/null); c=\$(cat /proc/\$p/cmdline 2>/dev/null | tr '\\0' ' '); " +
+            "case \"\$c\" in *MDIAGP3*|*\"export PATH\"*) continue;; esac; " +
+            "case \"\$cm|\$c\" in *magisk*) m=\$((m+1)); echo \"proc \$p: comm=\$cm | \$c | \$(grep '^State:' /proc/\$p/status 2>/dev/null) | \$(grep '^PPid:' /proc/\$p/status 2>/dev/null)\";; esac; done; " +
+            "echo \"census: scanned \$n pids, matched \$m (sampler pid \$\$, comm \$(cat /proc/\$\$/comm 2>/dev/null))\"; " +
             "echo device:; ls -la /${MagiskCore.TMP}/.magisk/device/ 2>&1; " +
             "echo cache:; ls -la /cache/magisk.log* 2>&1; " +
             "echo magiskdir:; ls -la /${MagiskCore.TMP}/.magisk/ 2>&1"
@@ -1870,14 +1874,15 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     }
 
     /** P5 of the diag design — the conditional strace, run unconditionally at both daemon start
-     * points (post-fs-data and, in the P6 seat, boot-complete): the first field run already put
-     * the daemon in P2(c)/P3's "alive but stuck" cell, so the condition is met before the run
-     * starts. One foreground --daemon attempt over a shell channel that alone carries
-     * AEMU64_MTRACE: the daemon's own supervisor instance (run64, api 23) then prints every
-     * trapped call it mediates as magisk-trace: lines on its stderr — this call's pipe. A second
-     * start while a daemon already lives answers and exits at once, so the attempt is harmless
-     * in the live case. The harvest mirrors the tail into the host log: the parked call is an
-     * entry line with no "= result" after it, at the end. */
+     * points (post-fs-data and boot-complete): the first field run already put the daemon in
+     * P2(c)/P3's "alive but stuck" cell, so the condition is met before the run starts. One
+     * foreground --daemon attempt over a shell channel that alone carries AEMU64_MTRACE: the
+     * daemon's own supervisor instance (run64, api 23) then prints every trapped call it mediates
+     * as magisk-trace: lines on its stderr — this call's pipe. A second start while a daemon
+     * already lives answers and exits at once, so the attempt is harmless in the live case. The
+     * harvest mirrors the whole trace into the host log (head + tail past 800 lines): the parked
+     * call is an entry line with no "= result" after it, and the daemon child's first steps —
+     * lost when only the tail was kept — are at the head. */
     private fun magiskDiagTraced(label: String) {
         runCatching {
             val t5 = System.currentTimeMillis()
@@ -1892,17 +1897,25 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 "${trace.size} trace lines; other output: ${other.take(300)}")
             if (trace.isEmpty()) {
                 log("magisk-diag: P5 ($label): no magisk-trace lines captured — the trace was not armed for this process, or it made no trapped call")
+            } else if (trace.size <= 800) {
+                log("magisk-diag: P5 ($label): all ${trace.size} trace lines follow")
+                for (l in trace) log(l.take(300))
             } else {
-                val tail = trace.takeLast(200)
-                if (tail.size < trace.size) log("magisk-diag: P5 ($label): the last ${tail.size} of ${trace.size} trace lines follow")
+                val head = trace.take(400); val tail = trace.takeLast(400)
+                log("magisk-diag: P5 ($label): the first ${head.size} of ${trace.size} trace lines follow")
+                for (l in head) log(l.take(300))
+                log("magisk-diag: P5 ($label): … ${trace.size - head.size - tail.size} trace lines omitted …")
+                log("magisk-diag: P5 ($label): the last ${tail.size} of ${trace.size} trace lines follow")
                 for (l in tail) log(l.take(300))
             }
         }.onFailure { log("magisk-diag: P5 traced run ($label) failed: ${it.message}") }
     }
 
-    /** Before the first service: the stand-in tmpfs and the su links, the daemon itself (magiskinit's job on a
-     * phone), "magisk --post-fs-data" (merges module updates, runs post-fs-data scripts), then the modules' files
-     * are copied into the tree. Never fails the boot. */
+    /** Before the first service: the stand-in tmpfs and the su links, then "magisk --post-fs-data" (merges
+     * module updates, runs post-fs-data scripts). In the official flow this stage client is also what
+     * creates the daemon — connect_daemon(create=true) forks it as a side effect, and no separate
+     * --daemon start exists — so this stage does the same and only watches for the socket. Then the
+     * modules' files are copied into the tree. Never fails the boot. */
     private fun magiskPostFsData() {
         runCatching {
             if (!magiskOn) {
@@ -1914,7 +1927,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             MagiskCore.prepareTmp(paths.root)
             MagiskCore.linkSystem(paths.root, ::log)
             if (MAGISK_DIAG) magiskDiagStart()
-            magiskStartDaemon()
+            magiskSocketWatch()
             log("magisk: post-fs-data -> ${magiskExec("--post-fs-data", 45_000)}")
             MagiskCore.unlockTmp(paths.root)    // its magic mount leaves directories at mode 000
             val version = guestShell("/${MagiskCore.TMP}/magisk -v; /${MagiskCore.TMP}/magisk -V", 15_000).trim().replace('\n', ' ')
@@ -1986,15 +1999,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 MagiskCore.unlockTmp(paths.root)
                 magiskManagerSetup()
             }
-            if (on && MAGISK_DIAG) {
-                // P6 of the diag design: at boot-complete logd is up, so a daemon that dies now has
-                // somewhere to leave its words (logcat). Re-issue the #103 start in its original
-                // shape; if it lives here, the early-boot environment was the wall.
-                log("magisk-diag: P6 late restart at boot-complete (logd is up)")
-                magiskStartDaemon()
-                log("magisk-diag: P6 late restart done; /cache/magisk.log: ${magiskLogTail()}")
-                magiskDiagTraced("boot-complete")
-            }
+            if (on && MAGISK_DIAG) magiskDiagTraced("boot-complete")
         }.onFailure { log("magisk: boot-complete stage failed: ${it.message}") }
     }
 
