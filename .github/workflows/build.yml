@@ -111,6 +111,18 @@ jobs:
         with:
           name: aemu-magisk-sub-apk
           path: app/src/main/assets/engines/kk/aemu-magisk-sub.apk
+      - name: Build guest Zygisk spike stack
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          sh app/guest-zygisk/build.sh
+          sha256sum app/src/main/assets/engines/kk/aemu-azygisk.so app/src/main/assets/engines/kk/aemu-zygisk-testmod.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aemu-zygisk-assets
+          path: |
+            app/src/main/assets/engines/kk/aemu-azygisk.so
+            app/src/main/assets/engines/kk/aemu-zygisk-testmod.so
       - name: Build guest terminal app from source
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
