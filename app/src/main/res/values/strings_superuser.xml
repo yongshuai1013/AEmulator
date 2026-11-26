@@ -2,7 +2,7 @@
 <!-- AEmulator: classic su root (SuperuserSupport.kt). English only for now; untranslated locales fall back to these. -->
 <resources>
     <string name="vm_superuser_title">Root (Superuser)</string>
-    <string name="vm_superuser_sub">Plants su and the Superuser manager app (koush\'s, built from source with this app): an app that runs su is asked by the manager, and an allowed app gets a root shell. Independent of Magisk. Applies at the next full boot. Native-engine (64-bit) guests. Experimental.</string>
-    <string name="vm_superuser_sub_unsupported">Plants su and the Superuser manager app (koush\'s, built from source with this app), gated by the supervisor\'s exec elevation point. Independent of Magisk.</string>
+    <string name="vm_superuser_sub">Plants su and the Superuser manager app (koush\'s, built from source with this app): an app that runs su is asked by the manager, and an allowed app gets a root shell. Applies at the next full boot. Native-engine (64-bit) guests. Experimental.</string>
+    <string name="vm_superuser_sub_unsupported">Plants su and the Superuser manager app (koush\'s, built from source with this app), gated by the supervisor\'s exec elevation point.</string>
     <string name="vm_superuser_unsupported">Not supported on 32-bit guests yet</string>
 </resources>
