@@ -1527,6 +1527,16 @@ static void daemon_entry(void) {
     }
     chmod(spath, 0666);
     listen(srv, 32);
+    /* The pidfile is written only once the socket is actually listening: it is how the
+     * host's liveness probe names the resident daemon, and later tells "never started"
+     * from "started and died" (a pidfile whose pid is gone). */
+    {
+        char pidpath[PATH_MAX];
+        snprintf(pidpath, sizeof(pidpath), "%s/.magisk/device/daemon.pid", magisk_tmp());
+        FILE *pf = fopen(pidpath, "w");
+        if (pf) { fprintf(pf, "%d\n", getpid()); fclose(pf); }
+    }
+    slog("daemon resident: pid %d, listening on %s", getpid(), spath);
     for (;;) {
         int c = accept4(srv, NULL, NULL, SOCK_CLOEXEC);
         if (c < 0) {
@@ -1580,6 +1590,7 @@ static int connect_daemon(int code) {
     int refused = 0;
     int fd = connect_once(code, &refused);
     if (fd >= 0 || refused) return fd;
+    char spawn_note[128] = "";
     if (getuid() == 0) {
         pid_t pid = fork();
         if (pid == 0) {
@@ -1595,10 +1606,17 @@ static int connect_daemon(int code) {
             while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
             fd = connect_once(code, &refused);
             if (fd >= 0 || refused) return fd;
+            /* The spawn's own fate is part of the diagnosis: an exec that never lands
+             * (status 127) and a spawner killed mid-start look identical from here
+             * without it, and the spawner itself cannot say — its stdio is /dev/null. */
+            if (WIFSIGNALED(status))
+                snprintf(spawn_note, sizeof(spawn_note), "; daemon spawn killed by signal %d", WTERMSIG(status));
+            else if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+                snprintf(spawn_note, sizeof(spawn_note), "; daemon spawn exited with status %d", WEXITSTATUS(status));
         }
     }
-    fprintf(stderr, "Cannot connect to daemon: %s (os error %d)\n",
-            strerror(g_connect_errno), g_connect_errno);
+    fprintf(stderr, "Cannot connect to daemon: %s (os error %d)%s\n",
+            strerror(g_connect_errno), g_connect_errno, spawn_note);
     return -1;
 }
 
@@ -1736,10 +1754,18 @@ static int install_module_cli(const char *zip) {
 }
 
 /* --daemon: when a daemon already answers, this is the START_DAEMON request; when none does,
- * the host's stage flow expects this command to be what brings it up (design 3.2). */
+ * the host's stage flow expects this command to be what brings it up (design 3.2). The
+ * already-running check is a plain probe, never connect_daemon: that path's create=true
+ * answers a failed probe by exec'ing another --daemon, whose own check would exec yet
+ * another — as root the chain only ends where fork starts failing, and every level that
+ * gave up on the probe forks a daemon of its own to fight over the socket. The first
+ * field run never got a daemon at all: the chain outlived the seat that started it and
+ * the whole tree was torn down with the seat's shell, socket never created. */
 static int daemon_cli(void) {
-    int fd = connect_daemon(REQ_START_DAEMON);
+    int refused = 0;
+    int fd = connect_once(REQ_START_DAEMON, &refused);
     if (fd >= 0) { close(fd); return 0; }
+    if (refused) return 1;
     pid_t pid = fork();
     if (pid < 0) return 1;
     if (pid == 0) {
