@@ -34,28 +34,6 @@ private val NETD_STRACE = true
  * build without it. */
 private val ACORE_STRACE = true
 
-/** TEMPORARY diagnostic build (magisk-daemon-diag-desk.md; slimmed by the magisk-shape batch):
- * probes around the stage commands, so the daemon's silent failure has to name itself — P0 proves
- * the binary execs, P3/P4 sample /proc and the fall-out points while the post-fs-data stage runs,
- * P5 re-runs --daemon in the foreground with the supervisor's own trap trace armed for that one
- * shell channel (AEMU64_MTRACE, run64 api 23), at both start points (post-fs-data and
- * boot-complete), so the call it parks in names itself in the host log. The harvest keeps the
- * whole trace (head + tail when it exceeds 800 lines): the first version kept only the tail and
- * lost the daemon child's first steps with it. P1/P2 are gone (P2 duplicated P5's foreground
- * attempt, without the trace) and so is P6, which re-issued at boot-complete a background
- * --daemon start the official flow does not have. P3's census is taken on the host (see
- * hostProcCensus): a guest-side "ls /proc" lists the image's own static /proc directory — the
- * supervisor's path translation prefers the image's files for /proc paths, and that directory
- * holds no pid entries at all — so the #109 census scanned 0 pids while every /proc/<pid> file
- * it read directly (which fall through to the phone's /proc) worked. The measurement batch also
- * widens the supervisor's trap trace for the daemon's lineage (install_filter_mtrace in run64)
- * to the calls a process parks or dies by, and dumps the surviving magisk processes' /proc
- * state at the socket watch's timeout (magiskStateDump).
- * Observation only: own threads, bounded timeouts, fail-open, no behaviour path touched. On in
- * this build (the field phone cannot flip it); remove the constant and every MAGISK_DIAG block
- * once the verdict is in. */
-private val MAGISK_DIAG = true
-
 /** Native arm64 engine: vendor daemons that only poll hardware the phone does not have (modem, DSP, TrustZone). */
 private val N64_SKIP = setOf("audiod", "ATFWD-daemon", "imsqmidaemon", "loc_launcher", "cnd", "dpmd", "cnss-daemon",
     "tftp_server", "qcom-system-daemon", "hvdcp_opti", "pm-service", "mtd", "mlipayd", "vsimd", "fdpp", "perfd", "ipacm",
@@ -594,19 +572,6 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }
         // своя панель кнопок у нас — экранную панель гостя (4.x) прячем, чтобы не дублировать
         overrides["qemu.hw.mainkeys"] = if (s.showNavBar && !(engine == Engine.N64 && kernel.navBarRequired)) "1" else "0"
-        // offline module host (ModuleHost): the system.prop of every enabled module, merged here —
-        // after the firmware's own values, under the engine's (a key the engine or a setting has
-        // already claimed is kept, never taken over by a module) and under props.extra below
-        if (engine == Engine.N64) {
-            val store = File(paths.dir, "modhost")
-            if (ModuleHost.hasStore(store)) {
-                var applied = 0; var kept = 0
-                for ((k, v) in ModuleHost.systemProps(store)) {
-                    if (k in overrides) kept++ else { overrides[k] = v; applied++ }
-                }
-                if (applied + kept > 0) log("modhost: system.prop merged: $applied applied, $kept kept as the engine/settings had them")
-            }
-        }
         // отладка: run/props.extra — строки ключ=значение поверх всего остального
         File(paths.bin, "props.extra").takeIf { it.isFile }?.readLines()?.forEach { l ->
             val k = l.substringBefore('=').trim()
@@ -792,10 +757,6 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             agentOn = settings.agent && agentSupported
             AgentSupport.write(paths.root, settings, ::log)
         }
-        // Magisk (VmSettings.magisk): init's post-fs-data stage, run by the host before the first service starts
-        if (!stopping) magiskPostFsData()
-        // the offline module host's post-fs-data scripts, at the same stage, independent of Magisk
-        if (!stopping) modHostPostFsData()
         var glDone = false
         // (debugging, see Kernel64.syncLog: only the first N services are started, then the guest is left as it is)
         val stopAfter = if (engine == Engine.N64 && kernel.syncLog) runCatching { File(paths.root, "dev/.aemu-stop-after").readText().trim().toInt() }.getOrNull() else null
@@ -890,8 +851,6 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }
         if (!glDone) glUp()
         log("system started: ${alive().joinToString()}")
-        magiskService()
-        modHostService()
         watchdog()
     }
 
@@ -1291,7 +1250,6 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             // survived the boot (owners-key-measure Q2-f)
             TreeFixer(ctx, paths, img, ::log).dumpModes("booted")
             setState(State.RUNNING)
-            Thread { magiskBootComplete() }.start()
             Thread { agentBootComplete() }.start()
             Thread { afterBoot() }.start()
             mirrorTombstones()
@@ -1653,8 +1611,6 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             synchronized(procs) { procs.remove("healthd") }?.let { runCatching { it.destroyForcibly() } }
             runCatching { startService(h) }
         }
-        // Zygisk: the daemon counts zygote restarts and takes itself out of the zygote after 3 crashes (init's "onrestart exec magisk --zygote-restart")
-        if (magiskOn) runCatching { log("magisk: zygote-restart -> ${magiskExec("--zygote-restart", 10_000)}") }
         runCatching { startService(z) }
         img.services.firstOrNull { it.name == "zygote_secondary" }?.let { z2 ->
             synchronized(procs) { procs.remove("zygote_secondary") }?.let { runCatching { it.destroyForcibly() } }
@@ -1810,343 +1766,15 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     }
 
     /**
-     * The Root Manager in the guest changed the hide list: the running daemon's denylist follows through
-     * its own CLI (the same channel the boot path uses). With Magisk off there is no daemon to tell —
-     * the guest's list file is applied by the boot path instead, and the bridge reports that as deferred,
-     * not as done.
+     * The Root Manager in the guest changed the hide list: the guest's own list file is what the
+     * per-app views read, and it is applied by the boot path — there is no daemon to tell while the
+     * system runs, so the bridge reports the change as deferred, not as done.
      */
-    private fun agentDeny(pkg: String, on: Boolean): AgentBridge.DenyAnswer {
-        if (!magiskOn) return AgentBridge.DenyAnswer(false, "Magisk is off; the guest's list applies at the next boot")
-        val out = magiskExec("--denylist ${if (on) "add" else "remove"} $pkg", 30_000)
-        return AgentBridge.DenyAnswer(true, out.ifBlank { "the daemon answered nothing" })
-    }
-
-    // ---- Magisk (VmSettings.magisk, see MagiskCore): the host plays the part of init's boot stages ----------------
-
-    private val magiskOn: Boolean get() =
-        settings.magisk && engine == Engine.N64 && !recoveryMode &&
-            MagiskCore.info(paths.root) != null && MagiskCore.hasArm64Userland(paths.root)
-
-    /** Runs a magisk command the way init's "exec" would, without letting the daemon it may start keep our pipe open. */
-    private fun magiskExec(args: String, timeoutMs: Long): String =
-        guestShell("/${MagiskCore.TMP}/magisk $args </dev/null >/dev/null 2>&1; echo exit=$?", timeoutMs).trim()
-
-    private fun magiskLogTail(): String =
-        runCatching { File(paths.root, "cache/magisk.log").readLines().takeLast(12).joinToString(" | ") }.getOrDefault("")
-
-    /** Watches for the daemon's socket from the moment the post-fs-data stage starts. There is no separate
-     * daemon start any more: in the official flow the daemon is created by the post-fs-data stage client
-     * itself (connect_daemon with create=true, core/daemon.rs of the pinned Magisk), so the socket's first
-     * appearance — or its absence after 30 s — is that stage's verdict, timestamped here. Observation only. */
-    private fun magiskSocketWatch() {
-        val socket = File(paths.root, "${MagiskCore.TMP}/.magisk/device/socket")
-        val t0 = System.currentTimeMillis()
-        Thread {
-            while (System.currentTimeMillis() - t0 < 30_000) {
-                if (socket.exists()) { log("magisk: daemon socket appeared at +${System.currentTimeMillis() - t0} ms after the post-fs-data stage started"); return@Thread }
-                Thread.sleep(200)
-            }
-            log("magisk: daemon socket did not appear within 30 s of the post-fs-data stage; /cache/magisk.log: ${magiskLogTail()}")
-            magiskStateDump()
-        }.start()
-    }
-
-    /** One process of the phone's /proc whose comm or cmdline names the magisk lineage. */
-    private data class MagiskProc(val pid: Int, val comm: String, val cmdline: String)
-
-    /** The process census, taken on the host and shared by the P3/P4 samples and the socket
-     * watch's state dump. A guest-side enumeration cannot work: the supervisor's path
-     * translation prefers the image's own files for /proc paths, so a guest "ls /proc" opens
-     * the image's static /proc directory — a mount-point directory that holds no pid entries
-     * at all — while /proc/<pid>/comm and friends, absent from the image, fall through to the
-     * phone's real /proc and read fine. That asymmetry is the #109 census's scanned 0: the
-     * listing was real, the directory it listed was the wrong one. Guest processes are this
-     * app's own children on the host, under the same pids the guest sees (there is no pid
-     * namespace between the two views), so the census belongs here: enumerate the phone's
-     * /proc, read comm and cmdline per pid, match the lineage on either. Returns the number
-     * of pid directories seen and the matches, in pid order. */
-    private fun hostProcCensus(): Pair<Int, List<MagiskProc>> {
-        var scanned = 0
-        val matched = mutableListOf<MagiskProc>()
-        val dirs = runCatching { File("/proc").listFiles() }.getOrNull().orEmpty()
-        for (d in dirs) {
-            val pid = d.name.toIntOrNull() ?: continue
-            scanned++
-            val comm = runCatching { File(d, "comm").readText().trim() }.getOrDefault("")
-            val cmdline = runCatching {
-                String(File(d, "cmdline").readBytes(), Charsets.ISO_8859_1).replace('\u0000', ' ').trim()
-            }.getOrDefault("")
-            if (comm.contains("magisk") || cmdline.contains("magisk")) matched += MagiskProc(pid, comm, cmdline)
-        }
-        return scanned to matched.sortedBy { it.pid }
-    }
-
-    /** A directory's entries as one line of "name (size)" / "name/" items — the host-side form
-     * of the fall-out listings the guest-shell samples used to print with ls. */
-    private fun hostLs(dir: File, filter: String? = null): String {
-        val items = runCatching {
-            dir.listFiles()?.filter { filter == null || it.name.startsWith(filter) }?.sortedBy { it.name }
-        }.getOrNull()
-        if (items == null) return "(unreadable: ${dir.path})"
-        if (items.isEmpty()) return "(empty)"
-        return items.joinToString(" ") { if (it.isDirectory) "${it.name}/" else "${it.name} (${it.length()})" }
-    }
-
-    /** The socket watch's timeout verdict, one level down (magisk-state: lines): every
-     * magisk-lineage process still on the phone, with the status lines that say how it waits
-     * (State, SigBlk, SigCgt), the /proc/<pid>/syscall line that names the call it is parked
-     * in — the measurement's main quarry — and its wchan when it has one. A field that cannot
-     * be read says so in its line; a census that finds nothing prints the none-found line.
-     * Host-side for the same reason as the census. */
-    private fun magiskStateDump() {
-        runCatching {
-            val (scanned, matched) = hostProcCensus()
-            if (matched.isEmpty()) {
-                log("magisk-state: none found (scanned $scanned pids)")
-                return
-            }
-            log("magisk-state: ${matched.size} magisk-lineage process(es) at the socket timeout (scanned $scanned pids)")
-            for (p in matched) {
-                val dir = File("/proc/${p.pid}")
-                log("magisk-state: pid ${p.pid} comm=${p.comm} | ${p.cmdline.take(160)}")
-                val status = runCatching { File(dir, "status").readLines() }.getOrDefault(emptyList())
-                for (l in status) if (l.startsWith("State:") || l.startsWith("SigBlk:") || l.startsWith("SigCgt:"))
-                    log("magisk-state: pid ${p.pid} ${l.trim()}")
-                val syscall = runCatching { File(dir, "syscall").readText().trim() }.getOrDefault("")
-                log("magisk-state: pid ${p.pid} syscall: ${syscall.ifEmpty { "<unreadable>" }}")
-                val wchan = runCatching { File(dir, "wchan").readText().trim() }.getOrDefault("")
-                if (wchan.isNotEmpty() && wchan != "0") log("magisk-state: pid ${p.pid} wchan: $wchan")
-            }
-        }.onFailure { log("magisk-state: dump failed: ${it.message}") }
-    }
-
-    // ---- TEMPORARY Magisk daemon diagnostic (MAGISK_DIAG; magisk-daemon-diag-desk.md) ----------------
-    // Observation only: the probes run on their own threads beside the stage commands, every call is
-    // timeout-bounded and wrapped, and nothing here alters a stage command, a file or a return value.
-    // All output lands in the host log with the magisk-diag: prefix — the only channel that survives
-    // the reboot.
-
-    /** Kicks off the two probe threads: P0 (exec-alive) followed by the P5 traced run at this seat, and
-     * P3/P4 (survival sampling timed against the post-fs-data stage that is about to run). Returns at once. */
-    private fun magiskDiagStart() {
-        val t0 = System.currentTimeMillis()
-        Thread {
-            runCatching {
-                val p0 = guestShell("/${MagiskCore.TMP}/magisk -c; echo rc=$?", 15_000).trim().replace('\n', ' ')
-                log("magisk-diag: P0 exec-alive -> ${p0.take(600)}")
-                magiskDiagTraced("post-fs-data")
-            }.onFailure { log("magisk-diag: P0 probe failed: ${it.message}") }
-        }.start()
-        Thread {
-            runCatching {
-                for ((label, atMs) in listOf("+0.5s" to 500L, "+2s" to 2_000L, "+10s" to 10_000L)) {
-                    val wait = t0 + atMs - System.currentTimeMillis()
-                    if (wait > 0) Thread.sleep(wait)
-                    magiskDiagSample(label, t0)
-                }
-                log("magisk-diag: P3/P4 sampling done, ${System.currentTimeMillis() - t0} ms after probe start")
-            }.onFailure { log("magisk-diag: P3/P4 sampling failed: ${it.message}") }
-        }.start()
-    }
-
-    /** One P3/P4 sample: every magisk-lineage process (pid, comm, cmdline, state, ppid — from the
-     * shared host census, see hostProcCensus for why the guest's own /proc listing cannot be
-     * used), the socket directory, and the P4 fall-out points (a magisk.log.bak rotation shows
-     * the daemon reached its logging stage; anything beside the socket in device/ marks how far
-     * the start got), the directory sections read on the host from the same tree the guest
-     * shell used to list. Every sample ends with its scan count, so a census that ran and
-     * matched nothing is distinguishable from one that never ran: the #107 field log carried
-     * only the directory sections, with no way to tell whether the loop above them had
-     * executed at all, and the #109 guest-shell version scanned a directory with no pids in it. */
-    private fun magiskDiagSample(label: String, t0: Long) {
-        val sb = StringBuilder()
-        val (scanned, matched) = hostProcCensus()
-        for (p in matched) {
-            val status = runCatching { File("/proc/${p.pid}/status").readLines() }.getOrDefault(emptyList())
-            val state = status.firstOrNull { it.startsWith("State:") }?.trim() ?: ""
-            val ppid = status.firstOrNull { it.startsWith("PPid:") }?.trim() ?: ""
-            sb.appendLine("proc ${p.pid}: comm=${p.comm} | ${p.cmdline.take(160)} | $state | $ppid")
-        }
-        sb.appendLine("census: scanned $scanned pids, matched ${matched.size} (host-side census)")
-        sb.appendLine("device:")
-        sb.appendLine(hostLs(File(paths.root, "${MagiskCore.TMP}/.magisk/device")))
-        sb.appendLine("cache:")
-        sb.appendLine(hostLs(File(paths.root, "cache"), "magisk.log"))
-        sb.appendLine("magiskdir:")
-        sb.appendLine(hostLs(File(paths.root, "${MagiskCore.TMP}/.magisk")))
-        log("magisk-diag: P3/P4 sample $label (at +${System.currentTimeMillis() - t0} ms):\n${sb.toString().trim()}")
-    }
-
-    /** P5 of the diag design — the conditional strace, run unconditionally at both daemon start
-     * points (post-fs-data and boot-complete): the first field run already put the daemon in
-     * P2(c)/P3's "alive but stuck" cell, so the condition is met before the run starts. One
-     * foreground --daemon attempt over a shell channel that alone carries AEMU64_MTRACE: the
-     * daemon's own supervisor instance (run64, api 23) then prints every trapped call it mediates
-     * as magisk-trace: lines on its stderr — this call's pipe. A second start while a daemon
-     * already lives answers and exits at once, so the attempt is harmless in the live case. The
-     * harvest mirrors the whole trace into the host log (head + tail past 800 lines): the parked
-     * call is an entry line with no "= result" after it, and the daemon child's first steps —
-     * lost when only the tail was kept — are at the head. */
-    private fun magiskDiagTraced(label: String) {
-        runCatching {
-            val t5 = System.currentTimeMillis()
-            val out = guestRunner.run(
-                listOf("/system/bin/sh", "-c", shellPrefix + "/${MagiskCore.TMP}/magisk --daemon; echo rc=$?"),
-                8_000, mapOf("AEMU64_MTRACE" to "1"),
-            ).second
-            val lines = out.lines()
-            val trace = lines.filter { it.contains("magisk-trace:") }
-            val other = lines.filter { it.isNotBlank() && !it.contains("magisk-trace:") }.joinToString(" ").trim()
-            log("magisk-diag: P5 traced --daemon ($label) returned after ${System.currentTimeMillis() - t5} ms: " +
-                "${trace.size} trace lines; other output: ${other.take(300)}")
-            if (trace.isEmpty()) {
-                log("magisk-diag: P5 ($label): no magisk-trace lines captured — the trace was not armed for this process, or it made no trapped call")
-            } else if (trace.size <= 800) {
-                log("magisk-diag: P5 ($label): all ${trace.size} trace lines follow")
-                for (l in trace) log(l.take(300))
-            } else {
-                val head = trace.take(400); val tail = trace.takeLast(400)
-                log("magisk-diag: P5 ($label): the first ${head.size} of ${trace.size} trace lines follow")
-                for (l in head) log(l.take(300))
-                log("magisk-diag: P5 ($label): … ${trace.size - head.size - tail.size} trace lines omitted …")
-                log("magisk-diag: P5 ($label): the last ${tail.size} of ${trace.size} trace lines follow")
-                for (l in tail) log(l.take(300))
-            }
-        }.onFailure { log("magisk-diag: P5 traced run ($label) failed: ${it.message}") }
-    }
-
-    /** Before the first service: the stand-in tmpfs and the su links, then "magisk --post-fs-data" (merges
-     * module updates, runs post-fs-data scripts). In the official flow this stage client is also what
-     * creates the daemon — connect_daemon(create=true) forks it as a side effect, and no separate
-     * --daemon start exists — so this stage does the same and only watches for the socket. Then the
-     * modules' files are copied into the tree. Never fails the boot. */
-    private fun magiskPostFsData() {
-        runCatching {
-            if (!magiskOn) {
-                // switched off or removed since the last boot: put the tree back
-                if (MagiskCore.leftovers(paths.root)) { MagiskCore.deactivate(paths.root, ::log); log("magisk: off, the tree is back to stock") }
-                return
-            }
-            MagiskCore.Overlay.revert(paths.root, ::log)
-            MagiskCore.prepareTmp(paths.root)
-            MagiskCore.linkSystem(paths.root, ::log)
-            if (MAGISK_DIAG) magiskDiagStart()
-            magiskSocketWatch()
-            log("magisk: post-fs-data -> ${magiskExec("--post-fs-data", 45_000)}")
-            MagiskCore.unlockTmp(paths.root)    // its magic mount leaves directories at mode 000
-            val version = guestShell("/${MagiskCore.TMP}/magisk -v; /${MagiskCore.TMP}/magisk -V", 15_000).trim().replace('\n', ' ')
-            log("magisk: daemon answers \"$version\"")
-            // the hide list (the guest's own file, AgentSupport.LIST_FILE — the Root Manager in the guest
-            // owns it) as the daemon's own denylist, beside the mount layer's per-app view: Zygisk then
-            // stays out of those apps. Through the daemon's CLI before the overlay places anything, every
-            // answer logged — a daemon that refuses shows up here, not as a success
-            val denyList = (AgentSupport.readHideList(paths.root) ?: emptyList()).filter { it != MagiskCore.PACKAGE }
-            if (denyList.isNotEmpty()) {
-                log("magisk: denylist enable -> ${magiskExec("--denylist enable", 30_000)}")
-                for (pkg in denyList) log("magisk: denylist add $pkg -> ${magiskExec("--denylist add $pkg", 30_000)}")
-            }
-            // Zygisk (docs/magisk.md): with it on in magisk.db the daemon's post-fs-data sets the native-bridge property to libzygisk.so;
-            // its magic mount is ignored by the shim, so Overlay.apply copies the magisk binary into /system/lib64 under that name
-            val zygiskLib = MagiskCore.zygiskLibName(guestShell("getprop ${MagiskCore.NATIVE_BRIDGE_PROP}", 15_000))
-            log(if (zygiskLib != null) "magisk: zygisk on ($zygiskLib)" else "magisk: zygisk off")
-            val n = MagiskCore.Overlay.apply(paths.root, zygiskLib, ::log)
-            if (n > 0) log("magisk: $n module file(s) copied into the system")
-            if (!version.any { it.isDigit() }) log("magisk: the daemon did not answer; /cache/magisk.log: ${magiskLogTail()}")
-        }.onFailure { log("magisk: post-fs-data stage failed: ${it.message}") }
-    }
-
-    // ---- offline module host (ModuleHost): the boot scripts of host-installed modules ----------------
-
-    /** Ids of the modules the offline host has enabled for this instance; empty for everyone else. */
-    private fun modHostEnabled(): List<String> =
-        if (engine != Engine.N64) emptyList()
-        else runCatching { ModuleHost.enabledIds(File(paths.dir, "modhost")) }.getOrDefault(emptyList())
-
-    /** The enabled modules' post-fs-data.sh, run at the post-fs-data stage next to Magisk's own. */
-    private fun modHostPostFsData() {
-        val ids = modHostEnabled()
-        if (ids.isEmpty()) return
-        runCatching {
-            for (id in ids) {
-                val rel = "${ModuleHost.MODULES_DIR}/$id/post-fs-data.sh"
-                if (!File(paths.root, rel).isFile) continue
-                val out = guestShell("MODDIR=/${ModuleHost.MODULES_DIR}/$id sh /$rel", 60_000).trim().replace('\n', ' ')
-                log("modhost: $id post-fs-data -> ${out.take(200)}")
-            }
-        }.onFailure { log("modhost: post-fs-data scripts failed: ${it.message}") }
-    }
-
-    /** The enabled modules' service.sh, run at the late_start seat next to Magisk's own service stage. */
-    private fun modHostService() {
-        val ids = modHostEnabled()
-        if (ids.isEmpty()) return
-        Thread {
-            runCatching {
-                for (id in ids) {
-                    val rel = "${ModuleHost.MODULES_DIR}/$id/service.sh"
-                    if (!File(paths.root, rel).isFile) continue
-                    val out = guestShell("MODDIR=/${ModuleHost.MODULES_DIR}/$id sh /$rel", 120_000).trim().replace('\n', ' ')
-                    log("modhost: $id service -> ${out.take(200)}")
-                }
-            }.onFailure { log("modhost: service scripts failed: ${it.message}") }
-        }.start()
-    }
-
-    /** init's late_start: service.d and the modules' service.sh. */
-    private fun magiskService() {
-        if (!magiskOn) return
-        Thread {
-            runCatching { log("magisk: service -> ${magiskExec("--service", 60_000)}"); MagiskCore.unlockTmp(paths.root); if (MagiskCore.fixDbMode(paths.root)) log("magisk: magisk.db was mode 000, gave the owner access") }
-                .onFailure { log("magisk: service stage failed: ${it.message}") }
-        }.start()
-    }
-
-    /** sys.boot_completed: boot-completed.d / the modules' boot-completed.sh, and the Magisk app if it is not installed yet. */
-    private fun magiskBootComplete() {
-        // The app install is queued by the import of the APK (MagiskCore.appInstallPending) and does not wait for Root to be on;
-        // the daemon's stage and the manager set-up only run with it.
-        if (engine != Engine.N64 || recoveryMode || MagiskCore.info(paths.root) == null || !MagiskCore.hasArm64Userland(paths.root)) return
-        val on = magiskOn
-        runCatching {
-            if (on) {
-                log("magisk: boot-complete -> ${magiskExec("--boot-complete", 60_000)}")
-                if (MagiskCore.fixDbMode(paths.root)) log("magisk: magisk.db was mode 000, gave the owner access")
-            }
-            val pending = MagiskCore.appInstallPending(paths.root)
-            val apk = File(paths.root, MagiskCore.APK_COPY)
-            if (pending || on) {
-                val have = guestShell("pm path ${MagiskCore.PACKAGE}", 60_000).contains("package:")
-                if (!apk.isFile) {
-                    if (pending) { MagiskCore.clearAppInstall(paths.root); log("magisk: queued app install dropped, the APK copy is gone") }
-                } else if (pending || !have) {
-                    val staged = File(paths.root, "data/local/tmp").apply { mkdirs() }.let { File(it, "aemu-magisk.apk") }
-                    java.nio.file.Files.copy(apk.toPath(), staged.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-                    staged.setReadable(true, false)
-                    // the queue entry goes as soon as the install has been called (whatever pm answered, even if the call threw):
-                    // it is a one-shot request, not retried at every boot
-                    try {
-                        val out = installApk("/data/local/tmp/aemu-magisk.apk").trim()
-                        log("magisk: app install${if (pending) " (queued by the import)" else ""} -> ${out.take(300)}")
-                    } finally {
-                        staged.delete()
-                        if (pending) {
-                            MagiskCore.clearAppInstall(paths.root)
-                            log("magisk: queued app install removed (${if (MagiskCore.appInstallPending(paths.root)) "STILL THERE" else "gone"})")
-                        }
-                    }
-                }
-            }
-            if (on) {
-                MagiskCore.unlockTmp(paths.root)
-                magiskManagerSetup()
-            }
-            if (on && MAGISK_DIAG) magiskDiagTraced("boot-complete")
-        }.onFailure { log("magisk: boot-complete stage failed: ${it.message}") }
-    }
+    private fun agentDeny(pkg: String, on: Boolean): AgentBridge.DenyAnswer =
+        AgentBridge.DenyAnswer(false, "the guest's list applies at the next boot")
 
     /**
-     * sys.boot_completed: the agent's inbox app (the AEmuImport list inside the guest). Installed the way
-     * the Magisk app is — staged through data/local/tmp, a plain tree directory the installer reads fine —
+     * sys.boot_completed: the agent's inbox app (the AEmuImport list inside the guest). Staged through data/local/tmp, a plain tree directory the installer reads fine —
      * when it is missing or its versionCode differs from the delivered copy (length alone is not the gate:
      * two builds can share a length — 1.3 and 1.4 both landed on 24,973 bytes — and a length-only gate
      * then skips the update forever; length is only the fallback for when a versionCode cannot be read).
@@ -2196,48 +1824,6 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 staged.delete()
             }
         }.onFailure { log("agent: boot-complete stage failed: ${it.message}") }
-    }
-
-    /**
-     * Makes the Magisk app recognisable as the manager, then proves that its su works.
-     *
-     * The daemon finds the manager by the owner of /data/user_de/0/<package> (not /data/data/<package>). The shim answers
-     * a stat with the owner the guest gave the file (a chown leaves it in an extended attribute) and with root for the
-     * rest, so a directory nobody chowned reads as uid 0 and the real app (10132 in the logs) is a stranger to the
-     * daemon: its su ended in "Accessed denied" (the check that ran right after boot showed it). Not verified on a device
-     * which of the two the user_de directory was; the steps below are safe either way and log what they found.
-     * So: copy the owner of the data directory onto the device-encrypted one, and test again. If su still answers
-     * "denied", write the app's uid into magisk.db as an allowed policy: the daemon reads that table whatever it
-     * thinks of the manager (a request from any other app still goes through the prompt, which needs the manager).
-     */
-    private fun magiskManagerSetup() {
-        val t = MagiskCore.TMP
-        val pkg = MagiskCore.PACKAGE
-        fun sh(cmd: String, ms: Long = 30_000) = guestShell(cmd, ms).trim().replace("\n", " | ")
-        val uid = sh("stat -c %u /data/data/$pkg").toIntOrNull()
-        if (uid == null || uid < 10000) { log("magisk: the app's uid is unknown (\"$uid\"): is $pkg installed?"); return }
-        val before = sh("stat -c %u /data/user_de/0/$pkg")
-        if (before != uid.toString()) {
-            log("magisk: /data/user_de/0/$pkg belongs to uid \"$before\", the manager is $uid: chown -> " +
-                sh("chown $uid:$uid /data/user_de/0/$pkg 2>&1; stat -c %u /data/user_de/0/$pkg"))
-        }
-        fun trySu() = sh("su $uid -c 'su -c id' 2>&1 | head -3")
-        var answer = trySu()
-        if (!answer.contains("uid=0")) {
-            // the daemon keeps what it learnt about a uid for a few seconds
-            Thread.sleep(3_500)
-            answer = trySu()
-        }
-        if (!answer.contains("uid=0")) {
-            log("magisk: su for uid $uid still answers \"$answer\": adding an allow policy for it (policy 2 = allow)")
-            sh("/$t/magisk --sqlite 'REPLACE INTO policies (uid,policy,until,logging,notification) VALUES($uid,2,0,1,1)'")
-            MagiskCore.fixDbMode(paths.root)
-            Thread.sleep(3_500)
-            answer = trySu()
-        }
-        log("magisk: check -> app-uid=$uid, db: " + sh("ls -ln /data/adb/magisk.db") +
-            " | policies: " + sh("/$t/magisk --sqlite 'select uid,policy from policies'") + " | su as the app: $answer")
-        if (!answer.contains("uid=0")) log("magisk: su still fails for the app; /cache/magisk.log: ${magiskLogTail()}")
     }
 
     private fun pidOf(p: Process): Int? {
