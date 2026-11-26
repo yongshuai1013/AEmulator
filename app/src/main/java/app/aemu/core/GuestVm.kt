@@ -1067,6 +1067,11 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         // verbatim as they arrive: they used to reach it only through NetdTrace's one-shot
         // digest, which closes a minute into the boot — long before any VPN session starts
         val nlMirror = name == "netd"
+        // the ptrace watcher's lines (aemu-watch:, and its crash blocks, which begin
+        // "aemu-crash: watcher") are printed by the zygote's supervisor to this service's own
+        // log; mirror them here like netd's, or a field run has to know to export zygote.log
+        // before it can tell whether the watcher was on post at all
+        val watchMirror = name == "zygote"
         Thread({
             if (!direct) runCatching {
                 OutputStreamWriter(FileOutputStream(log, true)).use { w ->
@@ -1075,6 +1080,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                         p.inputStream.bufferedReader().forEachLine {
                             w.write(it); w.write("\n"); w.flush()
                             if (nlMirror && (it.startsWith("aemu-nlreq:") || it.startsWith("aemu-nllink:"))) log(it)
+                            if (watchMirror && (it.startsWith("aemu-watch:") || it.startsWith("aemu-crash: watcher"))) log(it)
                         }
                     } else {
                         var rawLines = 0
@@ -1099,6 +1105,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                                 log(String.format(java.util.Locale.US, "installd-trace: [+%d.%03d] %s", el / 1000, el % 1000, line.take(300)))
                             }
                             if (nlMirror && (line.startsWith("aemu-nlreq:") || line.startsWith("aemu-nllink:"))) {
+                                log(line)
+                            }
+                            if (watchMirror && (line.startsWith("aemu-watch:") || line.startsWith("aemu-crash: watcher"))) {
                                 log(line)
                             }
                         }
