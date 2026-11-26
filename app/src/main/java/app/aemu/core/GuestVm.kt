@@ -594,6 +594,19 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }
         // своя панель кнопок у нас — экранную панель гостя (4.x) прячем, чтобы не дублировать
         overrides["qemu.hw.mainkeys"] = if (s.showNavBar && !(engine == Engine.N64 && kernel.navBarRequired)) "1" else "0"
+        // offline module host (ModuleHost): the system.prop of every enabled module, merged here —
+        // after the firmware's own values, under the engine's (a key the engine or a setting has
+        // already claimed is kept, never taken over by a module) and under props.extra below
+        if (engine == Engine.N64) {
+            val store = File(paths.dir, "modhost")
+            if (ModuleHost.hasStore(store)) {
+                var applied = 0; var kept = 0
+                for ((k, v) in ModuleHost.systemProps(store)) {
+                    if (k in overrides) kept++ else { overrides[k] = v; applied++ }
+                }
+                if (applied + kept > 0) log("modhost: system.prop merged: $applied applied, $kept kept as the engine/settings had them")
+            }
+        }
         // отладка: run/props.extra — строки ключ=значение поверх всего остального
         File(paths.bin, "props.extra").takeIf { it.isFile }?.readLines()?.forEach { l ->
             val k = l.substringBefore('=').trim()
@@ -781,6 +794,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }
         // Magisk (VmSettings.magisk): init's post-fs-data stage, run by the host before the first service starts
         if (!stopping) magiskPostFsData()
+        // the offline module host's post-fs-data scripts, at the same stage, independent of Magisk
+        if (!stopping) modHostPostFsData()
         var glDone = false
         // (debugging, see Kernel64.syncLog: only the first N services are started, then the guest is left as it is)
         val stopAfter = if (engine == Engine.N64 && kernel.syncLog) runCatching { File(paths.root, "dev/.aemu-stop-after").readText().trim().toInt() }.getOrNull() else null
@@ -876,6 +891,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         if (!glDone) glUp()
         log("system started: ${alive().joinToString()}")
         magiskService()
+        modHostService()
         watchdog()
     }
 
@@ -2037,6 +2053,43 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             if (n > 0) log("magisk: $n module file(s) copied into the system")
             if (!version.any { it.isDigit() }) log("magisk: the daemon did not answer; /cache/magisk.log: ${magiskLogTail()}")
         }.onFailure { log("magisk: post-fs-data stage failed: ${it.message}") }
+    }
+
+    // ---- offline module host (ModuleHost): the boot scripts of host-installed modules ----------------
+
+    /** Ids of the modules the offline host has enabled for this instance; empty for everyone else. */
+    private fun modHostEnabled(): List<String> =
+        if (engine != Engine.N64) emptyList()
+        else runCatching { ModuleHost.enabledIds(File(paths.dir, "modhost")) }.getOrDefault(emptyList())
+
+    /** The enabled modules' post-fs-data.sh, run at the post-fs-data stage next to Magisk's own. */
+    private fun modHostPostFsData() {
+        val ids = modHostEnabled()
+        if (ids.isEmpty()) return
+        runCatching {
+            for (id in ids) {
+                val rel = "${ModuleHost.MODULES_DIR}/$id/post-fs-data.sh"
+                if (!File(paths.root, rel).isFile) continue
+                val out = guestShell("MODDIR=/${ModuleHost.MODULES_DIR}/$id sh /$rel", 60_000).trim().replace('\n', ' ')
+                log("modhost: $id post-fs-data -> ${out.take(200)}")
+            }
+        }.onFailure { log("modhost: post-fs-data scripts failed: ${it.message}") }
+    }
+
+    /** The enabled modules' service.sh, run at the late_start seat next to Magisk's own service stage. */
+    private fun modHostService() {
+        val ids = modHostEnabled()
+        if (ids.isEmpty()) return
+        Thread {
+            runCatching {
+                for (id in ids) {
+                    val rel = "${ModuleHost.MODULES_DIR}/$id/service.sh"
+                    if (!File(paths.root, rel).isFile) continue
+                    val out = guestShell("MODDIR=/${ModuleHost.MODULES_DIR}/$id sh /$rel", 120_000).trim().replace('\n', ' ')
+                    log("modhost: $id service -> ${out.take(200)}")
+                }
+            }.onFailure { log("modhost: service scripts failed: ${it.message}") }
+        }.start()
     }
 
     /** init's late_start: service.d and the modules' service.sh. */
