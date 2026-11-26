@@ -34,11 +34,16 @@ private val NETD_STRACE = true
  * build without it. */
 private val ACORE_STRACE = true
 
-/** TEMPORARY diagnostic build (magisk-daemon-diag-desk.md): probes P0–P4/P6 around the unchanged
+/** TEMPORARY diagnostic build (magisk-daemon-diag-desk.md): probes P0–P5/P6 around the unchanged
  * daemon start of #103, so the daemon's silent exit has to name itself — P0 proves the binary
  * execs, P1 checks the binary's own tmpfs path against the one the socket poll watches, P2 runs
  * --daemon in the foreground with its output kept, P3/P4 sample /proc and the fall-out points
  * while the background start runs, P6 retries the start at boot-complete when logd is up.
+ * P5 (added once the first field run put the daemon in the "alive but stuck" cell) re-runs
+ * --daemon in the foreground with the supervisor's own trap trace armed for that one shell
+ * channel (AEMU64_MTRACE, run64 api 23), at both start points, so the call it parks in names
+ * itself in the host log. P3's census no longer trusts the guest sh's /proc glob — it silently
+ * matched nothing in the first field run — and enumerates /proc with ls instead.
  * Observation only: own threads, bounded timeouts, fail-open, no behaviour path touched; with
  * this off the file is #103 verbatim. On in this build (the field phone cannot flip it); remove
  * the constant and every MAGISK_DIAG block once the verdict is in. */
@@ -1831,6 +1836,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 val t2 = System.currentTimeMillis()
                 val p2 = guestShell("/${MagiskCore.TMP}/magisk --daemon; echo rc=$?", 8_000).trim().replace('\n', ' ')
                 log("magisk-diag: P2 foreground --daemon returned after ${System.currentTimeMillis() - t2} ms -> ${p2.take(600)}")
+                magiskDiagTraced("post-fs-data")
             }.onFailure { log("magisk-diag: P0-P2 probes failed: ${it.message}") }
         }.start()
         Thread {
@@ -1846,18 +1852,52 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     }
 
     /** One P3/P4 sample: every process whose cmdline mentions magisk (pid, state, ppid — the sampler
-     * itself excluded), the socket directory, and the P4 fall-out points (a magisk.log.bak rotation
-     * shows the daemon reached its logging stage; anything beside the socket in device/ marks how
-     * far the start got). */
+     * and its fellow diag shells excluded by the markers their own cmdlines carry), the socket
+     * directory, and the P4 fall-out points (a magisk.log.bak rotation shows the daemon reached
+     * its logging stage; anything beside the socket in device/ marks how far the start got).
+     * The census enumerates /proc with ls and a numeric case filter: the first field run's
+     * /proc/[0-9]* glob silently expanded to nothing in the guest sh, so all three samples
+     * listed only the directories below and no process at all. */
     private fun magiskDiagSample(label: String, t0: Long) {
-        val cmd = "self=\$\$; for d in /proc/[0-9]*; do p=\${d#/proc/}; [ \"\$p\" = \"\$self\" ] && continue; " +
-            "c=\$(tr '\\0' ' ' < \$d/cmdline 2>/dev/null); case \"\$c\" in *magisk*) " +
-            "echo \"proc \$p: \$c | \$(grep '^State:' \$d/status 2>/dev/null) | \$(grep '^PPid:' \$d/status 2>/dev/null)\";; esac; done; " +
+        val cmd = "for p in \$(ls /proc 2>/dev/null); do case \"\$p\" in ''|*[!0-9]*) continue;; esac; " +
+            "c=\$(tr '\\0' ' ' < /proc/\$p/cmdline 2>/dev/null); case \"\$c\" in *MDIAGP3*|*\"export PATH\"*) continue;; *magisk*) " +
+            "echo \"proc \$p: \$c | \$(grep '^State:' /proc/\$p/status 2>/dev/null) | \$(grep '^PPid:' /proc/\$p/status 2>/dev/null)\";; esac; done; " +
             "echo device:; ls -la /${MagiskCore.TMP}/.magisk/device/ 2>&1; " +
             "echo cache:; ls -la /cache/magisk.log* 2>&1; " +
             "echo magiskdir:; ls -la /${MagiskCore.TMP}/.magisk/ 2>&1"
         val out = runCatching { guestShell(cmd, 20_000).trim() }.getOrDefault("sample shell failed")
         log("magisk-diag: P3/P4 sample $label (at +${System.currentTimeMillis() - t0} ms):\n$out")
+    }
+
+    /** P5 of the diag design — the conditional strace, run unconditionally at both daemon start
+     * points (post-fs-data and, in the P6 seat, boot-complete): the first field run already put
+     * the daemon in P2(c)/P3's "alive but stuck" cell, so the condition is met before the run
+     * starts. One foreground --daemon attempt over a shell channel that alone carries
+     * AEMU64_MTRACE: the daemon's own supervisor instance (run64, api 23) then prints every
+     * trapped call it mediates as magisk-trace: lines on its stderr — this call's pipe. A second
+     * start while a daemon already lives answers and exits at once, so the attempt is harmless
+     * in the live case. The harvest mirrors the tail into the host log: the parked call is an
+     * entry line with no "= result" after it, at the end. */
+    private fun magiskDiagTraced(label: String) {
+        runCatching {
+            val t5 = System.currentTimeMillis()
+            val out = guestRunner.run(
+                listOf("/system/bin/sh", "-c", shellPrefix + "/${MagiskCore.TMP}/magisk --daemon; echo rc=$?"),
+                8_000, mapOf("AEMU64_MTRACE" to "1"),
+            ).second
+            val lines = out.lines()
+            val trace = lines.filter { it.contains("magisk-trace:") }
+            val other = lines.filter { it.isNotBlank() && !it.contains("magisk-trace:") }.joinToString(" ").trim()
+            log("magisk-diag: P5 traced --daemon ($label) returned after ${System.currentTimeMillis() - t5} ms: " +
+                "${trace.size} trace lines; other output: ${other.take(300)}")
+            if (trace.isEmpty()) {
+                log("magisk-diag: P5 ($label): no magisk-trace lines captured — the trace was not armed for this process, or it made no trapped call")
+            } else {
+                val tail = trace.takeLast(200)
+                if (tail.size < trace.size) log("magisk-diag: P5 ($label): the last ${tail.size} of ${trace.size} trace lines follow")
+                for (l in tail) log(l.take(300))
+            }
+        }.onFailure { log("magisk-diag: P5 traced run ($label) failed: ${it.message}") }
     }
 
     /** Before the first service: the stand-in tmpfs and the su links, the daemon itself (magiskinit's job on a
@@ -1953,6 +1993,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 log("magisk-diag: P6 late restart at boot-complete (logd is up)")
                 magiskStartDaemon()
                 log("magisk-diag: P6 late restart done; /cache/magisk.log: ${magiskLogTail()}")
+                magiskDiagTraced("boot-complete")
             }
         }.onFailure { log("magisk: boot-complete stage failed: ${it.message}") }
     }
