@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AEmulator: Magisk substitute (SubstituteSupport.kt). English only for now; untranslated locales fall back to these. -->
+<resources>
+    <string name="vm_magisksub_title">Root (Magisk substitute)</string>
+    <string name="vm_magisksub_sub">Our own daemon in the official Magisk app\'s clothes (30.7): su requests are decided by its magisk.db and asked through the Magisk app, modules are merged at boot, and the classic Superuser plant stays out while this is on. There is no mount or namespace work behind it: module system files are recorded, not overlaid, no sepolicy is loaded, and the app\'s Zygisk switch writes its setting with no effect. Applies at the next full boot. Native-engine Android 6.0 (arm64) guests. Experimental.</string>
+    <string name="vm_magisksub_sub_unsupported">Our own daemon in the official Magisk app\'s clothes (30.7): su policy and module stages, without mount or namespace work behind them.</string>
+    <string name="vm_magisksub_unsupported">Not supported on this guest yet</string>
+</resources>
