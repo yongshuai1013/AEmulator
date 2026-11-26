@@ -485,10 +485,15 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         val inp = FileInputStream(f.fd)
         val buf = ByteArray(65536)
         try {
+            var firstBytes = true
             while (f.open && s.alive) {
                 val n = inp.read(buf)
                 if (n < 0) break
                 if (n == 0) continue
+                if (firstBytes) {
+                    firstBytes = false
+                    log("aemu-vpn: flow ${f.id} first guest bytes: $n")
+                }
                 if (!conn.guestBytes(buf, 0, n)) break
             }
         } catch (_: Throwable) {
