@@ -1640,7 +1640,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         // the crash that brought us here left its tombstone in the tree; mirror it host-side
         mirrorTombstones(4_000)
         // the substitute daemon hears about the zygote restart like a real daemon would
-        if (substOn) Thread { runCatching { substExec("--zygote-restart", 30_000) } }.start()
+        if (substOn) Thread { runCatching { substStage("--zygote-restart", 30_000) } }.start()
     }
 
     private fun guestLogHas(text: String): Boolean = runCatching {
@@ -1809,16 +1809,57 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         guestShell("${SubstituteSupport.TMP}/magisk $args </dev/null", timeoutMs).trim()
 
     /**
+     * One substitute stage call. The stage CLIs are silent on success, so anything they do
+     * print is diagnostic — a failed daemon wake reports itself on stderr — and it goes to
+     * the host log instead of being dropped: the substitute's first field run failed with
+     * no trace anywhere precisely because this output was discarded at every seat.
+     */
+    private fun substStage(args: String, timeoutMs: Long = 60_000) {
+        val out = runCatching { substExec(args, timeoutMs) }.getOrElse { "error: ${it.message}" }
+        if (out.isNotBlank()) log("magisk-sub: $args -> ${out.take(400)}")
+    }
+
+    /** Lines of the daemon's own log already mirrored into the host log by [substMirrorDaemonLog]. */
+    private var substDaemonLogSeen = 0
+
+    /**
+     * Mirror the daemon's own log (its /cache/magisk.log, read straight from the guest
+     * tree) into the host log, only the lines not mirrored yet: the daemon's lifecycle —
+     * its start, its stage work, its own error lines, and the silence where it died —
+     * stays readable next to the seats that probed it.
+     */
+    private fun substMirrorDaemonLog() {
+        val f = File(paths.root, "cache/magisk.log")
+        if (!f.isFile) return
+        val lines = runCatching { f.readLines() }.getOrNull() ?: return
+        if (lines.size < substDaemonLogSeen) substDaemonLogSeen = 0
+        for (i in substDaemonLogSeen until lines.size) log("magisk-sub: daemon log: ${lines[i].take(300)}")
+        substDaemonLogSeen = lines.size
+    }
+
+    /**
      * The substitute's liveness, written for these seats: the daemon's socket file exists in
      * the guest and the daemon answers CHECK_VERSION. Both halves are logged either way, so
-     * the host log can tell a live substitute from a dead one at every stage.
+     * the host log can tell a live substitute from a dead one at every stage. A live verdict
+     * names the daemon's pid (its pidfile); a dead one asks the guest whether that pid is
+     * gone — "started and died" reads differently from "never started".
      */
     private fun substLiveness(after: String) {
+        substMirrorDaemonLog()
         val out = runCatching {
             guestShell("if [ -S ${SubstituteSupport.TMP}/.magisk/device/socket ]; then ${SubstituteSupport.TMP}/magisk -v; else echo no-socket; fi", 30_000)
         }.getOrElse { "error: ${it.message}" }.trim()
-        if (out.startsWith("30.7")) log("magisk-sub: daemon alive after $after (version $out)")
-        else log("magisk-sub: daemon NOT answering after $after ($out)")
+        val pidFile = "${SubstituteSupport.TMP}/.magisk/device/daemon.pid"
+        if (out.startsWith("30.7")) {
+            val pid = runCatching { guestShell("cat $pidFile", 15_000) }.getOrNull()?.trim()?.toIntOrNull()
+            log("magisk-sub: daemon alive after $after (version $out${pid?.let { ", pid $it" } ?: ""})")
+        } else {
+            log("magisk-sub: daemon NOT answering after $after ($out)")
+            val state = runCatching {
+                guestShell("p=\$(cat $pidFile 2>/dev/null); if [ -n \"\$p\" ]; then if [ -d /proc/\$p ]; then echo \"pid \$p exists but is not answering\"; else echo \"pid \$p gone\"; fi; fi", 15_000)
+            }.getOrNull()?.trim().orEmpty()
+            if (state.isNotEmpty()) log("magisk-sub: daemon state after $after: $state")
+        }
     }
 
     /**
@@ -1838,7 +1879,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                     "$t/.magisk/busybox/busybox --install -s $t/.magisk/busybox",
                 60_000)
             substLinkSystem()
-            substExec("--post-fs-data", 120_000)
+            substStage("--post-fs-data", 120_000)
             log("magisk-sub: post-fs-data seat done")
             substLiveness("post-fs-data")
         }.onFailure { log("magisk-sub: post-fs-data seat failed: ${it.message}") }
@@ -1865,7 +1906,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     /** The substitute's late_start seat, after the service plan is up. */
     private fun substLateStart() {
         runCatching {
-            substExec("--service")
+            substStage("--service")
             log("magisk-sub: late_start seat done")
             substLiveness("late_start")
         }.onFailure { log("magisk-sub: late_start seat failed: ${it.message}") }
@@ -1880,7 +1921,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     private fun substBootComplete() {
         if (!substOn) return
         runCatching {
-            substExec("--boot-complete")
+            substStage("--boot-complete")
             log("magisk-sub: boot-complete seat done")
             if (agentOn) {
                 val hide = AgentSupport.readHideList(paths.root)?.filter { it != SubstituteSupport.PACKAGE }
