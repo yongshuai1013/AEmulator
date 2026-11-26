@@ -43,9 +43,14 @@ private val ACORE_STRACE = true
  * whole trace (head + tail when it exceeds 800 lines): the first version kept only the tail and
  * lost the daemon child's first steps with it. P1/P2 are gone (P2 duplicated P5's foreground
  * attempt, without the trace) and so is P6, which re-issued at boot-complete a background
- * --daemon start the official flow does not have. P3's census enumerates /proc with ls, reads
- * comm as well as cmdline (the daemon's comm is "magiskd") and always prints its scan count,
- * after the first version's census silently matched nothing in the field.
+ * --daemon start the official flow does not have. P3's census is taken on the host (see
+ * hostProcCensus): a guest-side "ls /proc" lists the image's own static /proc directory — the
+ * supervisor's path translation prefers the image's files for /proc paths, and that directory
+ * holds no pid entries at all — so the #109 census scanned 0 pids while every /proc/<pid> file
+ * it read directly (which fall through to the phone's /proc) worked. The measurement batch also
+ * widens the supervisor's trap trace for the daemon's lineage (install_filter_mtrace in run64)
+ * to the calls a process parks or dies by, and dumps the surviving magisk processes' /proc
+ * state at the socket watch's timeout (magiskStateDump).
  * Observation only: own threads, bounded timeouts, fail-open, no behaviour path touched. On in
  * this build (the field phone cannot flip it); remove the constant and every MAGISK_DIAG block
  * once the verdict is in. */
@@ -1817,7 +1822,77 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 Thread.sleep(200)
             }
             log("magisk: daemon socket did not appear within 30 s of the post-fs-data stage; /cache/magisk.log: ${magiskLogTail()}")
+            magiskStateDump()
         }.start()
+    }
+
+    /** One process of the phone's /proc whose comm or cmdline names the magisk lineage. */
+    private data class MagiskProc(val pid: Int, val comm: String, val cmdline: String)
+
+    /** The process census, taken on the host and shared by the P3/P4 samples and the socket
+     * watch's state dump. A guest-side enumeration cannot work: the supervisor's path
+     * translation prefers the image's own files for /proc paths, so a guest "ls /proc" opens
+     * the image's static /proc directory — a mount-point directory that holds no pid entries
+     * at all — while /proc/<pid>/comm and friends, absent from the image, fall through to the
+     * phone's real /proc and read fine. That asymmetry is the #109 census's scanned 0: the
+     * listing was real, the directory it listed was the wrong one. Guest processes are this
+     * app's own children on the host, under the same pids the guest sees (there is no pid
+     * namespace between the two views), so the census belongs here: enumerate the phone's
+     * /proc, read comm and cmdline per pid, match the lineage on either. Returns the number
+     * of pid directories seen and the matches, in pid order. */
+    private fun hostProcCensus(): Pair<Int, List<MagiskProc>> {
+        var scanned = 0
+        val matched = mutableListOf<MagiskProc>()
+        val dirs = runCatching { File("/proc").listFiles() }.getOrNull().orEmpty()
+        for (d in dirs) {
+            val pid = d.name.toIntOrNull() ?: continue
+            scanned++
+            val comm = runCatching { File(d, "comm").readText().trim() }.getOrDefault("")
+            val cmdline = runCatching {
+                String(File(d, "cmdline").readBytes(), Charsets.ISO_8859_1).replace('\u0000', ' ').trim()
+            }.getOrDefault("")
+            if (comm.contains("magisk") || cmdline.contains("magisk")) matched += MagiskProc(pid, comm, cmdline)
+        }
+        return scanned to matched.sortedBy { it.pid }
+    }
+
+    /** A directory's entries as one line of "name (size)" / "name/" items — the host-side form
+     * of the fall-out listings the guest-shell samples used to print with ls. */
+    private fun hostLs(dir: File, filter: String? = null): String {
+        val items = runCatching {
+            dir.listFiles()?.filter { filter == null || it.name.startsWith(filter) }?.sortedBy { it.name }
+        }.getOrNull()
+        if (items == null) return "(unreadable: ${dir.path})"
+        if (items.isEmpty()) return "(empty)"
+        return items.joinToString(" ") { if (it.isDirectory) "${it.name}/" else "${it.name} (${it.length()})" }
+    }
+
+    /** The socket watch's timeout verdict, one level down (magisk-state: lines): every
+     * magisk-lineage process still on the phone, with the status lines that say how it waits
+     * (State, SigBlk, SigCgt), the /proc/<pid>/syscall line that names the call it is parked
+     * in — the measurement's main quarry — and its wchan when it has one. A field that cannot
+     * be read says so in its line; a census that finds nothing prints the none-found line.
+     * Host-side for the same reason as the census. */
+    private fun magiskStateDump() {
+        runCatching {
+            val (scanned, matched) = hostProcCensus()
+            if (matched.isEmpty()) {
+                log("magisk-state: none found (scanned $scanned pids)")
+                return
+            }
+            log("magisk-state: ${matched.size} magisk-lineage process(es) at the socket timeout (scanned $scanned pids)")
+            for (p in matched) {
+                val dir = File("/proc/${p.pid}")
+                log("magisk-state: pid ${p.pid} comm=${p.comm} | ${p.cmdline.take(160)}")
+                val status = runCatching { File(dir, "status").readLines() }.getOrDefault(emptyList())
+                for (l in status) if (l.startsWith("State:") || l.startsWith("SigBlk:") || l.startsWith("SigCgt:"))
+                    log("magisk-state: pid ${p.pid} ${l.trim()}")
+                val syscall = runCatching { File(dir, "syscall").readText().trim() }.getOrDefault("")
+                log("magisk-state: pid ${p.pid} syscall: ${syscall.ifEmpty { "<unreadable>" }}")
+                val wchan = runCatching { File(dir, "wchan").readText().trim() }.getOrDefault("")
+                if (wchan.isNotEmpty() && wchan != "0") log("magisk-state: pid ${p.pid} wchan: $wchan")
+            }
+        }.onFailure { log("magisk-state: dump failed: ${it.message}") }
     }
 
     // ---- TEMPORARY Magisk daemon diagnostic (MAGISK_DIAG; magisk-daemon-diag-desk.md) ----------------
@@ -1849,28 +1924,32 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }.start()
     }
 
-    /** One P3/P4 sample: every process whose comm or cmdline mentions magisk (pid, state, ppid — the
-     * sampler and its fellow diag shells excluded by the markers their own cmdlines carry), the socket
-     * directory, and the P4 fall-out points (a magisk.log.bak rotation shows the daemon reached
-     * its logging stage; anything beside the socket in device/ marks how far the start got).
-     * The census enumerates /proc with ls and a numeric case filter (the guest sh's /proc/[0-9]*
-     * glob silently expanded to nothing in the first field run), reads cmdline through a cat pipe
-     * instead of a redirection into tr, and falls back to /proc/<pid>/comm — the daemon renames
-     * itself "magiskd", which comm keeps even where cmdline reads empty. Every sample ends with
-     * its scan count, so a census that ran and matched nothing is distinguishable from one that
-     * never ran: the #107 field log carried only the directory sections below, with no way to
-     * tell whether the loop above them had executed at all. */
+    /** One P3/P4 sample: every magisk-lineage process (pid, comm, cmdline, state, ppid — from the
+     * shared host census, see hostProcCensus for why the guest's own /proc listing cannot be
+     * used), the socket directory, and the P4 fall-out points (a magisk.log.bak rotation shows
+     * the daemon reached its logging stage; anything beside the socket in device/ marks how far
+     * the start got), the directory sections read on the host from the same tree the guest
+     * shell used to list. Every sample ends with its scan count, so a census that ran and
+     * matched nothing is distinguishable from one that never ran: the #107 field log carried
+     * only the directory sections, with no way to tell whether the loop above them had
+     * executed at all, and the #109 guest-shell version scanned a directory with no pids in it. */
     private fun magiskDiagSample(label: String, t0: Long) {
-        val cmd = "n=0; m=0; for p in \$(ls /proc 2>/dev/null); do case \"\$p\" in ''|*[!0-9]*) continue;; esac; n=\$((n+1)); " +
-            "cm=\$(cat /proc/\$p/comm 2>/dev/null); c=\$(cat /proc/\$p/cmdline 2>/dev/null | tr '\\0' ' '); " +
-            "case \"\$c\" in *MDIAGP3*|*\"export PATH\"*) continue;; esac; " +
-            "case \"\$cm|\$c\" in *magisk*) m=\$((m+1)); echo \"proc \$p: comm=\$cm | \$c | \$(grep '^State:' /proc/\$p/status 2>/dev/null) | \$(grep '^PPid:' /proc/\$p/status 2>/dev/null)\";; esac; done; " +
-            "echo \"census: scanned \$n pids, matched \$m (sampler pid \$\$, comm \$(cat /proc/\$\$/comm 2>/dev/null))\"; " +
-            "echo device:; ls -la /${MagiskCore.TMP}/.magisk/device/ 2>&1; " +
-            "echo cache:; ls -la /cache/magisk.log* 2>&1; " +
-            "echo magiskdir:; ls -la /${MagiskCore.TMP}/.magisk/ 2>&1"
-        val out = runCatching { guestShell(cmd, 20_000).trim() }.getOrDefault("sample shell failed")
-        log("magisk-diag: P3/P4 sample $label (at +${System.currentTimeMillis() - t0} ms):\n$out")
+        val sb = StringBuilder()
+        val (scanned, matched) = hostProcCensus()
+        for (p in matched) {
+            val status = runCatching { File("/proc/${p.pid}/status").readLines() }.getOrDefault(emptyList())
+            val state = status.firstOrNull { it.startsWith("State:") }?.trim() ?: ""
+            val ppid = status.firstOrNull { it.startsWith("PPid:") }?.trim() ?: ""
+            sb.appendLine("proc ${p.pid}: comm=${p.comm} | ${p.cmdline.take(160)} | $state | $ppid")
+        }
+        sb.appendLine("census: scanned $scanned pids, matched ${matched.size} (host-side census)")
+        sb.appendLine("device:")
+        sb.appendLine(hostLs(File(paths.root, "${MagiskCore.TMP}/.magisk/device")))
+        sb.appendLine("cache:")
+        sb.appendLine(hostLs(File(paths.root, "cache"), "magisk.log"))
+        sb.appendLine("magiskdir:")
+        sb.appendLine(hostLs(File(paths.root, "${MagiskCore.TMP}/.magisk")))
+        log("magisk-diag: P3/P4 sample $label (at +${System.currentTimeMillis() - t0} ms):\n${sb.toString().trim()}")
     }
 
     /** P5 of the diag design — the conditional strace, run unconditionally at both daemon start
