@@ -37,7 +37,7 @@ enum {
     NR_lseek = 62, NR_read = 63, NR_write = 64, NR_writev = 66, NR_pread64 = 67, NR_pwrite64 = 68, NR_pselect6 = 72, NR_readlinkat = 78, NR_newfstatat = 79, NR_fstat = 80,
     NR_timerfd_create = 85, NR_utimensat = 88, NR_capget = 90, NR_capset = 91, NR_exit = 93, NR_exit_group = 94, NR_unshare = 97,
     NR_futex = 98, NR_nanosleep = 101, NR_clock_nanosleep = 115, NR_setsid = 157,
-    NR_ptrace = 117, NR_sched_yield = 124, NR_tgkill = 131, NR_rt_sigaction = 134, NR_rt_sigprocmask = 135, NR_reboot = 142,
+    NR_ptrace = 117, NR_sched_yield = 124, NR_tgkill = 131, NR_sigaltstack = 132, NR_rt_sigaction = 134, NR_rt_sigprocmask = 135, NR_reboot = 142,
     NR_setregid = 143, NR_setgid = 144, NR_setreuid = 145, NR_setuid = 146, NR_setresuid = 147, NR_getresuid = 148,
     NR_setresgid = 149, NR_getresgid = 150, NR_setfsuid = 151, NR_setfsgid = 152, NR_getgroups = 158, NR_setgroups = 159,
     NR_uname = 160, NR_prctl = 167, NR_getpid = 172, NR_getppid = 173, NR_getuid = 174, NR_geteuid = 175, NR_getgid = 176, NR_getegid = 177, NR_gettid = 178,
@@ -2217,7 +2217,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             if (pre(P(1), "/proc/") && pl >= 14 && seq(P(1) + pl - 8, "/cmdline") && !(a[2] & 3)) {
                 long f = S4(nr, AT_FDCWD, P(1), 0, 0);
                 if (f >= 0) {
-                    char t[4096]; long n = S3(NR_read, f, t, sizeof t - 1), o = 0;
+                    char *t = pb_get(); long n = S3(NR_read, f, t, 4095), o = 0;   // scratch from the pb pool, not the frame: trap2_base's stack stays small wherever the chain runs (see the trap stacks section)
                     S1(NR_close, f);
                     if (n < 0) n = 0;
                     t[n] = 0;
@@ -2227,7 +2227,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
                         if (o < n && g_qemu[0] && seq(t + o, g_qemu)) o += (long)slen(g_qemu) + 1;
                         if (o > n) o = n;
                     }
-                    return fake_memfile("aemu-cmdline", t + o, (u64)(n - o));
+                    { long fr = fake_memfile("aemu-cmdline", t + o, (u64)(n - o)); pb_put(t); return fr; }
                 }
             }
             if (seq(P(1), "/sys/fs/selinux/enforce")) {
@@ -2662,9 +2662,9 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             u64 total = 0;
             for (u64 i = 0; i < (u64)a[2]; i++) total += iov[i].len;
             if (total && total <= 1024) {
-                u8 buf[1024]; u64 done = 0;
+                char *buf = pb_get(); u64 done = 0;   // pb pool, not the frame (see the trap stacks section)
                 for (u64 i = 0; i < (u64)a[2]; i++) { memcpy(buf + done, iov[i].base, iov[i].len); done += iov[i].len; }
-                if (nlreq_swallow((int)a[0], buf, total)) return (long)total;
+                { int sw = nlreq_swallow((int)a[0], (const u8 *)buf, total); pb_put(buf); if (sw) return (long)total; }
             }
         }
         if (g_is_netd && a[1] && nlreq_find((int)a[0]) < 0) nlreq_log_untracked((int)a[0], (const void *)a[1], (u64)a[2]);
@@ -3293,9 +3293,74 @@ static void watch_spawn(void) {
     say("aemu-watch: watcher up in zygote pid="); say(utoa((u64)S0(NR_getpid), t + sizeof t)); say("\n");
 }
 
-static void on_sigsys(int sig, void *info, void *uc) {
+// ---------------------------------------------------------------------------------------------------- trap stacks
+//
+// The trap path gets a stack of its own. Until this batch the SIGSYS handler ran on the trapping
+// thread's own stack, and the entry toll is fixed and heavy: the kernel's signal frame, the
+// handler chain's frames, trap2_base's frame (0x1070 while it held a 4 KB scratch buffer) and
+// hub_pump behind it. A thread that arrives with less than the toll left dies in the doorway,
+// before any case runs: the Magisk daemon did exactly that (2026-11-26 field run, named by
+// aemu-crash) — hub_pump's prologue store at sp+0x70, the thread 0xFD0 bytes from the bottom of
+// its stack, the connect case never reached. Two moves, both needed:
+//   1. sigsys_entry (start.S) switches to a per-thread stack from this pool before any C frame
+//      exists, so the guest stack pays only the kernel's frame. The switch is self-provisioning:
+//      clone is not trapped (a newborn thread has no supervisor hook), so the first trap of any
+//      thread claims its slot here. Alongside it, each thread gets a real sigaltstack over the
+//      same memory (trap_altstack_ensure) and both handlers carry SA_ONSTACK, so fatal_relay and
+//      later deliveries land on the same ground; a thread that already has an altstack of its
+//      own keeps it — the entry switch covers the trap path regardless.
+//   2. trap2_base's KB-sized scratch buffers moved to the pb pool (below, at their cases), so
+//      the chain's own frames stay small wherever they run.
+// Sizing: 64 KB per stack. The budget is ~8 KB for the kernel frame (arm64 rt frame with the
+// FPSIMD context), ~2 KB for the whole trap chain after move 2, ~8 KB for a fatal signal nesting
+// inside a trap (fatal_relay + the crash capture), and margin for the binder/vmount detours —
+// ~24 KB worst case, so 64 KB is >2.5x that and >12x the toll that killed the daemon. 128 slots
+// (8 MB of .bss, untouched pages cost nothing); past the last slot the entry stays on the guest
+// stack, which is the pre-batch behaviour, not a new failure.
+#define TSTACK_SIZE (64 * 1024)
+#define TSTACK_N 128
+static char g_tstack[TSTACK_N][TSTACK_SIZE] __attribute__((aligned(16)));
+static volatile int g_tstack_tid[TSTACK_N];        // owning tid per slot, 0 = unclaimed
+static volatile int g_tstack_alt[TSTACK_N];        // sigaltstack settled for the slot's thread
+static volatile int g_tstack_next;
+
+static int tstack_index(u64 tid, int claim) {
+    for (int i = 0; i < TSTACK_N; i++) if (g_tstack_tid[i] == (int)tid) return i;
+    if (!claim) return -1;
+    int i = __atomic_fetch_add(&g_tstack_next, 1, __ATOMIC_ACQ_REL);
+    if (i >= TSTACK_N) return -1;
+    __atomic_store_n(&g_tstack_tid[i], (int)tid, __ATOMIC_RELEASE);
+    return i;
+}
+
+// Called from sigsys_entry (start.S) before any C frame exists on the trapping thread: pure
+// table work, no syscalls, no locks the guest could ever hold.
+void *trap_stack_top(u64 tid) {
+    int i = tstack_index(tid, 1);
+    return i < 0 ? 0 : (void *)(g_tstack[i] + TSTACK_SIZE);
+}
+
+// Settle this thread's sigaltstack onto its trap stack (once per thread). A thread that already
+// has an altstack — its own, or one inherited across fork — keeps it; the entry switch is what
+// guarantees the trap path, this only aligns the kernel's own delivery with the same ground.
+static void trap_altstack_ensure(void) {
+    int i = tstack_index((u64)S0(NR_gettid), 1);
+    if (i < 0 || g_tstack_alt[i]) return;
+    struct { void *sp; int flags; int pad; u64 size; } old;
+    memset(&old, 0, sizeof old);
+    if (S2(NR_sigaltstack, 0, &old) == 0 && (old.flags & 2 /*SS_DISABLE*/)) {
+        struct { void *sp; int flags; int pad; u64 size; } nw = { g_tstack[i], 0, 0, TSTACK_SIZE };
+        S2(NR_sigaltstack, &nw, 0);
+    }
+    __atomic_store_n(&g_tstack_alt[i], 1, __ATOMIC_RELEASE);
+}
+
+void sigsys_entry(int sig, void *info, void *uc);
+
+void on_sigsys_body(int sig, void *info, void *uc) {   // called from sigsys_entry (start.S)
     struct sigctx *c = (struct sigctx *)((char *)uc + 176);
     (void)sig; (void)info;
+    trap_altstack_ensure();
     mask_mediate((u64 *)((char *)uc + 40));                     // mask mediation: the restored mask never blocks the capture-critical set
     if (g_crash) *(u64 *)((char *)uc + 40) &= ~(1UL << 7);      // AEMU64_CRASH also keeps SIGFPE deliverable
     c->regs[0] = (u64)trap((long)c->regs[8], (long *)c->regs, uc);
@@ -3640,12 +3705,17 @@ void aemu_main(u64 *sp) {
     // in the supervisor (netd; see the nlreq section and install_filter_netd)
     { const char *base = prog; for (const char *p = prog; *p; p++) if (*p == '/') base = p + 1; g_is_netd = seq(base, "netd"); }
 
-    // signal handler first, then the filter (once per process tree: it survives exec)
-    struct { void *h; u64 flags; void *restorer; u64 mask; } sa = { (void *)on_sigsys, 4 /*SA_SIGINFO*/ | 0x40000000 /*SA_NODEFER*/, 0, 0 };
+    // signal handler first, then the filter (once per process tree: it survives exec). The SIGSYS
+    // handler is the asm entry: it moves the trap chain onto the thread's trap stack before any
+    // C runs (see the trap stacks section). SA_ONSTACK on both handlers: threads that have a
+    // sigaltstack (trap_altstack_ensure settles one per thread, starting with this one) get
+    // kernel delivery onto that same ground.
+    struct { void *h; u64 flags; void *restorer; u64 mask; } sa = { (void *)sigsys_entry, 4 /*SA_SIGINFO*/ | 0x40000000 /*SA_NODEFER*/ | 0x08000000 /*SA_ONSTACK*/, 0, 0 };
     if (S4(NR_rt_sigaction, SIGSYS, &sa, 0, 8) < 0) die("sigaction", "");
+    trap_altstack_ensure();
     u64 unblock = SYSBIT | FATALMASK; S4(NR_rt_sigprocmask, 1, &unblock, 0, 8);   // deliverable from the first guest instruction (mask mediation)
     {
-        struct { void *h; u64 flags; void *restorer; u64 mask; } ca = { (void *)fatal_relay, 4 /*SA_SIGINFO*/ | 0x40000000 /*SA_NODEFER*/, 0, 0 };
+        struct { void *h; u64 flags; void *restorer; u64 mask; } ca = { (void *)fatal_relay, 4 /*SA_SIGINFO*/ | 0x40000000 /*SA_NODEFER*/ | 0x08000000 /*SA_ONSTACK*/, 0, 0 };
         static const int fatal[] = { 11, 7, 4, 6, 8 };
         for (int i = 0; i < 5; i++) S4(NR_rt_sigaction, fatal[i], &ca, 0, 8);
     }
