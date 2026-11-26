@@ -33,7 +33,7 @@ enum {
     NR_inotify_add_watch = 27, NR_ioctl = 29,
     NR_mknodat = 33, NR_mkdirat = 34, NR_unlinkat = 35, NR_symlinkat = 36, NR_linkat = 37, NR_renameat = 38,
     NR_umount2 = 39, NR_mount = 40, NR_statfs = 43, NR_truncate = 45, NR_ftruncate = 46, NR_faccessat = 48,
-    NR_chdir = 49, NR_chroot = 51, NR_fchmodat = 53, NR_fchownat = 54, NR_fchown = 55, NR_openat = 56, NR_close = 57,
+    NR_chdir = 49, NR_chroot = 51, NR_fchmodat = 53, NR_fchownat = 54, NR_fchown = 55, NR_openat = 56, NR_close = 57, NR_pipe2 = 59,
     NR_lseek = 62, NR_read = 63, NR_write = 64, NR_writev = 66, NR_pread64 = 67, NR_pwrite64 = 68, NR_pselect6 = 72, NR_readlinkat = 78, NR_newfstatat = 79, NR_fstat = 80,
     NR_timerfd_create = 85, NR_utimensat = 88, NR_capget = 90, NR_capset = 91, NR_exit = 93, NR_exit_group = 94, NR_unshare = 97,
     NR_futex = 98, NR_nanosleep = 101, NR_clock_nanosleep = 115, NR_setsid = 157,
@@ -101,7 +101,7 @@ static int g_is_netd;             // this process is the guest's netd (its route
 static void (*g_fatal[32])(int, void *, void *);
 static void fatal_relay(int sig, void *info, void *uc);
 static long g_home_pid;                 // the pid aemu_main ran in; a forked descendant has another (ptrace watcher)
-static void watch_child_maybe(void);    // ptrace watcher: a forked child's chance to offer itself up (below)
+static void watch_note_name(const char *nm);    // ptrace watcher: a forked child renamed "system_server" offers itself up (below)
 // qemu-arm's signal handler blocks every signal in the context it returns to (until the guest's handler is
 // entered); with SIGSYS blocked the next trapped call would kill the process, so that bit is taken back out.
 static void (*g_h32[65])(int, void *, void *);
@@ -1741,7 +1741,6 @@ static void mtrace_out(long nr, long r) {
 static long trap2(long nr, long *a, void *uc, char **pbp);
 
 static long trap(long nr, long *a, void *uc) {
-    watch_child_maybe();            // ptrace watcher: in a forked child this notices system_server (below)
     char *pb = 0;
     int mt = g_mtrace_on && mtrace_in(nr, a);
     long r = trap2(nr, a, uc, &pb);
@@ -2533,7 +2532,13 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         }
         return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
     case NR_mount: case NR_umount2: case NR_chroot: case NR_capset: case NR_setgroups: case NR_unshare: case 268 /* setns */: return 0;
-    case NR_prctl: return 0;                    // only PR_CAPBSET_DROP gets here
+    case NR_prctl:
+        if (a[0] == 15 /*PR_SET_NAME*/) {       // the rename event itself is the ptrace watcher's only hook:
+            long r = S5(nr, a[0], a[1], 0, 0, 0);   // it runs for real, then the new name is classified (below)
+            if (r == 0) watch_note_name((const char *)a[1]);
+            return r;
+        }
+        return 0;                               // only PR_CAPBSET_DROP gets here
     case NR_timerfd_create: {                   // the *_ALARM clocks need CAP_WAKE_ALARM, vendor clocks (power-off alarm)
         long r = S2(nr, a[0], a[1]);            // do not exist here: the plain clocks tick the same
         if (r < 0) r = S2(nr, a[0] == 9 ? 7 : 0, a[1]);
@@ -2978,11 +2983,14 @@ static void fatal_relay(int sig, void *info, void *uc) {
 // --zygote in argv; the aemu-* stand-ins run app_process with a class name instead) and announces
 // itself with a marker file, <root>/dev/.aemu-watch-<pid>, plus one aemu-watch line. system_server
 // is not exec'd — zygote forks and the child specialises in place — so the arm happens on the child
-// side: a forked descendant's main thread watches its own name in the trap path (watch_child_maybe),
-// and when the name becomes "system_server" it looks for its parent's marker and only then asks to
-// be traced (PTRACE_TRACEME + a SIGSTOP announce). No marker, no trace: a supervisor that failed to
-// spot the zygote leaves system_server exactly as it was. The watcher sets PTRACE_O_TRACECLONE at
-// the announce stop, so every later thread of system_server is observed too.
+// side, at the rename itself: the filter traps PR_SET_NAME, and when a forked descendant's main
+// thread takes the name "system_server" (watch_note_name, in the prctl case) it looks for its
+// parent's marker and only then asks to be traced — a byte on the watcher's wake pipe first, then
+// PTRACE_TRACEME + a SIGSTOP announce. No marker, no trace: a supervisor that failed to spot the
+// zygote leaves system_server exactly as it was. The watcher sets PTRACE_O_TRACECLONE at the
+// announce stop, so every later thread of system_server is observed too. Until that byte arrives
+// the watcher thread sleeps on the pipe: it runs no wait4 at all, so zygote's own reaper keeps
+// every one of its children and the thread costs nothing.
 //
 // Coexistence with the in-process supervisor is the sharp edge: the tracee's own seccomp traps are
 // SIGSYS deliveries, and under ptrace every one of them stops here first. The watcher hands SIGSYS
@@ -2994,10 +3002,16 @@ static void fatal_relay(int sig, void *info, void *uc) {
 // exactly as it did unobserved. Any watcher-side failure detaches everything and ends the thread —
 // fail-open; the guest never waits on us.
 //
-// Known costs, accepted for a diagnostic: a wait4/CONT round trip rides on every trapped call
-// system_server makes, so its boot is slower than unobserved; and this thread's wait4(-1) can reap
-// a foreign zygote child before zygote's own lazy reaper sees it (dead-app bookkeeping lives in
-// system_server over binder; zygote's own list is bookkeeping only).
+// Known costs, accepted for a diagnostic: once armed, a wait4/CONT round trip rides on every
+// trapped call system_server makes, so its boot is slower than unobserved; and from the arm on,
+// this thread's wait4(-1) can reap a foreign zygote child before zygote's own lazy reaper sees it
+// (dead-app bookkeeping lives in system_server over binder; zygote's own list is bookkeeping
+// only). Before the arm there is no cost anywhere by construction: the trap path gained nothing
+// (the classification sits inside the prctl case, on renames only), and the watcher thread sleeps
+// on its pipe. The first version instead polled the name on every trapped call of every process —
+// one getpid per trap in the home process, three syscalls per trap in an undecided fork child —
+// and the whole guest's boot paid for it (60 s to the boot animation became 89 s and counting);
+// that is why the hook lives on the rename event now.
 
 #define WATCH_CLONE_FLAGS 0x50f00        // CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM
 #define WATCH_PTR_SETOPTIONS 0x4200
@@ -3019,37 +3033,38 @@ static void watch_marker(char *mp, long pid) {          // <root>/dev/.aemu-watc
 }
 
 // ---- child side: notice that this forked process became system_server, and offer it to the watcher.
-// Every inherited flag is stale after a fork, so the state is keyed by the pid it belongs to; the
-// price is one getpid per trapped call, which the trap path already dwarfs.
+// The notice is the rename itself: trap2_base's prctl case calls watch_note_name once a PR_SET_NAME
+// has run, so nothing is polled and the trap path pays nothing for the watcher. The flags below are
+// inherited across a fork like everything else in this image; that is safe here because what matters
+// is re-derived at the rename — the pid from the kernel, the parent from its marker — and a child
+// born to an already-armed parent is never the target anyway.
 
-static long g_wgen;                      // pid the state below belongs to
-static int g_warmed, g_wdone;            // this generation: TRACEME sent / no more checks needed
-static char g_wcomm0[16];                // the name this process had at its first trap after the fork
-static long g_wchecks;                   // traps spent undecided; bounded, so a never-renamed child stops paying
+static int g_warmed, g_wdone;            // this process: TRACEME sent / the offer is settled
+static long g_watch_wake_r = -1, g_watch_wake_w = -1;   // the watcher's wake pipe (watch_spawn); children inherit the write end
 
 static void watch_arm(void) {
     char mp[600];
     watch_marker(mp, S0(NR_getppid));
     if (S4(NR_faccessat, AT_FDCWD, mp, 0, 0) != 0) { g_wdone = 1; return; }   // no watcher in the parent: stay unobserved
+    // Wake the watcher before asking to be traced, and only if the wake can be delivered: a
+    // watcher that never wakes would leave this process stopped forever. The byte string is the
+    // announcer's pid, so the watcher can tell its exit from a foreign child's.
+    if (g_watch_wake_w < 0) { g_wdone = 1; return; }
+    { char t[24]; const char *pp = utoa((u64)S0(NR_getpid), t + sizeof t);
+      u64 n = slen(pp);
+      if (S3(NR_write, g_watch_wake_w, pp, n) != (long)n || S3(NR_write, g_watch_wake_w, "\n", 1) != 1) { g_wdone = 1; return; } }
     if (S4(NR_ptrace, 0 /*PTRACE_TRACEME*/, 0, 0, 0) < 0) { g_wdone = 1; return; }
     g_warmed = 1;
     S3(NR_tgkill, S0(NR_getpid), S0(NR_gettid), 19 /*SIGSTOP*/);              // announce: the watcher arms on this stop
 }
 
-static void watch_child_maybe(void) {
+static void watch_note_name(const char *nm) {
+    if (g_is32 || g_warmed || g_wdone) return;
+    if (!seq(nm, "system_server")) return;               // every other rename is not the target
     long me = S0(NR_getpid);
     if (me == g_home_pid) return;                        // the process aemu_main ran in: its watcher thread does the work
-    if (g_wgen != me) { g_wgen = me; g_warmed = 0; g_wdone = 0; g_wcomm0[0] = 0; g_wchecks = 0; }
-    if (g_wdone || g_warmed) return;
-    if (g_is32) { g_wdone = 1; return; }
     if (S0(NR_gettid) != me) return;                     // the name that matters is the main thread's
-    char nm[20]; memset(nm, 0, sizeof nm);
-    S5(NR_prctl, 16 /*PR_GET_NAME*/, nm, 0, 0, 0);
-    if (!nm[0]) return;
-    if (seq(nm, "system_server")) { watch_arm(); return; }
-    if (!g_wcomm0[0]) memcpy(g_wcomm0, nm, 16);
-    else if (!seq(nm, g_wcomm0)) g_wdone = 1;            // renamed to something else: not the target
-    if (++g_wchecks > 200000) g_wdone = 1;               // never renamed: stop paying
+    watch_arm();
 }
 
 // ---- parent side: the watcher thread in the zygote. Everything below runs on that thread alone.
@@ -3170,12 +3185,35 @@ static void watcher_main(void) {
     u64 chld = 1UL << (17 - 1);          // SIGCHLD is ours to consume via wait4, never as a signal
     S4(NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, &chld, 0, 8);
     long tgid = 0; int armed = 0, leader_gone = 0;
+    long announcer = 0;                  // pid read off the wake pipe whose announce stop is owed
+    int pipe_ok = g_watch_wake_r >= 0;
     for (;;) {
+        if (!armed && !announcer && pipe_ok) {
+            // Before the announce this thread sleeps on the wake pipe and runs no wait4 at
+            // all: zygote's own reaper keeps every one of its children, and the thread costs
+            // nothing. watch_arm writes the announcer's pid before it asks to be traced, so
+            // once a line is read, the wait below owes that child its stop (or its exit).
+            char lb[24]; u64 o = 0; int dead = 0;
+            for (;;) {
+                char b; long n = S3(NR_read, g_watch_wake_r, &b, 1);
+                if (n == -4 /*EINTR*/) continue;
+                if (n <= 0) { dead = 1; break; }
+                if (b == '\n') break;
+                if (o + 1 < sizeof lb) lb[o++] = b;
+            }
+            if (dead) { pipe_ok = 0; continue; }   // a broken wake pipe: fall back to waiting directly
+            lb[o] = 0;
+            long v = 0; for (u64 i = 0; lb[i]; i++) if (lb[i] >= '0' && lb[i] <= '9') v = v * 10 + (lb[i] - '0');
+            announcer = v;
+            continue;
+        }
         int status = 0;
         long tid = S4(NR_wait4, -1, &status, WATCH_WALL, 0);
         if (tid < 0) {
             if (tid == -4 /*EINTR*/) continue;
             if (armed) { say("aemu-watch: the tracee is gone; watcher off\n"); return; }
+            if (announcer) { announcer = 0; continue; }   // the announce fizzled (TRACEME refused child-side): back to the pipe
+            if (pipe_ok) continue;                        // not expected; stay off the wait
             struct { u64 s, ns; } ts = { 0, 50000000 };
             S2(NR_nanosleep, &ts, 0);
             continue;
@@ -3212,12 +3250,15 @@ static void watcher_main(void) {
             if (watch_cont(tid, sig)) goto off;
             continue;
         }
-        // an exit — the tracee's threads', or a foreign child's (before the arm there is nothing to say)
+        // an exit — the tracee's threads' once armed; before the arm, either the announcer's
+        // own (it died between its wake byte and its stop: the announce fizzled, so the loop
+        // returns to the pipe sleep) or a foreign child's caught in the brief window after a
+        // wake byte (nothing to say, and the announcer's stop is still owed, so the wait goes on)
         if (armed) {
             if (tid == tgid) leader_gone = 1;
             watch_tid_drop(tid);
             if (leader_gone && g_wntids == 0) { say("aemu-watch: system_server gone; watcher off\n"); return; }
-        }
+        } else if (tid == announcer) announcer = 0;
     }
 off:
     say("aemu-watch: ptrace keeps failing; detached, watcher off\n");
@@ -3233,15 +3274,19 @@ static int watch_is_zygote(char *const argv[], long argc) {
 }
 
 static void watch_spawn(void) {
+    long pf[2];
+    if (S2(NR_pipe2, pf, 0) < 0) { say("aemu-watch: no wake pipe for the watcher; off\n"); return; }   // a watcher that cannot be woken must never be waited for
+    g_watch_wake_r = pf[0]; g_watch_wake_w = pf[1];
     char mp[600];
     watch_marker(mp, S0(NR_getpid));
     long fd = S4(NR_openat, AT_FDCWD, mp, 02101 /*O_WRONLY|O_CREAT|O_APPEND*/, 0600);   // the marker first: a child arms only while it exists
     if (fd >= 0) S1(NR_close, fd);
     void *stk = (void *)S6(NR_mmap, 0, 1 << 18, 3 /*PROT_READ|PROT_WRITE*/, 0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/, -1, 0);
-    if ((u64)stk >= (u64)-4095) { say("aemu-watch: no stack for the watcher; off\n"); S3(NR_unlinkat, AT_FDCWD, mp, 0); return; }
+    if ((u64)stk >= (u64)-4095) { say("aemu-watch: no stack for the watcher; off\n"); S3(NR_unlinkat, AT_FDCWD, mp, 0); S1(NR_close, g_watch_wake_r); S1(NR_close, g_watch_wake_w); g_watch_wake_r = g_watch_wake_w = -1; return; }
     if (watch_clone(WATCH_CLONE_FLAGS, (char *)stk + (1 << 18), watcher_main) < 0) {
         say("aemu-watch: clone refused; watcher off\n");
         S3(NR_unlinkat, AT_FDCWD, mp, 0);
+        S1(NR_close, g_watch_wake_r); S1(NR_close, g_watch_wake_w); g_watch_wake_r = g_watch_wake_w = -1;
         return;
     }
     char t[24];
@@ -3297,10 +3342,11 @@ static void install_filter(void) {
     f[n++] = JEQ(NR_rt_sigprocmask, L_SIG, 0);
     f[n++] = JEQ(NR_prctl, L_PRCTL, 0);
     f[n++] = JEQ(NR_mmap, L_MMAP, L_ALLOW);
-    AT(L_PRCTL);                                                // PR_CAPBSET_DROP (24), PR_SET_SECCOMP (22), PR_SET_KEEPCAPS (8), PR_CAP_AMBIENT (47)
+    AT(L_PRCTL);                                                // PR_CAPBSET_DROP (24), PR_SET_SECCOMP (22), PR_SET_KEEPCAPS (8), PR_SET_NAME (15), PR_CAP_AMBIENT (47)
     f[n++] = LD(16); f[n++] = JEQ(24, L_TRAP, 0);
     f[n++] = JEQ(22, L_TRAP, 0);
     f[n++] = JEQ(8, L_TRAP, 0);
+    f[n++] = JEQ(15, L_TRAP, 0);                                // renames trap so the ptrace watcher can classify them (trap2_base)
     f[n++] = JEQ(47, L_TRAP, L_ALLOW);
     AT(L_SIG);                                                  // only when a set is given and it is not SIG_UNBLOCK
     f[n++] = LD(16); f[n++] = JEQ(1, L_ALLOW, 0);
