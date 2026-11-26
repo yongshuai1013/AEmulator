@@ -523,6 +523,77 @@ static int g_tun_live;
 static void tun_cat(char *t, u64 *o, const char *s) { u64 n = slen(s); memcpy(t + *o, s, n); *o += n; t[*o] = 0; }
 static void tun_catn(char *t, u64 *o, u64 v) { char num[24]; char *p = utoa(v, num + sizeof num); tun_cat(t, o, p); }
 
+// ---- 137 measurement, supervisor side: the aemu-137r step log
+//
+// The hub side of the 137 measurement (vpn-137-measure-desk.md) already logs its own
+// session steps from GuestVm/VpnHub (aemu-137: in the host log). This is the same pair of
+// sessions seen from inside each guest process's supervisor: the tun handover, the hub
+// state this process syncs to, the interface answers it synthesizes for the framework and
+// for netd, the connect() detours it takes, and the link envelopes it delivers. One line
+// per lifecycle/control-plane event — never per packet — each carrying this process's pid
+// and comm and the session tag. The tag is the HUB's session number, adopted from hub
+// state synchronization, never a local invention: a process whose first sync found no
+// session up counts the hub's up-transitions from that baseline, so its S<n> is the hub's
+// S<n>; a process whose first sync found a session already up prints S? for it rather
+// than guess a number (the wire state frame is a fixed 33 bytes and carries no sequence,
+// so the number itself cannot travel). A session created and destroyed without ever
+// reaching the up state in a broadcast advances the hub's counter unseen here; the hub
+// log shows such stillborn sessions, and a one-off tag offset after one is that known
+// signature, not a second bug. Lines go through say() — the aemu-crash path — and
+// GuestVm's pumps mirror the aemu-137r: prefix into the host log (say() alone does not
+// reach it: the #119 field log holds zero aemu-tun: lines).
+static int g_137r_seq;      // hub sessions counted from the sync baseline
+static int g_137r_seq_ok;   // the count started from a known no-session sync (tags are the hub's numbers)
+static int g_137r_synced;   // this process has processed at least one hub state/down frame
+static int g_137r_cur;      // the session now up: its number, -1 while up-but-unnumbered, 0 while down
+static int g_137r_hubst;    // hub reachability as last logged: 0 unknown, 1 up, 2 down
+static int g_137r_detour;   // detour-family lines so far (cap 512 per process)
+static int g_137r_nosess;   // no-session detour passes logged before any session existed (cap 4)
+static int g_137r_unreg;    // not-registered linkunreg lines so far (cap 64 per process)
+static int g_137r_deliv;    // link-deliver lines so far (cap 96 per process)
+
+static void r137_ip4(char *t, u64 *o, u32 a) {   // wire order: first octet in the top byte
+    tun_catn(t, o, (a >> 24) & 255); tun_cat(t, o, ".");
+    tun_catn(t, o, (a >> 16) & 255); tun_cat(t, o, ".");
+    tun_catn(t, o, (a >> 8) & 255); tun_cat(t, o, ".");
+    tun_catn(t, o, a & 255);
+}
+
+static void r137_num(char *t, u64 *o, long v) {
+    if (v < 0) { tun_cat(t, o, "-"); tun_catn(t, o, (u64)(-v)); }
+    else tun_catn(t, o, (u64)v);
+}
+
+static void r137_tag_into(char *t, u64 *o, int cur, int pending) {
+    if (pending > 0) { tun_cat(t, o, "S"); tun_catn(t, o, (u64)pending); return; }
+    if (cur > 0) { tun_cat(t, o, "S"); tun_catn(t, o, (u64)cur); return; }
+    if (cur < 0) { tun_cat(t, o, "S?"); return; }
+    tun_cat(t, o, "S-");
+}
+
+// Line head: "aemu-137r: pid=<pid> comm=<comm> <tag> ", the tag taken from cur/pending.
+static void r137_head2(char *t, u64 *o, int cur, int pending) {
+    char nm[20];
+    memset(nm, 0, sizeof nm);
+    S5(NR_prctl, 16 /*PR_GET_NAME*/, nm, 0, 0, 0);
+    tun_cat(t, o, "aemu-137r: pid=");
+    tun_catn(t, o, (u64)S0(NR_getpid));
+    tun_cat(t, o, " comm=");
+    tun_cat(t, o, nm[0] ? nm : "?");
+    tun_cat(t, o, " ");
+    r137_tag_into(t, o, cur, pending);
+    tun_cat(t, o, " ");
+}
+
+static void r137_head(char *t, u64 *o, int pending) { r137_head2(t, o, g_137r_cur, pending); }
+
+// The number the session now being configured will carry, when it can be known here:
+// the baseline count is good and no session is up, so the next up-transition is seq+1.
+static int r137_pending(void) {
+    if (g_137r_seq_ok && !g_137r_cur) return g_137r_seq + 1;
+    return 0;
+}
+
 static long tun_chan_read(int s, char *buf, u64 cap) { return S3(NR_read, g_tun[s].peer, buf, cap); }
 static long tun_chan_write(int s, const char *buf, u64 len) { return S3(NR_write, g_tun[s].peer, buf, len); }
 
@@ -545,6 +616,16 @@ static void tun_drain(void) {
                 tun_catn(line, &o, g_tun[s].bytes);
                 tun_cat(line, &o, " bytes (M1: drained and discarded at the channel endpoint)");
                 say(line);
+                { char l2[256]; u64 o2 = 0;
+                  r137_head(l2, &o2, 0);
+                  tun_cat(l2, &o2, "session-end-local name=");
+                  tun_cat(l2, &o2, g_tun[s].name);
+                  tun_cat(l2, &o2, " pkts=");
+                  tun_catn(l2, &o2, g_tun[s].pkts);
+                  tun_cat(l2, &o2, " bytes=");
+                  tun_catn(l2, &o2, g_tun[s].bytes);
+                  tun_cat(l2, &o2, " (the channel was never hubbed)\n");
+                  say(l2); }
                 S1(NR_close, g_tun[s].peer);
                 g_tun[s].live = 0;
                 g_tun_live--;
@@ -696,6 +777,21 @@ static void nlreq_log(int fd, const u8 *buf, u64 len, int verdict) {
     }
     tun_cat(line, &o, "\n");
     say(line);
+    { char l2[256]; u64 o2 = 0;
+      r137_head(l2, &o2, 0);
+      tun_cat(l2, &o2, "nlreq-answer fd=");
+      tun_catn(l2, &o2, (u64)fd);
+      tun_cat(l2, &o2, " type=");
+      tun_cat(l2, &o2, nlreq_type_name(type));
+      if (verdict > 0) {
+          tun_cat(l2, &o2, " verdict=answered by=");
+          tun_cat(l2, &o2, verdict == 1 ? "name" : verdict == 2 ? "table" : "oif");
+      } else {
+          tun_cat(l2, &o2, " verdict=passed why=");
+          tun_cat(l2, &o2, verdict == -1 ? "not-rule-route" : verdict == -2 ? "session-down" : "no-session-attr");
+      }
+      tun_cat(l2, &o2, "\n");
+      say(l2); }
 }
 
 static int g_nlreq_untrk;
@@ -729,6 +825,12 @@ static void nlreq_log_ack(int fd) {
     tun_catn(line, &o, (u64)fd);
     tun_cat(line, &o, " ack delivered\n");
     say(line);
+    { char l2[192]; u64 o2 = 0;
+      r137_head(l2, &o2, 0);
+      tun_cat(l2, &o2, "nlreq-ack fd=");
+      tun_catn(l2, &o2, (u64)fd);
+      tun_cat(l2, &o2, " (the synthesized ack was read)\n");
+      say(l2); }
 }
 
 // The request was ours to answer: keep it, and the receive that follows gets the ack.
@@ -822,6 +924,14 @@ static long tun_ioctl(int fd, u32 cmd, u64 arg) {
         tun_cat(line, &o, g_tun[s].name);
         tun_cat(line, &o, " allocated (TUNSETIFF)");
         say(line);
+        { char l2[256]; u64 o2 = 0;
+          r137_head(l2, &o2, 0);
+          tun_cat(l2, &o2, "tun-setiff name=");
+          tun_cat(l2, &o2, g_tun[s].name);
+          tun_cat(l2, &o2, " index=");
+          tun_catn(l2, &o2, (u64)g_tun[s].index);
+          tun_cat(l2, &o2, "\n");
+          say(l2); }
         hub_session_cfg(s);
         return 0;
     }
@@ -840,7 +950,7 @@ static long tun_ioctl(int fd, u32 cmd, u64 arg) {
 // all — a second, hidden break behind the missing /dev/tun. They are answered here, from this
 // registry: an interface exists because a session is registered, and its flags, MTU and addresses
 // are what the framework itself set. Returns 1 (and *out) when the name is one of ours.
-static int tun_sioc(u32 cmd, u64 arg, long *out) {
+static int tun_sioc_inner(u32 cmd, u64 arg, long *out) {
     if ((cmd & 0xffffff00u) != 0x8900u || !arg) return 0;
     char *ifr = (char *)arg;
     char name[16];
@@ -884,6 +994,70 @@ static int tun_sioc(u32 cmd, u64 arg, long *out) {
         memset(ifr + 16, 0, 16); *(u16 *)(ifr + 16) = 2; *(u32 *)(ifr + 20) = g_tun[s].mask; *out = 0; return 1;
     }
     return 0;
+}
+
+static const char *sioc_name(u32 cmd) {
+    switch (cmd) {
+    case 0x8913: return "SIOCGIFFLAGS";
+    case 0x8914: return "SIOCSIFFLAGS";
+    case 0x8915: return "SIOCGIFADDR";
+    case 0x8916: return "SIOCSIFADDR";
+    case 0x891b: return "SIOCGIFNETMASK";
+    case 0x891c: return "SIOCSIFNETMASK";
+    case 0x8921: return "SIOCGIFMTU";
+    case 0x8922: return "SIOCSIFMTU";
+    case 0x8933: return "SIOCGIFINDEX";
+    }
+    return "SIOC?";
+}
+
+// The by-name interface answers are the framework's view of the session: during
+// teardown it asks exactly here whether tun0 still exists and what its flags are, and
+// netd resolves the interface it must untable through the same door. Log each answer
+// (and each pass on the session's own name) as a 137r step; the decision itself is
+// tun_sioc_inner's, unchanged.
+static int tun_sioc(u32 cmd, u64 arg, long *out) {
+    int r = tun_sioc_inner(cmd, arg, out);
+    if ((cmd & 0xffffff00u) != 0x8900u || !arg) return r;
+    char *ifr = (char *)arg;
+    char name[16];
+    memcpy(name, ifr, 16);
+    name[15] = 0;
+    for (int i = 0; i < 15 && name[i]; i++) if (name[i] == ':') { name[i] = 0; break; }
+    if (r) {
+        char line[320]; u64 o = 0;
+        r137_head(line, &o, 0);
+        tun_cat(line, &o, "sioc-answer ");
+        tun_cat(line, &o, sioc_name(cmd));
+        tun_cat(line, &o, " name=");
+        tun_cat(line, &o, name);
+        tun_cat(line, &o, " result=");
+        r137_num(line, &o, *out);
+        if (cmd == 0x8913) { tun_cat(line, &o, " flags="); tun_catn(line, &o, *(u16 *)(ifr + 16)); }
+        if (cmd == 0x8933) { tun_cat(line, &o, " index="); tun_catn(line, &o, (u64)(u32)*(int *)(ifr + 16)); }
+        if (cmd == 0x8921) { tun_cat(line, &o, " mtu="); tun_catn(line, &o, (u64)(u32)*(int *)(ifr + 16)); }
+        if (cmd == 0x8915 || cmd == 0x891b) {
+            u32 v = *(u32 *)(ifr + 20);   // memory order, as the guest reads it
+            u32 w = ((v & 0xff) << 24) | ((v >> 8 & 0xff) << 16) | ((v >> 16 & 0xff) << 8) | (v >> 24);
+            tun_cat(line, &o, cmd == 0x8915 ? " addr=" : " mask=");
+            r137_ip4(line, &o, w);
+        }
+        tun_cat(line, &o, "\n");
+        say(line);
+    } else if (name[0] && g_hub_sess.name[0] && seq(name, g_hub_sess.name)) {
+        // Asked about the hub session's interface and not answered here: the session is
+        // down (or its state never reached this process), so the caller hears the real
+        // path's answer — during teardown, that the interface is gone.
+        char line[288]; u64 o = 0;
+        r137_head(line, &o, 0);
+        tun_cat(line, &o, "sioc-pass ");
+        tun_cat(line, &o, sioc_name(cmd));
+        tun_cat(line, &o, " name=");
+        tun_cat(line, &o, name);
+        tun_cat(line, &o, " (the session is not answerable here)\n");
+        say(line);
+    }
+    return r;
 }
 
 
@@ -1025,23 +1199,75 @@ static void hub_session_gone(const char *name) {
             tun_cat(line, &o, name);
             tun_cat(line, &o, " registry cleared (the hub reported the channel closed)");
             say(line);
+            { char l2[224]; u64 o2 = 0;
+              r137_head(l2, &o2, 0);
+              tun_cat(l2, &o2, "registry-cleared name=");
+              tun_cat(l2, &o2, name);
+              tun_cat(l2, &o2, " (the local tun entry was dropped)\n");
+              say(l2); }
         }
     }
     if (g_hub_sess.up && seq(g_hub_sess.name, name)) g_hub_sess.up = 0;
 }
 
+// A hub session-state transition, as this process syncs to it (137r): the tag is the one
+// the accounting in hub_handle settled on (for a down edge, the session that just ended).
+static void r137_state_edge(int up, int tagval) {
+    char line[320]; u64 o = 0;
+    r137_head2(line, &o, tagval, 0);
+    tun_cat(line, &o, up ? "state-edge up" : "state-edge down");
+    tun_cat(line, &o, " name=");
+    tun_cat(line, &o, g_hub_sess.name[0] ? g_hub_sess.name : "-");
+    tun_cat(line, &o, " index=");
+    tun_catn(line, &o, g_hub_sess.index);
+    if (up) {
+        tun_cat(line, &o, " addr=");
+        r137_ip4(line, &o, g_hub_sess.addr);
+        tun_cat(line, &o, " mtu=");
+        tun_catn(line, &o, g_hub_sess.mtu);
+        tun_cat(line, &o, " exempt=");
+        tun_catn(line, &o, (u64)(u32)g_hub_sess.exempt);
+    }
+    tun_cat(line, &o, "\n");
+    say(line);
+}
+
 static void hub_handle(u8 type, const u8 *pl, u64 len) {
     if (type == HUB_SESSION_STATE && len >= 29) {
+        int was_up = g_hub_sess.up;
+        int was_cur = g_137r_cur;
         g_hub_sess.up = pl[0] != 0;
         memcpy(g_hub_sess.name, pl + 1, 16); g_hub_sess.name[15] = 0;
         g_hub_sess.addr = hub_get32(pl + 17);
         g_hub_sess.mtu = hub_get32(pl + 21);
         g_hub_sess.exempt = (int)hub_get32(pl + 25);
         g_hub_sess.index = len >= 33 ? hub_get32(pl + 29) : 0;
+        // Adopt the hub's session numbering (see the 137r block at the tun section): the
+        // first sync decides whether this process can count the hub's sessions at all.
+        if (!g_137r_synced) {
+            g_137r_synced = 1;
+            if (!g_hub_sess.up) { g_137r_seq_ok = 1; g_137r_seq = 0; }
+        }
+        if (g_hub_sess.up && !was_up) {
+            if (g_137r_seq_ok) { g_137r_seq++; g_137r_cur = g_137r_seq; }
+            else g_137r_cur = -1;
+            r137_state_edge(1, g_137r_cur);
+        } else if (!g_hub_sess.up && was_up) {
+            g_137r_cur = 0;
+            r137_state_edge(0, was_cur);
+        }
     } else if (type == HUB_SESSION_DOWN && len >= 16) {
         char name[16];
         memcpy(name, pl, 16); name[15] = 0;
+        g_137r_synced = 1;
+        { char line[256]; u64 o = 0;
+          r137_head(line, &o, 0);
+          tun_cat(line, &o, "session-down-frame name=");
+          tun_cat(line, &o, name);
+          tun_cat(line, &o, "\n");
+          say(line); }
         hub_session_gone(name);
+        g_137r_cur = 0;
     }
 }
 
@@ -1051,6 +1277,13 @@ static void hub_dead(void) {
     if (g_hub_fd >= 0) S1(NR_close, g_hub_fd);
     g_hub_fd = -1;
     g_hub_sess.up = 0;
+    if (g_137r_hubst == 1) {
+        char line[224]; u64 o = 0;
+        r137_head(line, &o, 0);
+        tun_cat(line, &o, "hub-lost (the hub socket closed; session numbering re-baselines at the next sync)\n");
+        say(line);
+    }
+    g_137r_hubst = 0; g_137r_synced = 0; g_137r_seq_ok = 0; g_137r_seq = 0; g_137r_cur = 0;
     for (int s = 0; s < MAX_TUN; s++) {
         if (g_tun[s].live && g_tun[s].hubbed) {
             g_tun[s].live = 0;
@@ -1091,6 +1324,15 @@ static int hub_wait(u8 want, int ms, u8 *out, u64 cap, u64 *outlen) {
     return -1;
 }
 
+static void r137_hub_fail(void) {
+    if (g_137r_hubst == 2) return;
+    g_137r_hubst = 2;
+    char line[192]; u64 o = 0;
+    r137_head(line, &o, 0);
+    tun_cat(line, &o, "hub-connect failed (no VpnHub; the VPN paths stay local)\n");
+    say(line);
+}
+
 // Connect (once per process) and learn the current session state. -1: no hub — the caller falls
 // back to the pre-M2 path, unchanged.
 static int hub_ensure(void) {
@@ -1100,17 +1342,30 @@ static int hub_ensure(void) {
     if (g_hub_fd >= 0 && g_hub_pid == me) { hub_unlock(); return 0; }
     if (g_hub_fd >= 0) { S1(NR_close, g_hub_fd); g_hub_fd = -1; }   // inherited from the parent: not ours
     long s = S3(NR_socket, 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0);
-    if (s < 0) { hub_unlock(); return -1; }
+    if (s < 0) { r137_hub_fail(); hub_unlock(); return -1; }
     char path[600];
     memcpy(path, g_root, g_rootlen);
     memcpy(path + g_rootlen, "/dev/socket/aemu_vpnhub", 24);
     struct sockaddr_un sa;
     sa.family = 1;
     memcpy(sa.path, path, g_rootlen + 24);
-    if (S3(NR_connect, s, &sa, 2 + g_rootlen + 23) < 0) { S1(NR_close, s); hub_unlock(); return -1; }
+    if (S3(NR_connect, s, &sa, 2 + g_rootlen + 23) < 0) { S1(NR_close, s); r137_hub_fail(); hub_unlock(); return -1; }
     g_hub_fd = (int)s;
     g_hub_pid = me;
     if (hub_send(HUB_HELLO, 0, 0, -1) == 0) { u8 pl[64]; u64 ln = 0; hub_wait(HUB_SESSION_STATE, 2000, pl, sizeof pl, &ln); }   // failure just leaves the cache empty
+    if (g_137r_hubst != 1) {
+        g_137r_hubst = 1;
+        char line[320]; u64 o = 0;
+        r137_head(line, &o, 0);
+        tun_cat(line, &o, "hub-connect ok; hello state up=");
+        tun_catn(line, &o, (u64)(g_hub_sess.up ? 1 : 0));
+        tun_cat(line, &o, " name=");
+        tun_cat(line, &o, g_hub_sess.name[0] ? g_hub_sess.name : "-");
+        tun_cat(line, &o, " index=");
+        tun_catn(line, &o, g_hub_sess.index);
+        tun_cat(line, &o, "\n");
+        say(line);
+    }
     hub_unlock();
     return 0;
 }
@@ -1121,7 +1376,16 @@ static int hub_ensure(void) {
 // At /dev/tun open: hand the channel endpoint over. If anything about it fails, the session
 // simply stays local — the M1 drain is the floor, never an error for the guest.
 static void tun_hub_handoff(int s) {
-    if (hub_ensure() < 0) { hub_log1("no hub at /dev/tun open; the channel stays with the supervisor (M1 behaviour)", ""); return; }
+    if (hub_ensure() < 0) { hub_log1("no hub at /dev/tun open; the channel stays with the supervisor (M1 behaviour)", "");
+        { char line[224]; u64 o = 0;
+          r137_head(line, &o, 0);
+          tun_cat(line, &o, "tun-handoff result=no-hub slot=");
+          tun_catn(line, &o, (u64)s);
+          tun_cat(line, &o, " index=");
+          tun_catn(line, &o, (u64)g_tun[s].index);
+          tun_cat(line, &o, "\n");
+          say(line); }
+        return; }
     hub_lock();
     int ok = hub_send(HUB_TUN_PEER, 0, 0, g_tun[s].peer) == 0 && hub_wait(HUB_PEER_OK, 2000, 0, 0, 0) == 0;
     if (ok) {
@@ -1129,8 +1393,24 @@ static void tun_hub_handoff(int s) {
         g_tun[s].peer = -1;
         g_tun[s].hubbed = 1;
         hub_log1("tun channel handed to the hub", "");
+        { char line[224]; u64 o = 0;
+          r137_head(line, &o, 0);
+          tun_cat(line, &o, "tun-handoff result=handed slot=");
+          tun_catn(line, &o, (u64)s);
+          tun_cat(line, &o, " index=");
+          tun_catn(line, &o, (u64)g_tun[s].index);
+          tun_cat(line, &o, "\n");
+          say(line); }
     } else {
         hub_log1("the hub did not take the tun channel; keeping the M1 local drain", "");
+        { char line[224]; u64 o = 0;
+          r137_head(line, &o, 0);
+          tun_cat(line, &o, "tun-handoff result=refused slot=");
+          tun_catn(line, &o, (u64)s);
+          tun_cat(line, &o, " index=");
+          tun_catn(line, &o, (u64)g_tun[s].index);
+          tun_cat(line, &o, "\n");
+          say(line); }
     }
     hub_unlock();
 }
@@ -1145,6 +1425,16 @@ static void hub_session_cfg(int s) {
     hub_lock();
     hub_send(HUB_SESSION_CFG, pl, sizeof pl, -1);
     hub_unlock();
+    { char line[256]; u64 o = 0;
+      r137_head(line, &o, r137_pending());
+      tun_cat(line, &o, "session-cfg name=");
+      tun_cat(line, &o, g_tun[s].name);
+      tun_cat(line, &o, " index=");
+      tun_catn(line, &o, (u64)g_tun[s].index);
+      tun_cat(line, &o, " mtu=");
+      tun_catn(line, &o, (u64)g_tun[s].mtu);
+      tun_cat(line, &o, "\n");
+      say(line); }
 }
 
 // The address is what makes a session real (the framework sets it before it connects the agent):
@@ -1166,6 +1456,20 @@ static void hub_session_up(int s) {
     tun_cat(line, &o, g_tun[s].name);
     tun_cat(line, &o, " is up; guest connections will be detoured into the tunnel");
     say(line);
+    { char l2[288]; u64 o2 = 0;
+      u32 a2 = g_tun[s].addr;   // the same swap hub_session_up put on the wire
+      u32 w = ((a2 & 0xff) << 24) | ((a2 & 0xff00) << 8) | ((a2 >> 8) & 0xff00) | ((a2 >> 24) & 0xff);
+      r137_head(l2, &o2, r137_pending());
+      tun_cat(l2, &o2, "session-up-sent name=");
+      tun_cat(l2, &o2, g_tun[s].name);
+      tun_cat(l2, &o2, " index=");
+      tun_catn(l2, &o2, (u64)g_tun[s].index);
+      tun_cat(l2, &o2, " addr=");
+      r137_ip4(l2, &o2, w);
+      tun_cat(l2, &o2, " mtu=");
+      tun_catn(l2, &o2, (u64)g_tun[s].mtu);
+      tun_cat(l2, &o2, "\n");
+      say(l2); }
 }
 
 // ---- the connect detour
@@ -1197,6 +1501,28 @@ static void sock_note_bind(int fd) {
 }
 
 
+// One detour-family line (137r), under a shared per-process cap: the decision, the
+// destination, and the flow id / source port when there are ones. Only connect() calls
+// that reached the detour decision get a line — a non-stream or non-IPv4 connect was
+// never a candidate and stays silent, as before.
+static void r137_detour(const char *step, const u8 *sa, long flow, long srcport) {
+    if (g_137r_detour >= 512) return;
+    g_137r_detour++;
+    char line[320]; u64 o = 0;
+    r137_head(line, &o, 0);
+    tun_cat(line, &o, step);
+    tun_cat(line, &o, " uid=");
+    tun_catn(line, &o, (u64)(u32)g_uid);
+    tun_cat(line, &o, " dst=");
+    r137_ip4(line, &o, ((u32)sa[4] << 24) | ((u32)sa[5] << 16) | ((u32)sa[6] << 8) | (u32)sa[7]);
+    tun_cat(line, &o, ":");
+    tun_catn(line, &o, ((u32)sa[2] << 8) | (u32)sa[3]);
+    if (srcport >= 0) { tun_cat(line, &o, " srcport="); tun_catn(line, &o, (u64)srcport); }
+    if (flow >= 0) { tun_cat(line, &o, " flow="); tun_catn(line, &o, (u64)flow); }
+    tun_cat(line, &o, "\n");
+    say(line);
+}
+
 // The detour itself. Returns 1 when the call is settled here (with *out as its result), 0 when
 // the caller should take the ordinary path — no session, an exempt uid, a hub that will not
 // answer, a refusal: every doubt resolves to the connection the guest would have had before M2.
@@ -1206,8 +1532,14 @@ static int hub_maybe_detour(int fd, const u8 *sa, u64 salen, long *out) {
     if (!sa || salen < 16 || sa[0] != 2 /*AF_INET*/) return 0;
     if (hub_ensure() < 0) return 0;
     hub_pump();
-    if (!g_hub_sess.up) return 0;
-    if (g_hub_sess.exempt >= 0 && g_uid == g_hub_sess.exempt) return 0;   // VpnService.protect(), on the supervisor's side
+    if (!g_hub_sess.up) {
+        // The pass is the ordinary path; log it only while it can still teach something —
+        // the first few before any session existed, and any after one has (a connect that
+        // should have detoured but found the synced state already down).
+        if (g_137r_seq > 0 || g_137r_nosess < 4) { if (!g_137r_seq) g_137r_nosess++; r137_detour("detour-pass why=no-session", sa, -1, -1); }
+        return 0;
+    }
+    if (g_hub_sess.exempt >= 0 && g_uid == g_hub_sess.exempt) { r137_detour("detour-pass why=exempt", sa, -1, -1); return 0; }   // VpnService.protect(), on the supervisor's side
 
     u8 req[12];
     hub_put32(req, (u32)g_uid);
@@ -1219,16 +1551,18 @@ static int hub_maybe_detour(int fd, const u8 *sa, u64 salen, long *out) {
     u32 flow = 0;
     int ok = 0;
     if (hub_send(HUB_FLOW_NEW, req, sizeof req, -1) == 0) {
+        r137_detour("flow-new", sa, -1, g_sock[si].port);
         u8 pl[64]; u64 ln = 0;
         if (hub_wait(HUB_FLOW_OK, 2000, pl, sizeof pl, &ln) == 0 && ln >= 4) { flow = hub_get32(pl); ok = 1; }
     }
     if (!ok) {
         hub_unlock();
+        r137_detour("flow-refused (the guest keeps its direct connection)", sa, -1, g_sock[si].port);
         if (!g_hub_logged) { g_hub_logged = 1; hub_log1("the hub refused a detour; connections stay direct", ""); }
         return 0;
     }
     int sv[2];
-    if (S4(NR_socketpair, 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0, (long)sv) < 0) { hub_unlock(); return 0; }
+    if (S4(NR_socketpair, 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0, (long)sv) < 0) { hub_unlock(); r137_detour("flow-abandoned (socketpair failed; the guest keeps its direct connection)", sa, (long)flow, g_sock[si].port); return 0; }
     u8 idpl[4];
     hub_put32(idpl, flow);
     if (hub_send(HUB_FLOW_FD, idpl, sizeof idpl, sv[1]) < 0) {
@@ -1236,6 +1570,7 @@ static int hub_maybe_detour(int fd, const u8 *sa, u64 salen, long *out) {
         S1(NR_close, sv[0]);
         S1(NR_close, sv[1]);
         hub_log1("a detoured connection could not be handed to the hub; closing it rather than faking success", "");
+        r137_detour("flow-fd-failed (the guest gets ECONNREFUSED)", sa, (long)flow, g_sock[si].port);
         *out = -111;   // ECONNREFUSED: the one failure that is reported as a failure
         return 1;
     }
@@ -1247,6 +1582,7 @@ static int hub_maybe_detour(int fd, const u8 *sa, u64 salen, long *out) {
     S1(NR_close, sv[1]);
     if (r < 0) { *out = r; return 1; }
     if (!g_hub_logged) { g_hub_logged = 1; hub_log1("detouring guest connections into the tunnel (this process)", ""); }
+    r137_detour("flow-ok", sa, (long)flow, g_sock[si].port);
     *out = 0;
     return 1;
 }
@@ -1289,16 +1625,35 @@ static void nllink_log_reg(int fd, u32 proto, u32 groups, u32 id, const char *fa
     say(line);
 }
 
+// The same registration outcomes as aemu-nllink:, as 137r steps: the id a listener was
+// given is the join key with the hub's own listener lines.
+static void r137_linkreg(int fd, u32 proto, u32 groups, u32 id, const char *result) {
+    char line[288]; u64 o = 0;
+    r137_head(line, &o, 0);
+    tun_cat(line, &o, "linkreg fd=");
+    tun_catn(line, &o, (u64)fd);
+    tun_cat(line, &o, " proto=");
+    tun_catn(line, &o, proto);
+    tun_cat(line, &o, " groups=");
+    tun_catn(line, &o, groups);
+    tun_cat(line, &o, " id=");
+    tun_catn(line, &o, id);
+    tun_cat(line, &o, " result=");
+    tun_cat(line, &o, result);
+    tun_cat(line, &o, "\n");
+    say(line);
+}
+
 static void hub_linkreg(int fd, const u8 *sa, u64 salen) {
     if (!sa || salen < 12 || sa[0] != 16 /*AF_NETLINK*/) return;
     u32 groups = hub_get32(sa + 8);
     if (!groups) return;                       // a request socket, not a listener: no events for it
     nl_set_groups(fd, groups);
-    for (int i = 0; i < MAX_LINKREG; i++) if (g_linkreg[i].fd == fd) return;
+    for (int i = 0; i < MAX_LINKREG; i++) if (g_linkreg[i].fd == fd) { r137_linkreg(fd, (u32)nl_proto_of(fd), groups, g_linkreg[i].id, "already-registered"); return; }
     int peer = nl_find_peer(fd);
-    if (peer < 0 || hub_ensure() < 0) { nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, 0, "no hub connection"); return; }
+    if (peer < 0 || hub_ensure() < 0) { nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, 0, "no hub connection"); r137_linkreg(fd, (u32)nl_proto_of(fd), groups, 0, "no-hub-connection"); return; }
     int dup = (int)S2(NR_dup, peer, 0);
-    if (dup < 0) { nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, 0, "peer dup failed"); return; }
+    if (dup < 0) { nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, 0, "peer dup failed"); r137_linkreg(fd, (u32)nl_proto_of(fd), groups, 0, "peer-dup-failed"); return; }
     // the registration carries the socket's protocol: the hub speaks to each listener in the
     // dialect its consumer parses (kernel uevents for the uevent protocol, rtnetlink for the rest)
     u8 lp[4];
@@ -1311,9 +1666,10 @@ static void hub_linkreg(int fd, const u8 *sa, u64 salen) {
     }
     hub_unlock();
     S1(NR_close, dup);
-    if (!id) { nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, 0, "hub did not confirm"); return; }
-    for (int i = 0; i < MAX_LINKREG; i++) if (!g_linkreg[i].fd) { g_linkreg[i].fd = fd; g_linkreg[i].id = id; nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, id, 0); return; }
+    if (!id) { nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, 0, "hub did not confirm"); r137_linkreg(fd, (u32)nl_proto_of(fd), groups, 0, "hub-no-confirm"); return; }
+    for (int i = 0; i < MAX_LINKREG; i++) if (!g_linkreg[i].fd) { g_linkreg[i].fd = fd; g_linkreg[i].id = id; nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, id, 0); r137_linkreg(fd, (u32)nl_proto_of(fd), groups, id, "ok"); return; }
     nllink_log_reg(fd, (u32)nl_proto_of(fd), groups, 0, "listener table full");
+    r137_linkreg(fd, (u32)nl_proto_of(fd), groups, 0, "table-full");
 }
 
 static void hub_linkunreg(int fd) {
@@ -1321,15 +1677,56 @@ static void hub_linkunreg(int fd) {
         if (g_linkreg[i].fd != fd) continue;
         u32 id = g_linkreg[i].id;
         g_linkreg[i].fd = 0;
+        int sent = 0;
         if (hub_ensure() == 0) {
             u8 pl[4];
             hub_put32(pl, id);
             hub_lock();
-            hub_send(HUB_LINKUNREG, pl, sizeof pl, -1);
+            sent = hub_send(HUB_LINKUNREG, pl, sizeof pl, -1) == 0;
             hub_unlock();
         }
+        { char line[320]; u64 o = 0;
+          r137_head(line, &o, 0);
+          tun_cat(line, &o, "linkunreg fd=");
+          tun_catn(line, &o, (u64)fd);
+          tun_cat(line, &o, " slot=");
+          tun_catn(line, &o, (u64)i);
+          tun_cat(line, &o, " id=");
+          tun_catn(line, &o, id);
+          tun_cat(line, &o, " sent=");
+          tun_catn(line, &o, (u64)sent);
+          if (!id) tun_cat(line, &o, " note=empty-slot-match (the slot held no registration; id 0 is not a listener)");
+          tun_cat(line, &o, "\n");
+          say(line); }
         return;
     }
+}
+
+// A genuine registration always carries a hub id (they count from 1); an empty slot's fd
+// field is 0, which is also what makes hub_linkunreg match it for fd 0 above.
+static int linkreg_has(int fd) { for (int i = 0; i < MAX_LINKREG; i++) if (g_linkreg[i].fd == fd && g_linkreg[i].id) return 1; return 0; }
+
+// At the close/dup3 call sites: the descriptor was a netlink socket but held no listener
+// registration — netd's per-transaction route sockets land here, and so would a listener
+// whose registration was lost. Capped; the boot-time flush alone spends dozens of closes.
+static void r137_unreg_miss(int fd) {
+    if (g_137r_unreg >= 64) return;
+    g_137r_unreg++;
+    char line[224]; u64 o = 0;
+    r137_head(line, &o, 0);
+    tun_cat(line, &o, "linkunreg fd=");
+    tun_catn(line, &o, (u64)fd);
+    tun_cat(line, &o, " result=not-registered (a netlink socket that never held a listener registration)\n");
+    say(line);
+}
+
+static void r137_tun_close(int fd) {
+    char line[192]; u64 o = 0;
+    r137_head(line, &o, 0);
+    tun_cat(line, &o, "tun-close fd=");
+    tun_catn(line, &o, (u64)fd);
+    tun_cat(line, &o, "\n");
+    say(line);
 }
 
 // A registered listener's events have no kernel behind them: the hub writes them into the
@@ -1354,6 +1751,14 @@ static void nllink_log_notserved(int fd) {
     tun_catn(line, &o, (u64)fd);
     tun_cat(line, &o, " recvmsg NOT served (not registered with the hub)\n");
     say(line);
+    { char l2[224]; u64 o2 = 0;
+      r137_head(l2, &o2, 0);
+      tun_cat(l2, &o2, "link-notserved fd=");
+      tun_catn(l2, &o2, (u64)fd);
+      tun_cat(l2, &o2, " proto=");
+      tun_catn(l2, &o2, (u64)nl_proto_of(fd));
+      tun_cat(l2, &o2, "\n");
+      say(l2); }
 }
 
 static int nl_listener_recv(int fd, struct msgh *m, long *out) {
@@ -1364,7 +1769,20 @@ static int nl_listener_recv(int fd, struct msgh *m, long *out) {
     int env = 0;
     u8 buf[4096];
     long n = S3(NR_read, fd, buf, sizeof buf);
-    if (n < 0) { *out = n; return 1; }
+    if (n < 0) {
+        if (g_137r_deliv < 96) {
+            g_137r_deliv++;
+            char line[224]; u64 o = 0;
+            r137_head(line, &o, 0);
+            tun_cat(line, &o, "link-deliver fd=");
+            tun_catn(line, &o, (u64)fd);
+            tun_cat(line, &o, " read-error=");
+            r137_num(line, &o, n);
+            tun_cat(line, &o, "\n");
+            say(line);
+        }
+        *out = n; return 1;
+    }
     if (m->name && m->namelen >= 12) {
         // struct sockaddr_nl is 12 bytes, and 12 is exactly what uevent_kernel_recv offers
         // (its msg_namelen is sizeof(addr)); asking for 16 here meant the address was never
@@ -1412,6 +1830,34 @@ static int nl_listener_recv(int fd, struct msgh *m, long *out) {
             tun_catn(line, &o, (u64)offered);
             tun_cat(line, &o, ")");
         }
+        tun_cat(line, &o, "\n");
+        say(line);
+    }
+    if (g_137r_deliv < 96) {
+        g_137r_deliv++;
+        char line[320]; u64 o = 0;
+        r137_head(line, &o, 0);
+        tun_cat(line, &o, "link-deliver fd=");
+        tun_catn(line, &o, (u64)fd);
+        tun_cat(line, &o, " proto=");
+        tun_catn(line, &o, (u64)nl_proto_of(fd));
+        tun_cat(line, &o, " bytes=");
+        tun_catn(line, &o, (u64)done);
+        tun_cat(line, &o, " msg=");
+        if (nl_proto_of(fd) == 15 && n >= 2) {
+            // kernel uevent text: "<action>@<devpath>"
+            char w[8]; int wn = 0;
+            while (wn < 7 && wn < n && buf[wn] && buf[wn] != '@') { w[wn] = (char)buf[wn]; wn++; }
+            w[wn] = 0;
+            tun_cat(line, &o, w);
+            tun_cat(line, &o, "@uevent");
+        } else if (n >= 6) {
+            u16 mt = *(const u16 *)(buf + 4);
+            tun_cat(line, &o, mt == 16 ? "RTM_NEWLINK" : mt == 17 ? "RTM_DELLINK" : "nlmsg-type");
+            if (mt != 16 && mt != 17) { tun_cat(line, &o, "="); tun_catn(line, &o, mt); }
+        } else tun_cat(line, &o, "?");
+        tun_cat(line, &o, " envelope=");
+        tun_catn(line, &o, (u64)(env ? 1 : 0));
         tun_cat(line, &o, "\n");
         say(line);
     }
@@ -2325,7 +2771,8 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             if (S2(NR_fstat, a[1], &st) == 0 && st.st_ino == g_logino && st.st_dev == g_logdev &&
                 S2(NR_fstat, a[0], &st) == 0 && (st.st_mode & 0170000) == 0020000 && st.st_rdev == 0x103) return a[1];
         }
-        { long r = S3(nr, a[0], a[1], a[2]); if (r >= 0) { sock_forget((int)a[1]); hub_linkunreg((int)a[1]); } return r; }
+        { int was_nl = is_nl_fd((int)a[1]); int had_reg = linkreg_has((int)a[1]);
+          long r = S3(nr, a[0], a[1], a[2]); if (r >= 0) { sock_forget((int)a[1]); hub_linkunreg((int)a[1]); if (was_nl && !had_reg) r137_unreg_miss((int)a[1]); } return r; }
     }
     case NR_ptrace: {
         // observed, never mediated (iso-shadow): the request is performed exactly as made, and
@@ -2337,11 +2784,14 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         return r;
     }
     case NR_close: {
-        if (is_nl_fd((int)a[0])) nl_close((int)a[0]);
-        if (is_tun_fd((int)a[0])) say("aemu-tun: the framework closed its tun descriptor (the session ends when the channel runs dry)");
+        int was_nl = is_nl_fd((int)a[0]);
+        if (was_nl) nl_close((int)a[0]);
+        if (is_tun_fd((int)a[0])) { say("aemu-tun: the framework closed its tun descriptor (the session ends when the channel runs dry)"); r137_tun_close((int)a[0]); }
         sock_forget((int)a[0]);
         nlreq_drop((int)a[0]);
+        int had_reg = linkreg_has((int)a[0]);
         hub_linkunreg((int)a[0]);
+        if (was_nl && !had_reg) r137_unreg_miss((int)a[0]);
         return S1(nr, a[0]);
     }
     case NR_execve:
