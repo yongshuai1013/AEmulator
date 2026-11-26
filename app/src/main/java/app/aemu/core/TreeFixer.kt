@@ -117,6 +117,7 @@ class TreeFixer(
         installEngineFiles()
         superuserFiles()
         substituteFiles()
+        zygiskSpikeFiles()
         terminalFiles()
         gatekeeperFiles()
         protectOat()
@@ -278,6 +279,56 @@ class TreeFixer(
             zip.close()
             for (d in SubstituteSupport.DATA_DIRS) File(root, d).mkdirs()
         }.onFailure { log("magisk-sub deploy: ${it.message}") }
+    }
+
+    /**
+     * Zygisk spike (ZygiskSpikeSupport): while this VM's spike switch is on, plant the
+     * bridge as system/lib64/libazygisk.so (GuestVm points the native-bridge property
+     * at it before zygote starts), the module manifest as
+     * system/etc/aemu-zygisk-manifest, and the test module at its ABI-shaped home
+     * data/adb/modules/aemu-spike/zygisk/arm64-v8a.so. While the switch is off, take
+     * back exactly what was planted — byte-compared against the assets (the manifest
+     * against its one known text), so a firmware file is never touched.
+     */
+    private fun zygiskSpikeFiles() {
+        val bridge = File(root, ZygiskSpikeSupport.BRIDGE_PATH)
+        val manifest = File(root, ZygiskSpikeSupport.MANIFEST_PATH)
+        val module = File(root, ZygiskSpikeSupport.MODULE_PATH)
+        if (!ZygiskSpikeSupport.on(img)) {
+            runCatching {
+                val bytes = EngineAssets.open(ctx, ZygiskSpikeSupport.BRIDGE_ASSET).use { it.readBytes() }
+                if (bridge.isFile && bridge.readBytes().contentEquals(bytes)) { bridge.delete(); log("zygisk-spike: bridge removed (switch off)") }
+            }.onFailure { log("zygisk-spike cleanup: ${it.message}") }
+            runCatching {
+                if (manifest.isFile && manifest.readText() == ZygiskSpikeSupport.MANIFEST_TEXT) { manifest.delete(); log("zygisk-spike: manifest removed (switch off)") }
+            }.onFailure { log("zygisk-spike cleanup: ${it.message}") }
+            runCatching {
+                val bytes = EngineAssets.open(ctx, ZygiskSpikeSupport.MODULE_ASSET).use { it.readBytes() }
+                if (module.isFile && module.readBytes().contentEquals(bytes)) { module.delete(); log("zygisk-spike: test module removed (switch off)") }
+            }.onFailure { log("zygisk-spike cleanup: ${it.message}") }
+            return
+        }
+        runCatching {
+            val bytes = EngineAssets.open(ctx, ZygiskSpikeSupport.BRIDGE_ASSET).use { it.readBytes() }
+            if (!bridge.isFile || !bridge.readBytes().contentEquals(bytes)) {
+                bridge.parentFile?.mkdirs()
+                bridge.writeBytes(bytes)
+                log("zygisk-spike: bridge planted at ${ZygiskSpikeSupport.BRIDGE_PATH}")
+            }
+            bridge.setReadable(true, false)
+            if (!manifest.isFile || manifest.readText() != ZygiskSpikeSupport.MANIFEST_TEXT) {
+                manifest.parentFile?.mkdirs()
+                manifest.writeText(ZygiskSpikeSupport.MANIFEST_TEXT)
+                log("zygisk-spike: manifest planted at ${ZygiskSpikeSupport.MANIFEST_PATH}")
+            }
+            val mbytes = EngineAssets.open(ctx, ZygiskSpikeSupport.MODULE_ASSET).use { it.readBytes() }
+            if (!module.isFile || !module.readBytes().contentEquals(mbytes)) {
+                module.parentFile?.mkdirs()
+                module.writeBytes(mbytes)
+                log("zygisk-spike: test module planted at ${ZygiskSpikeSupport.MODULE_PATH}")
+            }
+            module.setReadable(true, false)
+        }.onFailure { log("zygisk-spike deploy: ${it.message}") }
     }
 
     /**
