@@ -1,0 +1,366 @@
++ PASS=0
++ FAIL=0
++ pkill -x magiskd
++ sleep 0.3
++ rm -rf /data/adb /data/data /debug_ramdisk/.magisk /cache/magisk.log /tmp/sulink
++ mkdir -p /data/adb/magisk /data/adb/modules /data/adb/modules_update /data/adb/post-fs-data.d /data/adb/service.d /data/adb/boot-completed.d /data/data/com.topjohnwu.magisk /debug_ramdisk/.magisk/device /debug_ramdisk/.magisk/busybox /debug_ramdisk/.magisk/worker /debug_ramdisk/.magisk/mirror /debug_ramdisk/.magisk/rootdir /tmp/sulink
++ chown 10086:10086 /data/data/com.topjohnwu.magisk
++ gcc -DDESKTOP_TEST -O2 -Wall -o /tmp/subst-test /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c -ldl -lpthread
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c: In function 'connect_once':
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:1559:49: warning: '%s' directive output may be truncated writing up to 4095 bytes into a region of size 108 [-Wformat-truncation=]
+ 1559 |     snprintf(un.sun_path, sizeof(un.sun_path), "%s", spath);
+      |                                                 ^~   ~~~~~
+In file included from /usr/include/stdio.h:980,
+                 from /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:42:
+In function 'snprintf',
+    inlined from 'connect_once' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:1559:5:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin_snprintf' output between 1 and 4096 bytes into a destination of size 108
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c: In function 'daemon_cli':
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:1523:49: warning: '%s' directive output may be truncated writing up to 4095 bytes into a region of size 108 [-Wformat-truncation=]
+ 1523 |     snprintf(un.sun_path, sizeof(un.sun_path), "%s", spath);
+      |                                                 ^~   ~~~~~
+In function 'snprintf',
+    inlined from 'daemon_entry' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:1523:5,
+    inlined from 'daemon_cli' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:1746:9:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin_snprintf' output between 1 and 4096 bytes into a destination of size 108
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c: In function 'exec_module_scripts.part.0':
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:660:42: warning: '%s' directive output may be truncated writing up to 32767 bytes into a region of size 4078 [-Wformat-truncation=]
+  660 |         snprintf(path, sizeof(path), "%s/%s/%s.sh", MODULEROOT, g_module_list[i], stage);
+      |                                          ^~
+In function 'snprintf',
+    inlined from 'exec_module_scripts.part.0' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:660:9:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin___snprintf_chk' output 23 or more bytes (assuming 32790) into a destination of size 4096
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c: In function 'stage_post_fs_data':
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:595:45: warning: '/disable' directive output may be truncated writing 8 bytes into a region of size between 1 and 4096 [-Wformat-truncation=]
+  595 |             snprintf(flag, sizeof(flag), "%s/disable", dst);
+      |                                             ^~~~~~~~
+In function 'snprintf',
+    inlined from 'upgrade_modules' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:595:13,
+    inlined from 'stage_post_fs_data' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:736:5:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin___snprintf_chk' output between 9 and 4104 bytes into a destination of size 4096
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c: In function 'stage_post_fs_data':
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:603:49: warning: '/disable' directive output may be truncated writing 8 bytes into a region of size between 1 and 4096 [-Wformat-truncation=]
+  603 |                 snprintf(flag, sizeof(flag), "%s/disable", dst);
+      |                                                 ^~~~~~~~
+In function 'snprintf',
+    inlined from 'upgrade_modules' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:603:17,
+    inlined from 'stage_post_fs_data' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:736:5:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin___snprintf_chk' output between 9 and 4104 bytes into a destination of size 4096
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c: In function 'stage_post_fs_data':
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:628:41: warning: '/remove' directive output may be truncated writing 7 bytes into a region of size between 1 and 4096 [-Wformat-truncation=]
+  628 |         snprintf(flag, sizeof(flag), "%s/remove", mdir);
+      |                                         ^~~~~~~
+In function 'snprintf',
+    inlined from 'collect_modules' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:628:9,
+    inlined from 'stage_post_fs_data' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:737:5:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin___snprintf_chk' output between 8 and 4103 bytes into a destination of size 4096
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c: In function 'stage_post_fs_data':
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:637:41: warning: '/update' directive output may be truncated writing 7 bytes into a region of size between 1 and 4096 [-Wformat-truncation=]
+  637 |         snprintf(flag, sizeof(flag), "%s/update", mdir);
+      |                                         ^~~~~~~
+In function 'snprintf',
+    inlined from 'collect_modules' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:637:9,
+    inlined from 'stage_post_fs_data' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:737:5:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin___snprintf_chk' output between 8 and 4103 bytes into a destination of size 4096
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c: In function 'stage_post_fs_data':
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:639:41: warning: '/disable' directive output may be truncated writing 8 bytes into a region of size between 1 and 4096 [-Wformat-truncation=]
+  639 |         snprintf(flag, sizeof(flag), "%s/disable", mdir);
+      |                                         ^~~~~~~~
+In function 'snprintf',
+    inlined from 'collect_modules' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:639:9,
+    inlined from 'stage_post_fs_data' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:737:5:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin___snprintf_chk' output between 9 and 4104 bytes into a destination of size 4096
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c: In function 'stage_post_fs_data':
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:642:59: warning: '%s' directive output may be truncated writing up to 255 bytes into a region of size 128 [-Wformat-truncation=]
+  642 |             snprintf(g_module_list[g_module_count], 128, "%s", e->d_name);
+      |                                                           ^~
+In function 'snprintf',
+    inlined from 'collect_modules' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:642:13,
+    inlined from 'stage_post_fs_data' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:737:5:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin___snprintf_chk' output between 1 and 256 bytes into a destination of size 128
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c: In function 'stage_post_fs_data':
+/home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:632:49: warning: '/uninstall.sh' directive output may be truncated writing 13 bytes into a region of size between 1 and 4096 [-Wformat-truncation=]
+  632 |             snprintf(script, sizeof(script), "%s/uninstall.sh", mdir);
+      |                                                 ^~~~~~~~~~~~~
+In function 'snprintf',
+    inlined from 'collect_modules' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:632:13,
+    inlined from 'stage_post_fs_data' at /home/hatch/workspace/aemu-subst-wt/app/guest-substitute/substitute.c:737:5:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin___snprintf_chk' output between 14 and 4109 bytes into a destination of size 4096
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
++ gcc -O2 -o /tmp/busybox /tmp/bbshim.c
++ install -m 755 /tmp/subst-test /data/adb/magisk/magisk
++ install -m 755 /tmp/subst-test /debug_ramdisk/magisk
++ install -m 755 /tmp/busybox /debug_ramdisk/.magisk/busybox/busybox
++ install -m 755 /tmp/fake_app_process.sh /system/bin/app_process
++ ln -sf /data/adb/magisk/magisk /tmp/sulink/su
++ chmod 755 /data /data/adb /data/adb/magisk /debug_ramdisk /debug_ramdisk/.magisk /debug_ramdisk/.magisk/device /debug_ramdisk/.magisk/busybox /debug_ramdisk/.magisk/worker /debug_ramdisk/.magisk/mirror /debug_ramdisk/.magisk/rootdir /data/data /data/data/com.topjohnwu.magisk
++ M=/debug_ramdisk/magisk
+++ /debug_ramdisk/magisk -v
++ check 'version string' 30.7:MAGISK:R 30.7:MAGISK:R
++ '[' 30.7:MAGISK:R = 30.7:MAGISK:R ']'
++ ok 'version string'
++ PASS=1
++ echo 'SMOKE-PASS: version string'
+SMOKE-PASS: version string
+++ /debug_ramdisk/magisk -V
++ check 'version code' 30700 30700
++ '[' 30700 = 30700 ']'
++ ok 'version code'
++ PASS=2
++ echo 'SMOKE-PASS: version code'
+SMOKE-PASS: version code
+++ /debug_ramdisk/magisk -c
++ has 'version -c' '30.7:MAGISK:R (30700)' 30700
++ echo '30.7:MAGISK:R (30700)'
++ grep -q 30700
++ ok 'version -c'
++ PASS=3
++ echo 'SMOKE-PASS: version -c'
+SMOKE-PASS: version -c
++ '[' -S /debug_ramdisk/.magisk/device/socket ']'
++ ok 'daemon socket exists'
++ PASS=4
++ echo 'SMOKE-PASS: daemon socket exists'
+SMOKE-PASS: daemon socket exists
++ /debug_ramdisk/magisk --sqlite 'INSERT INTO settings (key, value) VALUES ('\''smoke_key'\'', 42)'
+++ /debug_ramdisk/magisk --sqlite 'SELECT value FROM settings WHERE key='\''smoke_key'\'''
++ OUT=value=42
++ has 'sqlite roundtrip' value=42 value=42
++ echo value=42
++ grep -q value=42
++ ok 'sqlite roundtrip'
++ PASS=5
++ echo 'SMOKE-PASS: sqlite roundtrip'
+SMOKE-PASS: sqlite roundtrip
++ python3 -
+user_version: 12
+tables: ['denylist', 'policies', 'settings', 'strings']
+zygisk seed: (0,)
+SMOKE-PASS: db schema
++ '[' 0 -eq 0 ']'
++ /debug_ramdisk/magisk --denylist add com.example.app
+++ /debug_ramdisk/magisk --denylist ls
++ has 'denylist ls' 'com.example.app|com.example.app' com.example.app
++ echo 'com.example.app|com.example.app'
++ grep -q com.example.app
++ ok 'denylist ls'
++ PASS=6
++ echo 'SMOKE-PASS: denylist ls'
+SMOKE-PASS: denylist ls
+++ /debug_ramdisk/magisk --denylist status
++ has 'denylist status off' 'Denylist is not enforced' 'not enforced'
++ echo 'Denylist is not enforced'
++ grep -q 'not enforced'
++ ok 'denylist status off'
++ PASS=7
++ echo 'SMOKE-PASS: denylist status off'
+SMOKE-PASS: denylist status off
++ /debug_ramdisk/magisk --denylist enable
+++ /debug_ramdisk/magisk --denylist status
++ has 'denylist status on' 'Denylist is enforced' 'is enforced'
++ echo 'Denylist is enforced'
++ grep -q 'is enforced'
++ ok 'denylist status on'
++ PASS=8
++ echo 'SMOKE-PASS: denylist status on'
+SMOKE-PASS: denylist status on
++ /debug_ramdisk/magisk --denylist disable
++ mkdir -p /data/adb/modules/modA /data/adb/modules_update/modA /data/adb/modules/modB /data/adb/modules/modC /data/adb/modules_update/modNew
++ printf 'id=modA\nversion=old\n'
++ touch /data/adb/modules/modA/disable
++ printf 'id=modA\nversion=new\n'
++ printf 'id=modB\n'
++ touch /data/adb/modules/modB/remove
++ printf '#!/bin/sh\ntouch /data/adb/modB-uninstalled\n'
++ printf 'id=modC\n'
++ printf '#!/bin/sh\ntouch /data/adb/modC-pfs\n'
++ printf '#!/bin/sh\ntouch /data/adb/modC-svc\n'
++ printf 'id=modNew\n'
++ /debug_ramdisk/magisk --post-fs-data
++ grep -q version=new /data/adb/modules/modA/module.prop
++ ok 'modA updated'
++ PASS=9
++ echo 'SMOKE-PASS: modA updated'
+SMOKE-PASS: modA updated
++ '[' -f /data/adb/modules/modA/disable ']'
++ ok 'modA disable kept'
++ PASS=10
++ echo 'SMOKE-PASS: modA disable kept'
+SMOKE-PASS: modA disable kept
++ '[' '!' -d /data/adb/modules/modB ']'
++ ok 'modB removed'
++ PASS=11
++ echo 'SMOKE-PASS: modB removed'
+SMOKE-PASS: modB removed
++ '[' -f /data/adb/modB-uninstalled ']'
++ ok 'modB uninstall.sh ran'
++ PASS=12
++ echo 'SMOKE-PASS: modB uninstall.sh ran'
+SMOKE-PASS: modB uninstall.sh ran
++ '[' -f /data/adb/modC-pfs ']'
++ ok 'modC post-fs-data.sh ran'
++ PASS=13
++ echo 'SMOKE-PASS: modC post-fs-data.sh ran'
+SMOKE-PASS: modC post-fs-data.sh ran
++ '[' -d /data/adb/modules/modNew ']'
++ ok 'modNew installed'
++ PASS=14
++ echo 'SMOKE-PASS: modNew installed'
+SMOKE-PASS: modNew installed
+++ ls -A /data/adb/modules_update
++ '[' -z '' ']'
++ ok 'modules_update drained'
++ PASS=15
++ echo 'SMOKE-PASS: modules_update drained'
+SMOKE-PASS: modules_update drained
++ /debug_ramdisk/magisk --service
++ for i in 1 2 3 4 5 6 7 8 9 10
++ '[' -f /data/adb/modC-svc ']'
++ sleep 0.5
++ for i in 1 2 3 4 5 6 7 8 9 10
++ '[' -f /data/adb/modC-svc ']'
++ break
++ '[' -f /data/adb/modC-svc ']'
++ ok 'modC service.sh ran'
++ PASS=16
++ echo 'SMOKE-PASS: modC service.sh ran'
+SMOKE-PASS: modC service.sh ran
+++ /debug_ramdisk/magisk --sqlite 'SELECT value FROM settings WHERE key='\''bootloop'\'''
++ OUT=value=1
++ has 'bootloop counted' value=1 value=1
++ echo value=1
++ grep -q value=1
++ ok 'bootloop counted'
++ PASS=17
++ echo 'SMOKE-PASS: bootloop counted'
+SMOKE-PASS: bootloop counted
++ /debug_ramdisk/magisk --boot-complete
+++ /debug_ramdisk/magisk --sqlite 'SELECT value FROM settings WHERE key='\''bootloop'\'''
++ OUT=value=0
++ has 'boot-complete resets bootloop' value=0 value=0
++ echo value=0
++ grep -q value=0
++ ok 'boot-complete resets bootloop'
++ PASS=18
++ echo 'SMOKE-PASS: boot-complete resets bootloop'
+SMOKE-PASS: boot-complete resets bootloop
+++ /tmp/sulink/su -c 'echo su-root-ok'
++ OUT=su-root-ok
++ has 'su as root' su-root-ok su-root-ok
++ echo su-root-ok
++ grep -q su-root-ok
++ ok 'su as root'
++ PASS=19
++ echo 'SMOKE-PASS: su as root'
+SMOKE-PASS: su as root
+++ setpriv --reuid 65534 --regid 65534 --clear-groups /tmp/sulink/su -c 'echo su-query-ok; id'
++ OUT='su-query-ok
+uid=0(root) gid=0(root) groups=0(root)'
++ has 'su query->manager allow' 'su-query-ok
+uid=0(root) gid=0(root) groups=0(root)' su-query-ok
++ echo 'su-query-ok
+uid=0(root) gid=0(root) groups=0(root)'
++ grep -q su-query-ok
++ ok 'su query->manager allow'
++ PASS=20
++ echo 'SMOKE-PASS: su query->manager allow'
+SMOKE-PASS: su query->manager allow
++ has 'su query->uid0' 'su-query-ok
+uid=0(root) gid=0(root) groups=0(root)' uid=0
++ echo 'su-query-ok
+uid=0(root) gid=0(root) groups=0(root)'
++ grep -q uid=0
++ ok 'su query->uid0'
++ PASS=21
++ echo 'SMOKE-PASS: su query->uid0'
+SMOKE-PASS: su query->uid0
++ /debug_ramdisk/magisk --sqlite 'INSERT INTO policies (uid, policy, until, logging, notification) VALUES (65534, 1, 0, 0, 0)'
+++ setpriv --reuid 65534 --regid 65534 --clear-groups /tmp/sulink/su -c 'echo should-not-run'
++ OUT='Permission denied'
++ case "$OUT" in
++ ok 'su deny row'
++ PASS=22
++ echo 'SMOKE-PASS: su deny row'
+SMOKE-PASS: su deny row
++ /debug_ramdisk/magisk --sqlite 'DELETE FROM policies WHERE uid=65534'
++ mv /data/data/com.topjohnwu.magisk /data/data/mgr-away
+++ setpriv --reuid 65534 --regid 65534 --clear-groups /tmp/sulink/su -c 'echo should-not-run'
++ OUT='Permission denied'
++ case "$OUT" in
++ ok 'su query no manager denied'
++ PASS=23
++ echo 'SMOKE-PASS: su query no manager denied'
+SMOKE-PASS: su query no manager denied
++ mv /data/data/mgr-away /data/data/com.topjohnwu.magisk
++ grep -q 'manager answered policy 2' /cache/magisk.log
++ ok 'log: manager answered'
++ PASS=24
++ echo 'SMOKE-PASS: log: manager answered'
+SMOKE-PASS: log: manager answered
++ grep -q 'no manager is installed' /cache/magisk.log
++ ok 'log: no manager'
++ PASS=25
++ echo 'SMOKE-PASS: log: no manager'
+SMOKE-PASS: log: no manager
++ pkill -x magiskd
++ echo 'SMOKE RESULT: pass=25 fail=0'
+SMOKE RESULT: pass=25 fail=0
