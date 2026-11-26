@@ -88,6 +88,8 @@ static int g_uid, g_gid;        // the ids the guest believes it has
 static u32 g_real_uid;
 static char g_qemu[512];        // qemu-arm for the firmware's 32-bit programs (AEMU64_QEMU)
 static int g_crash;
+static int g_mtrace, g_mtrace_on;   // TEMPORARY (Magisk P5 strace, magisk-daemon-diag-desk.md): AEMU64_MTRACE arms trap tracing; only the magisk --daemon instance turns it on (g_mtrace_on), its forked children inherit it with the image
+static volatile long g_mtrace_lines;
 static u64 g_logdev, g_logino;      // the service log on descriptor 2 (a file or a pipe to the app)
 static int g_logpipe;
 static u64 g_inino;                 // ...and the pipe on descriptor 0
@@ -1438,6 +1440,7 @@ static long do_exec(const char *path, char *const argv[], char *const envp[]) {
     s = utoa((u64)egid, t + sizeof t); memcpy(e_id + o, s, slen(s) + 1);
     *a++ = e_id; *a++ = e_f;
     if (g_crash) *a++ = "AEMU64_CRASH=1";
+    if (g_mtrace) *a++ = "AEMU64_MTRACE=1";
     static char e_input[130];
     if (g_input[0]) { memcpy(e_input, "AEMU64_INPUT=", 13); memcpy(e_input + 13, g_input, slen(g_input) + 1); *a++ = e_input; }
     static char e_qemu[540];
@@ -1559,12 +1562,115 @@ static int in_system(long dirfd, const char *h, char *t) {
     return pre(h, g_root) && pre(h + g_rootlen, "/system/");
 }
 
+// ---------------------------------------------------------------------------------------------------- magisk trace
+
+// TEMPORARY (Magisk P5 strace, magisk-daemon-diag-desk.md): when g_mtrace_on (this instance is the
+// magisk daemon — see aemu_main), every trapped call is written to descriptor 2 as a magisk-trace:
+// line, once on entry with its arguments and once on return with its result. The daemon's silence
+// is the thing under measurement: an entry with no matching return line is the call it is parked
+// in, and the tail of the trace is its last words if it exits. Only trapped calls exist here —
+// what the filter lets through natively was never mediated and cannot be where it waits on us.
+// The line budget keeps a chatty daemon from filling the caller's pipe: the interesting lines are
+// the last ones, and the budget is sized so a full trace still fits the shell channel's capture.
+#define MTRACE_LINES 3400
+
+static const char *mtrace_name(long nr) {
+    switch (nr) {
+    case NR_setxattr: return "setxattr"; case NR_lsetxattr: return "lsetxattr";
+    case NR_getxattr: return "getxattr"; case NR_lgetxattr: return "lgetxattr";
+    case NR_listxattr: return "listxattr"; case NR_llistxattr: return "llistxattr";
+    case NR_removexattr: return "removexattr"; case NR_lremovexattr: return "lremovexattr";
+    case NR_getcwd: return "getcwd"; case NR_dup3: return "dup3";
+    case NR_inotify_add_watch: return "inotify_add_watch"; case NR_ioctl: return "ioctl";
+    case NR_mknodat: return "mknodat"; case NR_mkdirat: return "mkdirat";
+    case NR_unlinkat: return "unlinkat"; case NR_symlinkat: return "symlinkat";
+    case NR_linkat: return "linkat"; case NR_renameat: return "renameat";
+    case NR_umount2: return "umount2"; case NR_mount: return "mount";
+    case NR_statfs: return "statfs"; case NR_truncate: return "truncate";
+    case NR_faccessat: return "faccessat"; case NR_chdir: return "chdir";
+    case NR_chroot: return "chroot"; case NR_fchmodat: return "fchmodat";
+    case NR_fchownat: return "fchownat"; case NR_fchown: return "fchown";
+    case NR_openat: return "openat"; case NR_close: return "close";
+    case NR_readlinkat: return "readlinkat"; case NR_newfstatat: return "newfstatat";
+    case NR_fstat: return "fstat"; case NR_timerfd_create: return "timerfd_create";
+    case NR_utimensat: return "utimensat"; case NR_capget: return "capget";
+    case NR_capset: return "capset"; case NR_exit_group: return "exit_group";
+    case NR_unshare: return "unshare"; case NR_ptrace: return "ptrace";
+    case NR_rt_sigaction: return "rt_sigaction"; case NR_rt_sigprocmask: return "rt_sigprocmask";
+    case NR_reboot: return "reboot"; case NR_setregid: return "setregid";
+    case NR_setgid: return "setgid"; case NR_setreuid: return "setreuid";
+    case NR_setuid: return "setuid"; case NR_setresuid: return "setresuid";
+    case NR_getresuid: return "getresuid"; case NR_setresgid: return "setresgid";
+    case NR_getresgid: return "getresgid"; case NR_setfsuid: return "setfsuid";
+    case NR_setfsgid: return "setfsgid"; case NR_getgroups: return "getgroups";
+    case NR_setgroups: return "setgroups"; case NR_uname: return "uname";
+    case NR_prctl: return "prctl"; case NR_socket: return "socket";
+    case NR_bind: return "bind"; case NR_connect: return "connect";
+    case NR_getsockname: return "getsockname"; case NR_sendto: return "sendto";
+    case NR_setsockopt: return "setsockopt"; case NR_getsockopt: return "getsockopt";
+    case NR_sendmsg: return "sendmsg"; case NR_recvmsg: return "recvmsg";
+    case NR_execve: return "execve"; case NR_renameat2: return "renameat2";
+    case NR_statx: return "statx"; case 268: return "setns"; case 61: return "getdents64";
+    default: return 0;
+    }
+}
+
+static void mt_cat(char *t, u64 *o, const char *s) {
+    u64 n = slen(s);
+    if (*o + n > 190) n = *o < 190 ? 190 - *o : 0;
+    memcpy(t + *o, s, n); *o += n; t[*o] = 0;
+}
+static void mt_num(char *t, u64 *o, u64 v) { char n[24]; mt_cat(t, o, utoa(v, n + sizeof n)); }
+static void mt_snum(char *t, u64 *o, long v) { if (v < 0) { mt_cat(t, o, "-"); mt_num(t, o, (u64)-v); } else mt_num(t, o, (u64)v); }
+static void mt_hex(char *t, u64 *o, u64 v) {
+    char n[19]; int i = 18; n[i] = 0;
+    if (!v) n[--i] = '0';
+    while (v) { n[--i] = "0123456789abcdef"[v & 15]; v >>= 4; }
+    mt_cat(t, o, "0x"); mt_cat(t, o, n + i);
+}
+static void mt_head(char *line, u64 *o, long nr) {
+    const char *nm = mtrace_name(nr);
+    mt_cat(line, o, "magisk-trace: ");
+    mt_num(line, o, (u64)S0(NR_gettid));
+    mt_cat(line, o, " ");
+    if (nm) mt_cat(line, o, nm); else { mt_cat(line, o, "nr"); mt_snum(line, o, nr); }
+}
+
+/** Entry line; returns 1 when printed (the caller then owes the trace a return line). */
+static int mtrace_in(long nr, long *a) {
+    if (g_mtrace_lines >= MTRACE_LINES) {
+        if (g_mtrace_lines == MTRACE_LINES) { g_mtrace_lines++; say("magisk-trace: line budget reached, further traps of this process are not printed\n"); }
+        return 0;
+    }
+    g_mtrace_lines++;
+    char line[192]; u64 o = 0;
+    mt_head(line, &o, nr);
+    mt_cat(line, &o, "("); mt_hex(line, &o, (u64)a[0]);
+    mt_cat(line, &o, ", "); mt_hex(line, &o, (u64)a[1]);
+    mt_cat(line, &o, ", "); mt_hex(line, &o, (u64)a[2]);
+    mt_cat(line, &o, ")\n");
+    say(line);
+    return 1;
+}
+
+static void mtrace_out(long nr, long r) {
+    if (g_mtrace_lines >= MTRACE_LINES) return;
+    g_mtrace_lines++;
+    char line[192]; u64 o = 0;
+    mt_head(line, &o, nr);
+    mt_cat(line, &o, " = "); mt_snum(line, &o, r);
+    mt_cat(line, &o, "\n");
+    say(line);
+}
+
 static long trap2(long nr, long *a, void *uc, char **pbp);
 
 static long trap(long nr, long *a, void *uc) {
     char *pb = 0;
+    int mt = g_mtrace_on && mtrace_in(nr, a);
     long r = trap2(nr, a, uc, &pb);
     if (pb) pb_put(pb);
+    if (mt) mtrace_out(nr, r);
     return r;
 }
 
@@ -2823,6 +2929,7 @@ void aemu_main(u64 *sp) {
     if ((r = env_get(envp, "AEMU64_UTS_RELEASE")) && slen(r) < sizeof g_uts_rel) memcpy(g_uts_rel, r, slen(r) + 1);
     if ((r = env_get(envp, "AEMU64_UTS_VERSION")) && slen(r) < sizeof g_uts_ver) memcpy(g_uts_ver, r, slen(r) + 1);
     g_crash = env_get(envp, "AEMU64_CRASH") != 0;
+    g_mtrace = env_get(envp, "AEMU64_MTRACE") != 0;
     if ((r = env_get(envp, "AEMU64_INPUT")) && slen(r) < sizeof g_input) memcpy(g_input, r, slen(r) + 1);
     if ((r = env_get(envp, "AEMU64_SDCARD")) && slen(r) < sizeof g_sd) { g_sdlen = slen(r); memcpy(g_sd, r, g_sdlen + 1); }
     if ((r = env_get(envp, "AEMU64_QEMU")) && slen(r) < sizeof g_qemu) memcpy(g_qemu, r, slen(r) + 1);
@@ -2901,6 +3008,18 @@ void aemu_main(u64 *sp) {
         for (q = g_exe; *q; q++) if (*q == '/') b = q + 1;
         static const char *const mute[] = { "ip", "tc", "iptables", "ip6tables", "iptables-restore", "ip6tables-restore", "ndppd", 0 };
         for (int i = 0; mute[i]; i++) if (seq(b, mute[i])) S1(NR_exit_group, 0);
+    }
+    // TEMPORARY (Magisk P5 strace): AEMU64_MTRACE rides the traced shell channel into every
+    // instance it execs, but only the magisk daemon's own instance turns tracing on — program
+    // magisk, argument --daemon. The daemon's forked children inherit the flag with the image;
+    // anything it execs re-derives it in its own aemu_main through do_exec's re-emission.
+    if (g_mtrace) {
+        const char *b = g_exe, *q;
+        for (q = g_exe; *q; q++) if (*q == '/') b = q + 1;
+        if (seq(b, "magisk")) for (long i = 1; i < gargc; i++) if (seq(gargv[i], "--daemon")) {
+            g_mtrace_on = 1;
+            say("magisk-trace: tracing this daemon's trapped syscalls\n");
+        }
     }
     struct image exe, ld;
     int is32 = 0;
