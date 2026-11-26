@@ -33,15 +33,16 @@ enum {
     NR_mknodat = 33, NR_mkdirat = 34, NR_unlinkat = 35, NR_symlinkat = 36, NR_linkat = 37, NR_renameat = 38,
     NR_umount2 = 39, NR_mount = 40, NR_statfs = 43, NR_truncate = 45, NR_ftruncate = 46, NR_faccessat = 48,
     NR_chdir = 49, NR_chroot = 51, NR_fchmodat = 53, NR_fchownat = 54, NR_fchown = 55, NR_openat = 56, NR_close = 57,
-    NR_lseek = 62, NR_read = 63, NR_write = 64, NR_writev = 66, NR_pread64 = 67, NR_pwrite64 = 68, NR_readlinkat = 78, NR_newfstatat = 79, NR_fstat = 80,
-    NR_timerfd_create = 85, NR_utimensat = 88, NR_capget = 90, NR_capset = 91, NR_exit_group = 94, NR_unshare = 97,
+    NR_lseek = 62, NR_read = 63, NR_write = 64, NR_writev = 66, NR_pread64 = 67, NR_pwrite64 = 68, NR_pselect6 = 72, NR_readlinkat = 78, NR_newfstatat = 79, NR_fstat = 80,
+    NR_timerfd_create = 85, NR_utimensat = 88, NR_capget = 90, NR_capset = 91, NR_exit = 93, NR_exit_group = 94, NR_unshare = 97,
+    NR_futex = 98, NR_nanosleep = 101, NR_clock_nanosleep = 115, NR_setsid = 157,
     NR_ptrace = 117, NR_sched_yield = 124, NR_rt_sigaction = 134, NR_rt_sigprocmask = 135, NR_reboot = 142,
     NR_setregid = 143, NR_setgid = 144, NR_setreuid = 145, NR_setuid = 146, NR_setresuid = 147, NR_getresuid = 148,
     NR_setresgid = 149, NR_getresgid = 150, NR_setfsuid = 151, NR_setfsgid = 152, NR_getgroups = 158, NR_setgroups = 159,
-    NR_uname = 160, NR_prctl = 167, NR_getpid = 172, NR_getuid = 174, NR_geteuid = 175, NR_getgid = 176, NR_getegid = 177, NR_gettid = 178,
-    NR_socket = 198, NR_socketpair = 199, NR_bind = 200, NR_connect = 203, NR_getsockname = 204, NR_sendto = 206, NR_recvfrom = 207, NR_setsockopt = 208, NR_getsockopt = 209,
+    NR_uname = 160, NR_prctl = 167, NR_getpid = 172, NR_getppid = 173, NR_getuid = 174, NR_geteuid = 175, NR_getgid = 176, NR_getegid = 177, NR_gettid = 178,
+    NR_socket = 198, NR_socketpair = 199, NR_bind = 200, NR_listen = 201, NR_connect = 203, NR_getsockname = 204, NR_sendto = 206, NR_recvfrom = 207, NR_setsockopt = 208, NR_getsockopt = 209,
     NR_sendmsg = 211, NR_recvmsg = 212, NR_munmap = 215, NR_execve = 221, NR_mmap = 222, NR_mprotect = 226,
-    NR_renameat2 = 276, NR_memfd_create = 279, NR_statx = 291,
+    NR_accept4 = 242, NR_wait4 = 260, NR_renameat2 = 276, NR_memfd_create = 279, NR_statx = 291,
 };
 
 #define AT_FDCWD (-100)
@@ -1572,6 +1573,20 @@ static int in_system(long dirfd, const char *h, char *t) {
 // what the filter lets through natively was never mediated and cannot be where it waits on us.
 // The line budget keeps a chatty daemon from filling the caller's pipe: the interesting lines are
 // the last ones, and the budget is sized so a full trace still fits the shell channel's capture.
+//
+// The measurement batch widens what is trapped for this one lineage (install_filter_mtrace): the
+// base list has none of the calls a process parks or dies by — read, write, futex, the sleeps and
+// polls, exit itself — so the #109 daemon child could stop between two printed calls and leave no
+// trace of where. Those calls now trap here too and pass through trap2_base unchanged (a case
+// each; the switch's default is -ENOSYS, so a trapped call without a case would be a behaviour
+// change, not a measurement). Two calls are deliberately NOT trapped: clone/clone3. The handler
+// runs the guest's call itself, in the trapping thread; a clone issued there would clone the
+// handler mid-signal, on the guest's child stack, and the child would resume inside the
+// supervisor — mediating clone would break the fork it was meant to observe. New threads and
+// forked children are covered instead by the announcement in mtrace_in: the first trapped call of
+// a tid this image has not printed before introduces it, with its pid and ppid, before its own
+// first line. exit/exit_group do trap and print on entry; the process dies inside the pass-through,
+// so no return line follows — the entry line is the death record.
 #define MTRACE_LINES 3400
 
 static const char *mtrace_name(long nr) {
@@ -1605,6 +1620,11 @@ static const char *mtrace_name(long nr) {
     case NR_setfsgid: return "setfsgid"; case NR_getgroups: return "getgroups";
     case NR_setgroups: return "setgroups"; case NR_uname: return "uname";
     case NR_prctl: return "prctl"; case NR_socket: return "socket";
+    case NR_read: return "read"; case NR_write: return "write"; case NR_writev: return "writev";
+    case NR_futex: return "futex"; case NR_exit: return "exit"; case NR_nanosleep: return "nanosleep";
+    case NR_clock_nanosleep: return "clock_nanosleep"; case NR_setsid: return "setsid";
+    case NR_pselect6: return "pselect6"; case NR_ppoll: return "ppoll"; case NR_listen: return "listen";
+    case NR_accept4: return "accept4"; case NR_wait4: return "wait4";
     case NR_bind: return "bind"; case NR_connect: return "connect";
     case NR_getsockname: return "getsockname"; case NR_sendto: return "sendto";
     case NR_setsockopt: return "setsockopt"; case NR_getsockopt: return "getsockopt";
@@ -1636,12 +1656,40 @@ static void mt_head(char *line, u64 *o, long nr) {
     if (nm) mt_cat(line, o, nm); else { mt_cat(line, o, "nr"); mt_snum(line, o, nr); }
 }
 
+// The tids this image has already printed, and the first of them (the traced instance's own main
+// thread; a forked child inherits both, so its home tid names the lineage root). clone is not
+// trapped (see the section head), so a new thread or child is introduced here instead: the first
+// trapped call of an unlisted tid prints one announcement line — tid, pid, ppid — before its own
+// entry line. The table is per image: threads share it, a fork copies it, and the child's own tid
+// is never in the copy it inherits, so every fork child announces itself exactly once.
+static long mt_seen[64];
+static int mt_nseen;
+static long mt_home_tid;
+
+static void mtrace_note_tid(long tid) {
+    for (int i = 0; i < mt_nseen; i++) if (mt_seen[i] == tid) return;
+    if (mt_nseen >= (int)(sizeof mt_seen / sizeof mt_seen[0])) return;   // table full: stop announcing rather than repeat
+    mt_seen[mt_nseen++] = tid;
+    if (!mt_home_tid) { mt_home_tid = tid; return; }
+    if (g_mtrace_lines >= MTRACE_LINES) return;
+    g_mtrace_lines++;
+    char line[192]; u64 o = 0;
+    mt_cat(line, &o, "magisk-trace: new tid ");
+    mt_num(line, &o, (u64)tid);
+    mt_cat(line, &o, " (pid "); mt_num(line, &o, (u64)S0(NR_getpid));
+    mt_cat(line, &o, ", ppid "); mt_num(line, &o, (u64)S0(NR_getppid));
+    mt_cat(line, &o, ", lineage first tid "); mt_num(line, &o, (u64)mt_home_tid);
+    mt_cat(line, &o, ")\n");
+    say(line);
+}
+
 /** Entry line; returns 1 when printed (the caller then owes the trace a return line). */
 static int mtrace_in(long nr, long *a) {
     if (g_mtrace_lines >= MTRACE_LINES) {
         if (g_mtrace_lines == MTRACE_LINES) { g_mtrace_lines++; say("magisk-trace: line budget reached, further traps of this process are not printed\n"); }
         return 0;
     }
+    mtrace_note_tid((long)S0(NR_gettid));
     g_mtrace_lines++;
     char line[192]; u64 o = 0;
     mt_head(line, &o, nr);
@@ -2586,6 +2634,26 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         if (g_is_netd && a[1] && nlreq_find((int)a[0]) < 0) nlreq_log_untracked((int)a[0], (const void *)a[1], (u64)a[2]);
         return S3(nr, a[0], a[1], a[2]);
     }
+    // The measurement batch's widened traps (install_filter_mtrace, the magisk daemon's lineage
+    // only): every one of these is the real call, executed with the guest's own arguments — the
+    // trap exists so the trace can print it, nothing is answered, swallowed or altered. They are
+    // cases at all because this switch's default is -ENOSYS: a trapped call without one would
+    // hand the daemon an error it never earned, which would be a behaviour change wearing a
+    // measurement's clothes. exit/exit_group never come back from the real call — the entry line
+    // the trace printed before this switch is the process's death record.
+    case NR_read: return S3(nr, a[0], a[1], a[2]);
+    case NR_write: return S3(nr, a[0], a[1], a[2]);
+    case NR_futex: return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
+    case NR_nanosleep: return S2(nr, a[0], a[1]);
+    case NR_clock_nanosleep: return S4(nr, a[0], a[1], a[2], a[3]);
+    case NR_setsid: return S0(nr);
+    case NR_pselect6: return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
+    case NR_ppoll: return S5(nr, a[0], a[1], a[2], a[3], a[4]);
+    case NR_listen: return S2(nr, a[0], a[1]);
+    case NR_accept4: return S4(nr, a[0], a[1], a[2], a[3]);
+    case NR_wait4: return S4(nr, a[0], a[1], a[2], a[3]);
+    case NR_exit: S1(NR_exit, a[0]); return 0;
+    case NR_exit_group: S1(NR_exit_group, a[0]); return 0;
     case NR_recvfrom: {
         // the other half of a swallowed route request: hand back the ack (see nlreq_ack).
         // Everything else — including plain receives on the emulated netlink pairs, whose
@@ -2967,6 +3035,50 @@ static void install_filter_netd(void) {
     if (S3(NR_prctl, 22 /*PR_SET_SECCOMP*/, 2, &prog) < 0) die("netd filter refused", "");
 }
 
+// TEMPORARY (Magisk measurement batch): the traced daemon instance stacks this filter on top of
+// the base one, so the calls it parks or dies by — none of them in the base list — trap and print
+// like the rest of the trace. Forked children inherit it with the base filter; an exec re-derives
+// it in its own aemu_main only if it is again the --daemon instance. Every call trapped here has
+// a pass-through case in trap2_base (the switch's default is -ENOSYS), so mediation is execution
+// with the guest's own arguments and the trace is the only difference. Two of the design's calls
+// are absent on purpose: clone/clone3 (the handler would clone itself mid-signal — new tids are
+// announced in mtrace_in instead) and prctl (the base filter already traps every option but
+// PR_CAP_AMBIENT, and the trace already names it).
+static void install_filter_mtrace(void) {
+    static struct bpf f[32];
+    int n = 0, pos[L_N - 240];
+#define AT(l) pos[(l) - 240] = n
+    f[n++] = LD(4);  f[n++] = JEQ(0xC00000B7u, 0, L_ALLOW);
+    f[n++] = LD(12); f[n++] = JEQ(IMAGE_HI, 0, L_NR);
+    f[n++] = LD(8);  f[n++] = JGE(IMAGE_SPAN, L_NR, L_ALLOW);
+    AT(L_NR); f[n++] = LD(0);
+    f[n++] = JEQ(NR_read, L_TRAP, 0);
+    f[n++] = JEQ(NR_write, L_TRAP, 0);
+    f[n++] = JEQ(NR_writev, L_TRAP, 0);
+    f[n++] = JEQ(NR_futex, L_TRAP, 0);
+    f[n++] = JEQ(NR_exit, L_TRAP, 0);
+    f[n++] = JEQ(NR_exit_group, L_TRAP, 0);
+    f[n++] = JEQ(NR_nanosleep, L_TRAP, 0);
+    f[n++] = JEQ(NR_clock_nanosleep, L_TRAP, 0);
+    f[n++] = JEQ(NR_setsid, L_TRAP, 0);
+    f[n++] = JEQ(NR_pselect6, L_TRAP, 0);
+    f[n++] = JEQ(NR_ppoll, L_TRAP, 0);
+    f[n++] = JEQ(NR_listen, L_TRAP, 0);
+    f[n++] = JEQ(NR_accept4, L_TRAP, 0);
+    f[n++] = JEQ(NR_wait4, L_TRAP, L_ALLOW);
+    AT(L_TRAP); f[n++] = RET(TRAP);
+    AT(L_ALLOW); f[n++] = RET(ALLOW);
+#undef AT
+    for (int i = 0; i < n; i++) {
+        if ((f[i].code & 7) != 5) continue;
+        if (f[i].jt >= 240) f[i].jt = (u8)(pos[f[i].jt - 240] - i - 1);
+        if (f[i].jf >= 240) f[i].jf = (u8)(pos[f[i].jf - 240] - i - 1);
+    }
+    struct { u16 len; struct bpf *f; } prog = { (u16)n, f };
+    S5(NR_prctl, 38 /*PR_SET_NO_NEW_PRIVS*/, 1, 0, 0, 0);
+    if (S3(NR_prctl, 22 /*PR_SET_SECCOMP*/, 2, &prog) < 0) die("mtrace filter refused", "");
+}
+
 // ---------------------------------------------------------------------------------------------------- loader
 
 struct ehdr { u8 ident[16]; u16 type, machine; u32 version; u64 entry, phoff, shoff; u32 flags; u16 ehsize, phentsize, phnum, shentsize, shnum, shstrndx; };
@@ -3176,6 +3288,7 @@ void aemu_main(u64 *sp) {
     }
     if (!env_get(envp, "AEMU64_F")) install_filter();
     if (g_is_netd) install_filter_netd();
+    if (g_mtrace_on) install_filter_mtrace();
     if (g_is_netd) say("aemu-nlreq: netd process: route-request filter installed\n");
 
     // the guest's initial stack: argc, argv, envp (without our variables), auxv
