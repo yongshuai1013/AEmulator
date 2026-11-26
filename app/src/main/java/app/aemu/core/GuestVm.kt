@@ -66,6 +66,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     private val agent = AgentBridge(paths, { settings.agent && AgentSupport.supported(engine, img.api, recoveryMode) },
         { pkg, on -> agentDeny(pkg, on) }, ::log)
     @Volatile private var agentOn = false
+    @Volatile private var substOn = false
 
     @Volatile var state = State.STOPPED
         private set
@@ -108,41 +109,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     private val stateListeners = CopyOnWriteArrayList<(State) -> Unit>()
     private val logFile = File(paths.bin, "aemu.log")
 
-    // ---- VPN 137 measurement: the death-before ring. The last 100 key events
-    // (VPN lifecycle steps and session lines, service starts/exits, zygote events),
-    // dumped into this log whole when the zygote dies. The guest logcat's export
-    // window has missed the death segment five fields running; this ring lives
-    // host-side, in the one channel that always survives, so the seconds before
-    // the cascade are on record even when nothing else is.
-    private val ring137 = java.util.ArrayDeque<String>()
-    private val ring137Lock = Object()
-    @Volatile private var ring137DumpedAt = 0L
-
-    private fun ring137Add(stampedLine: String) {
-        synchronized(ring137Lock) {
-            ring137.addLast(stampedLine)
-            while (ring137.size > 100) ring137.removeFirst()
-        }
-    }
-
-    private fun ring137Note(note: String) = ring137Add("${stamp()} $note")
-
-    private fun dumpRing137(reason: String) {
-        val entries: List<String>
-        synchronized(ring137Lock) {
-            val now = System.currentTimeMillis()
-            if (now - ring137DumpedAt < 10_000) return
-            ring137DumpedAt = now
-            entries = ring137.toList()
-        }
-        log("aemu-137-ring: dump reason=$reason entries=${entries.size}")
-        for (e in entries) log("aemu-137-ring: $e")
-        log("aemu-137-ring: end reason=$reason")
-    }
-
     fun log(s: String) {
         val line = "${stamp()} $s"
-        if (s.startsWith("aemu-vpn:") || s.startsWith("aemu-137:")) runCatching { ring137Add(line) }
         lines.add(line)
         while (lines.size > 3000) lines.removeAt(0)
         runCatching {
@@ -790,6 +758,12 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             agentOn = settings.agent && agentSupported
             AgentSupport.write(paths.root, settings, ::log)
         }
+        // the Magisk substitute gets its own boot seat here, before the service plan starts:
+        // the payload tmp is prepared and the post-fs-data stage runs (the daemon itself is
+        // woken by that first root client, never exec'd by the host). Every host-log line of
+        // this stage carries the magisk-sub: prefix, distinct from any real Magisk boot.
+        substOn = SubstituteSupport.on(img)
+        if (substOn) substPostFsData()
         var glDone = false
         // (debugging, see Kernel64.syncLog: only the first N services are started, then the guest is left as it is)
         val stopAfter = if (engine == Engine.N64 && kernel.syncLog) runCatching { File(paths.root, "dev/.aemu-stop-after").readText().trim().toInt() }.getOrNull() else null
@@ -884,6 +858,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }
         if (!glDone) glUp()
         log("system started: ${alive().joinToString()}")
+        if (substOn) substLateStart()
         watchdog()
     }
 
@@ -1043,7 +1018,6 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         synchronized(procs) { procs[name] = p }
         pidOf(p)?.let { pgids.add(it) }
         log("· $name started")
-        ring137Note("service $name started")
         // netd syscall tracing (measurement build): the pump below stamps every line with the time
         // since this spawn and feeds NetdTrace; its digest lands in this log once the trace settles
         val trace = if (name == "netd" && env["QEMU_STRACE"] == "1" && !direct)
@@ -1128,11 +1102,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             installdTrace?.exited()
             installdTrace?.summary { s -> log(s) }
             val code = runCatching { p.waitFor() }.getOrDefault(-1)
-            if (!stopping) {
-                log("· $name exited, code $code")
-                ring137Note("service $name exited code $code")
-                if (name == "zygote" || name == "zygote_secondary") dumpRing137("$name-exit")
-            }
+            if (!stopping) log("· $name exited, code $code")
             // a restarted service is already running again under this name
             synchronized(procs) { if (procs[name].let { it == null || it === p }) props.put("init.svc.$name", "stopped") }
         }, "log-$name").apply { isDaemon = true; start() }
@@ -1289,6 +1259,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             TreeFixer(ctx, paths, img, ::log).dumpModes("booted")
             setState(State.RUNNING)
             Thread { agentBootComplete() }.start()
+            Thread { substBootComplete() }.start()
             Thread { afterBoot() }.start()
             mirrorTombstones()
         }
@@ -1509,8 +1480,6 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                     val p = synchronized(procs) { procs[name] } ?: continue
                     val code = runCatching { p.exitValue() }.getOrDefault(-1)
                     if (name == "zygote" || name == "zygote_secondary") {
-                        ring137Note("watchdog: $name dead, code $code")
-                        if (code == 137) dumpRing137("watchdog-$name-137")
                         if (state != State.FAILED && bootDoneAt == 0L && !(everBooted && zygoteRestarts < 6)) {
                             failure = "$name exited (code $code)" + if (code == 137) " — killed: the phone ran out of memory, or system_server died and took zygote with it (see the guest log)" else ""
                             if (code == 137 && guestLogHas("No original dex files found"))
@@ -1634,7 +1603,6 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     }
 
     private fun restartZygote() {
-        ring137Note("zygote restarting")
         // the stream keeps the dead system's last records above this marker
         logStream.mark("zygote restart")
         val z = img.services.firstOrNull { it.name == "zygote" } ?: return
@@ -1659,6 +1627,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }
         // the crash that brought us here left its tombstone in the tree; mirror it host-side
         mirrorTombstones(4_000)
+        // the substitute daemon hears about the zygote restart like a real daemon would
+        if (substOn) Thread { runCatching { substExec("--zygote-restart", 30_000) } }.start()
     }
 
     private fun guestLogHas(text: String): Boolean = runCatching {
@@ -1809,10 +1779,155 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     /**
      * The Root Manager in the guest changed the hide list: the guest's own list file is what the
      * per-app views read, and it is applied by the boot path — there is no daemon to tell while the
-     * system runs, so the bridge reports the change as deferred, not as done.
+     * system runs, so the bridge reports the change as deferred, not as done. While the Magisk
+     * substitute's switch is on there IS a daemon to tell: the change goes to its denylist at
+     * once (and the boot-complete seat re-syncs the whole list from the same file).
      */
-    private fun agentDeny(pkg: String, on: Boolean): AgentBridge.DenyAnswer =
-        AgentBridge.DenyAnswer(false, "the guest's list applies at the next boot")
+    private fun agentDeny(pkg: String, on: Boolean): AgentBridge.DenyAnswer {
+        if (substOn) {
+            val out = runCatching { substExec("--denylist ${if (on) "add" else "rm"} $pkg", 30_000) }.getOrElse { it.message ?: "" }
+            log("magisk-sub: denylist ${if (on) "add" else "rm"} $pkg (agent hide list)${out.takeIf { it.isNotBlank() }?.let { " -> $it" } ?: ""}")
+            return AgentBridge.DenyAnswer(true, "applied to the substitute daemon's denylist")
+        }
+        return AgentBridge.DenyAnswer(false, "the guest's list applies at the next boot")
+    }
+
+    /** One substitute CLI call through the payload tmp binary, output trimmed. */
+    private fun substExec(args: String, timeoutMs: Long = 60_000): String =
+        guestShell("${SubstituteSupport.TMP}/magisk $args </dev/null", timeoutMs).trim()
+
+    /**
+     * The substitute's liveness, written for these seats: the daemon's socket file exists in
+     * the guest and the daemon answers CHECK_VERSION. Both halves are logged either way, so
+     * the host log can tell a live substitute from a dead one at every stage.
+     */
+    private fun substLiveness(after: String) {
+        val out = runCatching {
+            guestShell("if [ -S ${SubstituteSupport.TMP}/.magisk/device/socket ]; then ${SubstituteSupport.TMP}/magisk -v; else echo no-socket; fi", 30_000)
+        }.getOrElse { "error: ${it.message}" }.trim()
+        if (out.startsWith("30.7")) log("magisk-sub: daemon alive after $after (version $out)")
+        else log("magisk-sub: daemon NOT answering after $after ($out)")
+    }
+
+    /**
+     * The substitute's pre-services seat: prepare the payload tmp (the daemon's magisk_tmp():
+     * the .magisk structure, the daemon binary, busybox and its applet links — sources are the
+     * /data/adb deployment TreeFixer planted), link the /system names into it, then run the
+     * post-fs-data stage. The stage call is the daemon's first root client of the boot, so it
+     * is also what wakes the daemon (its create=true); the host never execs --daemon.
+     */
+    private fun substPostFsData() {
+        runCatching {
+            val t = SubstituteSupport.TMP
+            guestShell(
+                "mkdir -p $t/.magisk/device $t/.magisk/worker $t/.magisk/mirror $t/.magisk/rootdir $t/.magisk/busybox && " +
+                    "cp ${SubstituteSupport.BIN}/magisk $t/magisk && chmod 755 $t/magisk && " +
+                    "cp ${SubstituteSupport.BIN}/busybox $t/.magisk/busybox/busybox && chmod 755 $t/.magisk/busybox/busybox && " +
+                    "$t/.magisk/busybox/busybox --install -s $t/.magisk/busybox",
+                60_000)
+            substLinkSystem()
+            substExec("--post-fs-data", 120_000)
+            log("magisk-sub: post-fs-data seat done")
+            substLiveness("post-fs-data")
+        }.onFailure { log("magisk-sub: post-fs-data seat failed: ${it.message}") }
+    }
+
+    /**
+     * The /system/bin and /system/xbin names (su, magisk, resetprop) as links into the payload
+     * tmp. A firmware file in the way is set aside as <name>.aemu-orig (only when that name is
+     * still free — a later seat never overwrites the first seat's original); TreeFixer's
+     * switch-off path removes the links and restores the originals.
+     */
+    private fun substLinkSystem() {
+        val t = SubstituteSupport.TMP
+        val cmds = StringBuilder()
+        for (dir in listOf("/system/bin", "/system/xbin")) for (name in SubstituteSupport.SYSTEM_LINKS) {
+            cmds.append(
+                "if [ -L $dir/$name ]; then rm -f $dir/$name; " +
+                    "elif [ -e $dir/$name ]; then if [ -e $dir/$name.aemu-orig ]; then rm -f $dir/$name; else mv $dir/$name $dir/$name.aemu-orig; fi; fi; " +
+                    "ln -s $t/magisk $dir/$name; ")
+        }
+        guestShell(cmds.toString(), 60_000)
+    }
+
+    /** The substitute's late_start seat, after the service plan is up. */
+    private fun substLateStart() {
+        runCatching {
+            substExec("--service")
+            log("magisk-sub: late_start seat done")
+            substLiveness("late_start")
+        }.onFailure { log("magisk-sub: late_start seat failed: ${it.message}") }
+    }
+
+    /**
+     * sys.boot_completed, the substitute's seat: finish the daemon's stage, re-sync its
+     * denylist from the guest agent's hide list (the manager package itself excluded — it
+     * must never hide from itself), and make sure the manager app inside the guest is the
+     * delivered build (see [substInstallApp]).
+     */
+    private fun substBootComplete() {
+        if (!substOn) return
+        runCatching {
+            substExec("--boot-complete")
+            log("magisk-sub: boot-complete seat done")
+            if (agentOn) {
+                val hide = AgentSupport.readHideList(paths.root)?.filter { it != SubstituteSupport.PACKAGE }
+                if (hide != null) {
+                    val cur = substExec("--denylist ls").lines().map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+                    for (pkg in hide) if (pkg !in cur) substExec("--denylist add $pkg", 30_000)
+                    for (pkg in cur) if (pkg !in hide) substExec("--denylist rm $pkg", 30_000)
+                    log("magisk-sub: denylist synced from the hide list (${hide.size} entries)")
+                }
+            }
+            substInstallApp()
+            substLiveness("boot-complete")
+        }.onFailure { log("magisk-sub: boot-complete seat failed: ${it.message}") }
+    }
+
+    /**
+     * The manager app inside the guest, kept at the delivered build: the copy TreeFixer
+     * planted at [SubstituteSupport.APK_PATH], staged through data/local/tmp and installed
+     * with pm — the same versionCode gate and uninstall-on-refusal shape as the agent's
+     * inbox app above. Unlike that app this one is signed with the project's long-term key,
+     * so a replace install across builds is the normal path and the fallback is a rarity.
+     */
+    private fun substInstallApp() {
+        val apk = File(paths.root, SubstituteSupport.APK_PATH)
+        if (!apk.isFile) { log("magisk-sub: ${SubstituteSupport.APK_PATH} is not in the image, no manager app"); return }
+        val pkgPath = guestShell("pm path ${SubstituteSupport.PACKAGE}", 60_000).lines()
+            .firstOrNull { it.startsWith("package:") }?.removePrefix("package:")?.trim()
+        if (pkgPath != null) {
+            val installedCode = Regex("""versionCode=(\d+)""")
+                .find(guestShell("dumpsys package ${SubstituteSupport.PACKAGE}", 60_000))
+                ?.groupValues?.get(1)?.toIntOrNull()
+            val stagedCode = runCatching {
+                ctx.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)?.versionCode
+            }.getOrNull()
+            if (installedCode != null && stagedCode != null) {
+                if (installedCode == stagedCode) { log("magisk-sub: manager app already at versionCode $stagedCode"); return }
+                log("magisk-sub: manager app versionCode $installedCode, delivered $stagedCode: updating")
+            } else {
+                val guestLen = guestShell("wc -c < $pkgPath", 30_000).trim().toLongOrNull()
+                if (guestLen == apk.length()) return
+            }
+        }
+        val staged = File(paths.root, "data/local/tmp").apply { mkdirs() }.let { File(it, "aemu-magisk-sub.apk") }
+        java.nio.file.Files.copy(apk.toPath(), staged.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        staged.setReadable(true, false)
+        try {
+            var out = installApk("/data/local/tmp/aemu-magisk-sub.apk").trim()
+            if (out.contains("Success")) {
+                log("magisk-sub: manager app install -> ${out.take(300)}")
+            } else {
+                log("magisk-sub: manager app update refused (${out.take(200)}); reinstalling from scratch")
+                val un = guestShell("pm uninstall ${SubstituteSupport.PACKAGE}", 60_000).trim()
+                out = installApk("/data/local/tmp/aemu-magisk-sub.apk").trim()
+                log("magisk-sub: manager app install -> ${out.take(300)} (after uninstall: ${un.take(120)})")
+            }
+        } finally {
+            staged.delete()
+        }
+    }
 
     /**
      * sys.boot_completed: the agent's inbox app (the AEmuImport list inside the guest). Staged through data/local/tmp, a plain tree directory the installer reads fine —
