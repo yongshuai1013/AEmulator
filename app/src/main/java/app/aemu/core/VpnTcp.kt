@@ -100,6 +100,7 @@ class VpnTcpConn(
             synSentAt = now
             phase = PHASE_SYN
             emitLocked(buildLocked(FLAG_SYN, isn, 0, EMPTY, true))
+            log("aemu-vpn: flow $id syn-sent dst=${serverIp ushr 24}.${(serverIp ushr 16) and 0xff}.${(serverIp ushr 8) and 0xff}.${serverIp and 0xff}:$serverPort srcport=$srcPort gen=$gen")
         }
     }
 
