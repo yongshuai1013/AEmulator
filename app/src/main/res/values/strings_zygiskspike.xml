@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AEmulator: Zygisk spike (ZygiskSpikeSupport.kt). English only for now; untranslated locales fall back to these. -->
+<resources>
+    <string name="vm_zygiskspike_title">Zygisk (spike)</string>
+    <string name="vm_zygiskspike_sub">Our own bridge library is loaded inside zygote through the native-bridge property and drives modules through the Zygisk API v4 table. This is the landing spike: one test module that only logs its pre/post calls. There is no companion (modules asking for one get -1), the PLT-hook and JNI-hook API calls report unsupported, 32-bit processes get no bridge, the system server path is not hooked, and the Magisk app\'s own Zygisk toggle still has no effect. Applies at the next full boot. Native-engine Android 6.0 (arm64) guests. Experimental.</string>
+    <string name="vm_zygiskspike_sub_unsupported">Our own bridge library inside zygote, driving modules through the Zygisk API v4 table; landing spike scope.</string>
+    <string name="vm_zygiskspike_unsupported">Not supported on this guest yet</string>
+</resources>
