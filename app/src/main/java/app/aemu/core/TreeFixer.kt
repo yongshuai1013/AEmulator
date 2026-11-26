@@ -116,6 +116,7 @@ class TreeFixer(
         if (owners) seedOwners()
         installEngineFiles()
         superuserFiles()
+        substituteFiles()
         terminalFiles()
         gatekeeperFiles()
         protectOat()
@@ -163,7 +164,9 @@ class TreeFixer(
     private fun superuserFiles() {
         val su = File(root, SuperuserSupport.SU_PATH)
         val app = File(root, SuperuserSupport.APP_PATH)
-        if (!(SuperuserSupport.supported(img) && img.settings.superuser)) {
+        // while the Magisk substitute's switch is on it owns the guest's su names, so the
+        // classic plant stays out and a previous plant is taken back by the removal path below
+        if (!(SuperuserSupport.supported(img) && img.settings.superuser) || SubstituteSupport.on(img)) {
             runCatching {
                 val bytes = EngineAssets.open(ctx, SuperuserSupport.SU_ASSET).use { it.readBytes() }
                 if (su.isFile && su.readBytes().contentEquals(bytes)) { su.delete(); log("superuser: su removed (switch off)") }
@@ -196,6 +199,85 @@ class TreeFixer(
                 log("superuser: manager app planted at ${SuperuserSupport.APP_PATH}")
             }
         }.onFailure { log("superuser app: ${it.message}") }
+    }
+
+    /**
+     * Magisk substitute (SubstituteSupport): while this VM's substitute switch is on, deploy
+     * the daemon payload into the guest's /data/adb out of the embedded repacked app — the
+     * binaries and scripts under data/adb/magisk, the app copy beside them (GuestVm installs
+     * it inside the guest at boot-complete and extracts nothing else, so the manager and the
+     * payload are the same bytes by construction), and the module stage directories. The
+     * magisk.db is NOT planted: the daemon creates it with the official schema on first
+     * start. While the switch is off, take the deployment back: payload files and the app
+     * copy byte-compared against the asset (a file that is not ours is never touched), the
+     * /system name links the boot seat made (they point into the payload tmp), and a firmware
+     * file the seat set aside as <name>.aemu-orig is restored when its name is free again.
+     */
+    private fun substituteFiles() {
+        val apkFile = File(root, SubstituteSupport.APK_PATH)
+        val binDir = File(root, "data/adb/magisk")
+        if (!SubstituteSupport.on(img)) {
+            for (dir in listOf("system/bin", "system/xbin")) for (name in SubstituteSupport.SYSTEM_LINKS) {
+                val f = File(root, "$dir/$name")
+                runCatching {
+                    if (isLink(f) && Os.readlink(f.absolutePath) == "${SubstituteSupport.TMP}/magisk") {
+                        f.delete()
+                        log("magisk-sub: link $dir/$name removed (switch off)")
+                    }
+                    val orig = File(root, "$dir/$name.aemu-orig")
+                    if (orig.isFile && !isLink(f) && !f.isFile) {
+                        orig.renameTo(f)
+                        log("magisk-sub: $dir/$name.aemu-orig restored to $dir/$name")
+                    }
+                }.onFailure { log("magisk-sub link cleanup: ${it.message}") }
+            }
+            val assetBytes = runCatching { EngineAssets.open(ctx, SubstituteSupport.APK_ASSET).use { it.readBytes() } }.getOrNull()
+            if (assetBytes != null) runCatching {
+                val tmpApk = File.createTempFile("aemu-magisk-sub", ".apk", ctx.cacheDir)
+                tmpApk.writeBytes(assetBytes)
+                val zip = java.util.zip.ZipFile(tmpApk)
+                for ((entry, rel) in SubstituteSupport.PAYLOAD) {
+                    val f = File(binDir, rel)
+                    val bytes = zip.getEntry(entry)?.let { e -> zip.getInputStream(e).use { it.readBytes() } }
+                    if (bytes != null && f.isFile && f.readBytes().contentEquals(bytes)) {
+                        f.delete()
+                        log("magisk-sub: payload $rel removed (switch off)")
+                    }
+                }
+                zip.close()
+                tmpApk.delete()
+                if (apkFile.isFile && apkFile.readBytes().contentEquals(assetBytes)) {
+                    apkFile.delete()
+                    log("magisk-sub: app copy removed (switch off)")
+                }
+                binDir.takeIf { it.list()?.isEmpty() == true }?.delete()
+            }.onFailure { log("magisk-sub cleanup: ${it.message}") }
+            return
+        }
+        val apkBytes = runCatching { EngineAssets.open(ctx, SubstituteSupport.APK_ASSET).use { it.readBytes() } }
+            .getOrElse { log("magisk-sub: ${SubstituteSupport.APK_ASSET} is not installed (build guest-substitute/build.sh), the payload is not deployed"); return }
+        runCatching {
+            if (!apkFile.isFile || !apkFile.readBytes().contentEquals(apkBytes)) {
+                apkFile.parentFile?.mkdirs()
+                apkFile.writeBytes(apkBytes)
+                apkFile.setReadable(true, false)
+                log("magisk-sub: app copy planted at ${SubstituteSupport.APK_PATH}")
+            }
+            val zip = java.util.zip.ZipFile(apkFile)
+            for ((entry, rel) in SubstituteSupport.PAYLOAD) {
+                val e = zip.getEntry(entry) ?: run { log("magisk-sub: $entry missing from the app copy, skipped"); continue }
+                val bytes = zip.getInputStream(e).use { it.readBytes() }
+                val f = File(binDir, rel)
+                if (!f.isFile || !f.readBytes().contentEquals(bytes)) {
+                    f.parentFile?.mkdirs()
+                    f.writeBytes(bytes)
+                    log("magisk-sub: payload $rel planted")
+                }
+                Os.chmod(f.absolutePath, 0x1ED)   // 0755: binaries and scripts alike
+            }
+            zip.close()
+            for (d in SubstituteSupport.DATA_DIRS) File(root, d).mkdirs()
+        }.onFailure { log("magisk-sub deploy: ${it.message}") }
     }
 
     /**
