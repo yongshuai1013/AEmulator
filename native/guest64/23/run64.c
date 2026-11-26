@@ -2677,6 +2677,108 @@ static void where(u64 addr) {
     S1(NR_close, fd);
 }
 
+// ---------------------------------------------------------------------------------------------------- crash capture
+//
+// 137 naming: when system_server died of SIGSEGV in the field the guest wrote no tombstone and this
+// image printed nothing — the death only showed in the guest log as zygote's "exited due to signal".
+// The relay below sees every fatal signal first, so the naming record is taken here. A delivery only
+// stashes the context (a few stores, no I/O, nothing on the syscall path); one structured aemu-crash
+// block is printed when the signal proves fatal for this process: there is no guest handler
+// (on_crash's path, which calls cc_emit itself), or the same fault is delivered again on the same
+// thread after the guest's handler returned without handling it. Observation only — the relay then
+// does exactly what it did before. Only SIGSEGV and SIGABRT are captured; the other fatal signals
+// keep the old behaviour untouched. If a field cannot be read the block still prints, naming the gap.
+
+static volatile int g_cc_done;              // the block for this process is already out
+static volatile int g_cc_pend;              // a delivery is stashed in the fields below
+static int g_cc_sig;
+static long g_cc_tid;
+static u64 g_cc_pc, g_cc_fault;
+
+static char *cc_hex(u64 v, char *end) { *--end = 0; do *--end = "0123456789abcdef"[v & 15]; while (v >>= 4); *--end = 'x'; *--end = '0'; return end; }
+static u64 cc_hv(char c) { return (u64)(c <= '9' ? c - '0' : c - 'a' + 10); }
+
+// addr -> "<map path>+0x<offset in the file>" from this process's own maps, in the style of where()
+// but written into out; bounded (streamed like where(), at most 8192 lines). out always ends up as
+// the resolution, "unmapped" (maps read, addr in no segment) or "no-maps" (maps could not be read).
+static void cc_mod(u64 addr, char *out, u64 cap) {
+    static char buf[1 << 16];
+    const char *miss = "unmapped";
+    long fd = S4(NR_openat, AT_FDCWD, "/proc/self/maps", 0, 0);
+    if (fd < 0) miss = "no-maps";
+    u64 keep = 0; long n; int lines = 0, found = 0;
+    while (!found && fd >= 0 && lines < 8192 && (n = S3(NR_read, fd, buf + keep, sizeof buf - 1 - keep)) > 0) {
+        u64 len = keep + (u64)n; buf[len] = 0;
+        char *l = buf;
+        for (;;) {
+            char *e = l; while (*e && *e != '\n') e++;
+            if (!*e) break;
+            *e = 0; lines++;
+            u64 lo = 0, hi = 0; char *q = l;
+            for (; *q && *q != '-'; q++) lo = lo * 16 + cc_hv(*q);
+            if (*q) for (q++; *q && *q != ' '; q++) hi = hi * 16 + cc_hv(*q);
+            if (addr >= lo && addr < hi) {
+                u64 off = 0;
+                while (*q == ' ') q++; while (*q && *q != ' ') q++;          // perms
+                while (*q == ' ') q++;
+                for (; *q && *q != ' '; q++) off = off * 16 + cc_hv(*q);    // file offset
+                for (int t = 0; t < 2; t++) { while (*q == ' ') q++; while (*q && *q != ' ') q++; }   // dev, inode
+                while (*q == ' ') q++;
+                const char *path = *q ? q : "[anon]";
+                u64 o = 0;
+                for (const char *p = path; *p && o + 1 < cap; p++) out[o++] = *p;
+                char hb[24]; const char *hs = cc_hex(addr - lo + off, hb + sizeof hb);
+                for (const char *p = "+"; *p && o + 1 < cap; p++) out[o++] = *p;
+                for (const char *p = hs; *p && o + 1 < cap; p++) out[o++] = *p;
+                out[o] = 0; found = 1;
+            }
+            l = e + 1;
+            if (found || lines >= 8192) break;
+        }
+        keep = slen(l); memmove(buf, l, keep);
+    }
+    if (fd >= 0) S1(NR_close, fd);
+    if (!found) { u64 o = 0; while (miss[o] && o + 1 < cap) { out[o] = miss[o]; o++; } out[o] = 0; }
+}
+
+static void cc_emit(int sig, void *info, void *uc) {
+    if (__atomic_exchange_n(&g_cc_done, 1, __ATOMIC_ACQUIRE)) return;
+    struct sigctx *c = (struct sigctx *)((char *)uc + 176);
+    u64 fault = *(u64 *)((char *)info + 16);                    // siginfo's si_addr, as in on_crash
+    int ownfd = -1;
+    if (g_sayfd < 0) {                                          // land in <root>/dev/aemu_crash.log too, as on_crash does
+        static char lp[600];
+        memcpy(lp, g_root, g_rootlen); memcpy(lp + g_rootlen, "/dev/aemu_crash.log", 20);
+        ownfd = (int)S4(NR_openat, AT_FDCWD, lp, 02101 /*O_WRONLY|O_CREAT|O_APPEND*/, 0600);
+        if (ownfd >= 0) g_sayfd = ownfd;
+    }
+    static char pcmod[PATH_MAX + 32], lrmod[PATH_MAX + 32];
+    cc_mod(c->pc, pcmod, sizeof pcmod);
+    cc_mod(c->regs[30], lrmod, sizeof lrmod);
+    char t[24];
+    say("aemu-crash: pid="); say(utoa((u64)S0(NR_getpid), t + sizeof t));
+    say(" comm=");
+    { char nm[20]; memset(nm, 0, sizeof nm); S5(NR_prctl, 16 /*PR_GET_NAME*/, nm, 0, 0, 0); say(nm[0] ? nm : g_exe); }
+    say(" sig="); say(utoa((u64)sig, t + sizeof t));
+    say(" fault="); hex(fault);
+    say(" pc="); hex(c->pc); say(" ("); say(pcmod); say(")");
+    say(" lr="); hex(c->regs[30]); say(" ("); say(lrmod); say(")");
+    say(" sp="); hex(c->sp);
+    say("\n");
+    if (ownfd >= 0) { S1(NR_close, ownfd); g_sayfd = -1; }
+}
+
+// A fatal delivery, seen by the relay: stash it, and if the identical fault comes straight back on
+// the same thread, the guest's handler did not handle it — this delivery is the death, so name it.
+static void cc_note(int sig, void *info, void *uc) {
+    struct sigctx *c = (struct sigctx *)((char *)uc + 176);
+    u64 fault = *(u64 *)((char *)info + 16);
+    long tid = S0(NR_gettid);
+    if (g_cc_pend && g_cc_sig == sig && g_cc_tid == tid && g_cc_pc == c->pc && g_cc_fault == fault)
+        cc_emit(sig, info, uc);
+    g_cc_pend = 1; g_cc_sig = sig; g_cc_tid = tid; g_cc_pc = c->pc; g_cc_fault = fault;
+}
+
 static void on_crash(int sig, void *info, void *uc) {
     struct { u64 fault; u64 regs[31]; u64 sp, pc, pstate; } *c = (void *)((char *)uc + 176);
     char t[24];
@@ -2687,6 +2789,7 @@ static void on_crash(int sig, void *info, void *uc) {
         memcpy(lp, g_root, g_rootlen); memcpy(lp + g_rootlen, "/dev/aemu_crash.log", 20);
         g_sayfd = (int)S4(NR_openat, AT_FDCWD, lp, 02101 /*O_WRONLY|O_CREAT|O_APPEND*/, 0600);
     }
+    if (sig == 11 || sig == 6) cc_emit(sig, info, uc);          // the structured naming line heads the report
     say("aemu64: fatal signal "); say(utoa((u64)sig, t + sizeof t)); say(" in "); say(g_exe);
     { char nm[20]; memset(nm, 0, sizeof nm); S5(NR_prctl, 16 /*PR_GET_NAME*/, nm, 0, 0, 0); say(" ["); say(nm); say("]"); }
     say("\n  pc "); hex(c->pc); say("  lr "); hex(c->regs[30]); say("  addr "); hex(*(u64 *)((char *)info + 16)); say("\n");
@@ -2752,6 +2855,7 @@ static void on_crash(int sig, void *info, void *uc) {
 // debuggerd hook) runs from it with the flags and mask it asked for. Only when the guest has nothing left
 // (SIG_DFL) the crash is reported here, on the program's stderr, with the mappings of pc and the callers.
 static void fatal_relay(int sig, void *info, void *uc) {
+    if (sig == 11 || sig == 6) cc_note(sig, info, uc);          // crash capture: stash (and name a repeat fault)
     if (g_crash) {
         on_crash(sig, info, uc);
         return;
