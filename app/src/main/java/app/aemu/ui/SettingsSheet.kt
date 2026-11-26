@@ -202,14 +202,9 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             Spacer(Modifier.height(8.dp))
             RecoverySection(img)
 
-            var magiskBusy by remember { mutableStateOf(false) }
-            MagiskSection(img, s.magisk, magiskBusy, { magiskBusy = it }) { s = s.copy(magisk = it) }
             SuperuserSection(img, s.superuser) { s = s.copy(superuser = it) }
             QemuZeroSection(img, s.qemuZero) { s = s.copy(qemuZero = it) }
             AgentSection(img, s) { s = it }
-
-            Spacer(Modifier.height(8.dp))
-            ModulesSection(img)
 
             Spacer(Modifier.height(8.dp))
             Text(stringResource(R.string.vs_archive), style = MaterialTheme.typography.titleMedium)
