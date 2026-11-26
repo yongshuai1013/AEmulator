@@ -203,6 +203,7 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             RecoverySection(img)
 
             SuperuserSection(img, s.superuser) { s = s.copy(superuser = it) }
+            SubstituteSection(img, s.magiskSub) { s = s.copy(magiskSub = it) }
             QemuZeroSection(img, s.qemuZero) { s = s.copy(qemuZero = it) }
             AgentSection(img, s) { s = it }
 
