@@ -573,6 +573,11 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }
         // своя панель кнопок у нас — экранную панель гостя (4.x) прячем, чтобы не дублировать
         overrides["qemu.hw.mainkeys"] = if (s.showNavBar && !(engine == Engine.N64 && kernel.navBarRequired)) "1" else "0"
+        // Zygisk spike: point the native-bridge property at our bridge (planted in
+        // /system/lib64 by TreeFixer) so ART loads it inside zygote; only while the
+        // VM's spike switch is on, and before zygote is born - this map is written
+        // into the property area by PropService.prepare ahead of every service.
+        if (ZygiskSpikeSupport.on(img)) overrides[ZygiskSpikeSupport.BRIDGE_PROP] = ZygiskSpikeSupport.BRIDGE_SONAME
         // отладка: run/props.extra — строки ключ=значение поверх всего остального
         File(paths.bin, "props.extra").takeIf { it.isFile }?.readLines()?.forEach { l ->
             val k = l.substringBefore('=').trim()
