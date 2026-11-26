@@ -33,6 +33,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class VpnTestService extends VpnService {
     static final String ACTION_STOP = "app.aemu.agent.VPN_TEST_STOP";
 
+    // The forwarding path logs under its own tag: before the M3 fix this whole path had
+    // no Log calls at all, which is why a dead reader or a parked connect was invisible
+    // from outside the guest (field #122: the service never dialed and nothing said so).
+    private static final String TAG = "aemu-vpn-fwd";
+
     private static final int FLAG_FIN = 0x01;
     private static final int FLAG_SYN = 0x02;
     private static final int FLAG_RST = 0x04;
@@ -130,6 +135,7 @@ public final class VpnTestService extends VpnService {
             }
             tunnel = p;
             VpnTestState.onEstablished();
+            Log.i(TAG, "establish() ok: session 10.99.0.2/32, route 0.0.0.0/0, mtu 1500");
             tunOut = new FileOutputStream(p.getFileDescriptor());
             running = true;
             // Register this app's uid with the hub, through the tunnel itself: the hub exempts
@@ -144,6 +150,8 @@ public final class VpnTestService extends VpnService {
             }, "aemu-vpn-reader");
             reader.setDaemon(true);
             reader.start();
+            Log.i(TAG, "reader thread started; EXEMPT uid=" + android.os.Process.myUid()
+                    + " written as the channel's first content");
         } catch (Throwable t) {
             VpnTestState.set("establish() 失敗：" + t);
             stopSelf();
@@ -156,6 +164,8 @@ public final class VpnTestService extends VpnService {
         byte[] buf = new byte[32767];
         FileInputStream in = new FileInputStream(tunnel.getFileDescriptor());
         readerIn = in;
+        Log.i(TAG, "reader loop entered");
+        boolean firstPacket = true;
         try {
             while (!Thread.currentThread().isInterrupted()) {
                 final int n;
@@ -167,23 +177,40 @@ public final class VpnTestService extends VpnService {
                         Thread.sleep(50);   // the framework opens tun non-blocking; nothing yet
                         continue;
                     }
-                    VpnTestState.set("tun 讀取結束：" + e);
-                    return;
+                    // Any other read error used to end the reader silently (the state page
+                    // got one line, logcat got none) — the M3 field failure mode: the
+                    // service looked alive while its only input was dead. Now: log it and
+                    // keep reading; only a real shutdown (running cleared / interrupt) or
+                    // EOF below ends the loop, and every exit says why.
+                    if (!running || Thread.currentThread().isInterrupted()) {
+                        Log.i(TAG, "reader exiting: read error during shutdown: " + e);
+                        return;
+                    }
+                    Log.w(TAG, "tun read error (continuing): " + e);
+                    VpnTestState.set("tun 讀取錯誤（續讀中）：" + e);
+                    Thread.sleep(100);
+                    continue;
                 }
                 if (n > 0) {
+                    if (firstPacket) {
+                        firstPacket = false;
+                        Log.i(TAG, "first tun packet: " + n + " bytes");
+                    }
                     VpnTestState.addPacket(buf, n);
                     if (running && n >= 20 && (buf[0] >> 4) == 4 && (buf[9] & 0xff) == 6) {
                         forwardPacket(buf, n);
                     }
                 } else if (n < 0) {
+                    Log.i(TAG, "reader exiting: tun read EOF");
                     VpnTestState.set("tun 已關閉（read 回 EOF）");
                     return;
                 } else {
                     Thread.sleep(20);
                 }
             }
+            Log.i(TAG, "reader exiting: interrupted (shutdown)");
         } catch (InterruptedException e) {
-            // stopped: fall through quietly
+            Log.i(TAG, "reader exiting: interrupted (shutdown)");
         }
     }
 
@@ -233,6 +260,8 @@ public final class VpnTestService extends VpnService {
             i += len;
         }
         conns.put(key, c);
+        Log.i(TAG, "conn " + c.no + " startConn: SYN from hub, dst=" + c.dstText
+                + " srcport=" + clientPort);
         VpnTestState.flowOpened(c.no, c.dstText);
         Thread th = new Thread(new Runnable() {
             @Override public void run() { connSocketLoop(c); }
@@ -246,12 +275,22 @@ public final class VpnTestService extends VpnService {
     private void connSocketLoop(final FwdConn c) {
         Socket s = new Socket();
         try {
-            protect(s);
+            // No protect() here, deliberately. The detour exemption in this architecture
+            // is the design's uid registration (the EXEMPT line at session start -> hub ->
+            // the supervisor passes this uid's connects at its trap point, before any
+            // guest routing exists); protect()'s fwmark has no consumer inside the guest,
+            // and the call sat on the critical path unlogged — in the #122 field it is one
+            // of the two places the connect could have parked without a trace. The uid
+            // exemption is what carries this socket out, and this line says so per conn.
+            Log.i(TAG, "conn " + c.no + " connecting to " + c.dstText
+                    + " via uid exemption (no protect())");
             byte[] ipb = new byte[] { (byte) (c.serverIp >>> 24), (byte) (c.serverIp >>> 16),
                     (byte) (c.serverIp >>> 8), (byte) c.serverIp };
             s.connect(new InetSocketAddress(InetAddress.getByAddress(ipb), c.serverPort), 15000);
+            Log.i(TAG, "conn " + c.no + " connected to " + c.dstText);
         } catch (Throwable e) {
             // Refused or unreachable: the hub's optimistic connect gets its answer as a RST.
+            Log.w(TAG, "conn " + c.no + " connect to " + c.dstText + " failed: " + e);
             writeRaw(buildPacket(c, 0, c.rcvNxt, FLAG_RST | FLAG_ACK, null, 0, 0));
             closeConn(c, "connect-failed");
             return;
@@ -268,6 +307,7 @@ public final class VpnTestService extends VpnService {
             c.unacked.add(new Unacked(c.isn + 1, c.synAckPacket));
         }
         writeRaw(c.synAckPacket);
+        Log.i(TAG, "conn " + c.no + " SYN-ACK written back to the hub");
         VpnTestState.flowState(c.no, "ESTABLISHED");
         Thread pump = new Thread(new Runnable() {
             @Override public void run() { connPumpLoop(c); }
@@ -467,6 +507,8 @@ public final class VpnTestService extends VpnService {
         if (c.socket != null) {
             try { c.socket.close(); } catch (Throwable ignored) { }
         }
+        Log.i(TAG, "conn " + c.no + " closed: " + reason
+                + " (up=" + c.upBytes + " down=" + c.downBytes + ")");
         VpnTestState.flowClosed(c.no, reason);
         c.lock.notifyAll();
     }
@@ -506,8 +548,11 @@ public final class VpnTestService extends VpnService {
                     tunOut.write(pkt);
                     tunOut.flush();
                 }
-            } catch (Throwable ignored) {
-                // the session is going away; the hub hears about it from the channel itself
+            } catch (Throwable e) {
+                // the session is going away; the hub hears about it from the channel itself.
+                // Still logged: a write failure on a live session is exactly the kind of
+                // silence this batch exists to remove.
+                Log.w(TAG, "tun write failed (" + pkt.length + " bytes): " + e);
             }
         }
     }
