@@ -120,6 +120,30 @@ static int gles2_for_32(void) {
 }
 static int is_fatal(long sig) { return sig == 11 || sig == 7 || sig == 4 || sig == 6 || sig == 8; }            // AEMU64_CRASH: report fatal signals ourselves
 
+// ---------------------------------------------------------------------------------------------------- mask mediation
+//
+// 137 mask mediation: a synchronous fatal fault whose signal is blocked in the faulting thread's mask is
+// never delivered — the kernel force-kills the whole process group, so the in-process capture below
+// (fatal_relay / aemu-crash) never runs; that is the side the field evidence landed on (three deaths, no
+// block printed). The delivery mask therefore never carries the capture-critical set, however the bits got
+// there. This follows the SYSBIT pattern exactly: one store (the interrupted context's uc_sigmask — what
+// the kernel restores on handler return, and what a guest mask query reads back), stripped in place at the
+// same chokepoints; there is deliberately no separate guest-visible shadow mask, just as SYSBIT has none.
+// The wider AEMU64_CRASH set (the four below plus SIGFPE) stays gated on g_crash exactly as before; the
+// four capture-critical signals are stripped unconditionally. The first strip in a process leaves one
+// aemu-mask line, so a field log shows the mediation actually fired (and for whom).
+#define FATALMASK ((1UL << 10) | (1UL << 5) | (1UL << 6) | (1UL << 3))    // SIGSEGV, SIGABRT, SIGBUS, SIGILL
+static volatile int g_mask_noted;
+static void mask_mediate(u64 *mask) {
+    if (!(*mask & FATALMASK)) return;
+    *mask &= ~FATALMASK;
+    if (__atomic_exchange_n(&g_mask_noted, 1, __ATOMIC_ACQUIRE)) return;
+    char t[24]; char nm[20]; memset(nm, 0, sizeof nm); S5(NR_prctl, 16 /*PR_GET_NAME*/, nm, 0, 0, 0);
+    say("aemu-mask: pid="); say(utoa((u64)S0(NR_getpid), t + sizeof t));
+    say(" comm="); say(nm[0] ? nm : g_exe);
+    say(" stripped SIGSEGV/SIGABRT/SIGBUS/SIGILL\n");
+}
+
 // ---------------------------------------------------------------------------------------------------- paths
 
 // Lexically normalises an absolute guest path into out (no "//", ".", ".."), so it cannot climb out of the root.
@@ -2543,12 +2567,15 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     case NR_rt_sigprocmask: {
         // We are inside a signal handler: the mask that counts is the one the kernel restores on return. SIGSYS
         // stays deliverable whatever the guest asks, or the kernel would kill the process on the next trap.
+        // The capture-critical fatal set stays deliverable too (mask mediation, above): a fault the guest has
+        // blocked would force-kill the process before fatal_relay could name it.
         u64 *mask = (u64 *)((char *)uc + 40), old = *mask;
         if (a[1]) {
             u64 set = *(u64 *)a[1];
             if (a[0] == 0) *mask = old | set; else if (a[0] == 1) *mask = old & ~set; else if (a[0] == 2) *mask = set; else return -EINVAL;
             *mask &= ~(SYSBIT | (1UL << 8) | (1UL << 18));     // and never SIGKILL, SIGSTOP
-            if (g_crash) *mask &= ~((1UL << 10) | (1UL << 6) | (1UL << 3) | (1UL << 5) | (1UL << 7));
+            mask_mediate(mask);
+            if (g_crash) *mask &= ~(1UL << 7);                  // AEMU64_CRASH also keeps SIGFPE deliverable
         }
         if (a[2]) *(u64 *)a[2] = old;
         return 0;
@@ -2685,7 +2712,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             struct ksa old; void *prev = (void *)g_fatal[a[0]];
             long r;
             if (a[1]) {
-                t = *(struct ksa *)a[1]; t.mask &= ~SYSBIT;
+                t = *(struct ksa *)a[1]; t.mask &= ~(SYSBIT | FATALMASK);   // mask mediation: the relay never runs with the capture set blocked
                 void *want = t.h;
                 if ((u64)want != 1) { t.h = (void *)fatal_relay; t.flags |= 4; if (!want) t.flags &= ~0x80000000UL; }   // not SA_RESETHAND for our own
                 r = S4(nr, a[0], &t, &old, a[3]);
@@ -2695,7 +2722,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             return r;
         }
         if (!a[1]) return S4(nr, a[0], 0, a[2], a[3]);
-        t = *(struct ksa *)a[1]; t.mask &= ~SYSBIT;
+        t = *(struct ksa *)a[1]; t.mask &= ~(SYSBIT | FATALMASK);   // mask mediation, as in the fatal path above
         if (g_is32 && (u64)t.h > 1 && a[0] > 0 && a[0] < 65) {     // qemu's handlers leave through relay32
             void *want = t.h, *prev = (void *)g_h32[a[0]];
             t.h = (void *)relay32; t.flags |= 4;
@@ -2936,7 +2963,8 @@ static void fatal_relay(int sig, void *info, void *uc) {
 static void on_sigsys(int sig, void *info, void *uc) {
     struct sigctx *c = (struct sigctx *)((char *)uc + 176);
     (void)sig; (void)info;
-    if (g_crash) *(u64 *)((char *)uc + 40) &= ~((1UL << 10) | (1UL << 6) | (1UL << 3) | (1UL << 5) | (1UL << 7));
+    mask_mediate((u64 *)((char *)uc + 40));                     // mask mediation: the restored mask never blocks the capture-critical set
+    if (g_crash) *(u64 *)((char *)uc + 40) &= ~(1UL << 7);      // AEMU64_CRASH also keeps SIGFPE deliverable
     c->regs[0] = (u64)trap((long)c->regs[8], (long *)c->regs, uc);
 }
 
@@ -3280,7 +3308,7 @@ void aemu_main(u64 *sp) {
     // signal handler first, then the filter (once per process tree: it survives exec)
     struct { void *h; u64 flags; void *restorer; u64 mask; } sa = { (void *)on_sigsys, 4 /*SA_SIGINFO*/ | 0x40000000 /*SA_NODEFER*/, 0, 0 };
     if (S4(NR_rt_sigaction, SIGSYS, &sa, 0, 8) < 0) die("sigaction", "");
-    u64 unblock = SYSBIT; S4(NR_rt_sigprocmask, 1, &unblock, 0, 8);
+    u64 unblock = SYSBIT | FATALMASK; S4(NR_rt_sigprocmask, 1, &unblock, 0, 8);   // deliverable from the first guest instruction (mask mediation)
     {
         struct { void *h; u64 flags; void *restorer; u64 mask; } ca = { (void *)fatal_relay, 4 /*SA_SIGINFO*/ | 0x40000000 /*SA_NODEFER*/, 0, 0 };
         static const int fatal[] = { 11, 7, 4, 6, 8 };
