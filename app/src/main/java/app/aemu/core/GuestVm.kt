@@ -108,8 +108,41 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     private val stateListeners = CopyOnWriteArrayList<(State) -> Unit>()
     private val logFile = File(paths.bin, "aemu.log")
 
+    // ---- VPN 137 measurement: the death-before ring. The last 100 key events
+    // (VPN lifecycle steps and session lines, service starts/exits, zygote events),
+    // dumped into this log whole when the zygote dies. The guest logcat's export
+    // window has missed the death segment five fields running; this ring lives
+    // host-side, in the one channel that always survives, so the seconds before
+    // the cascade are on record even when nothing else is.
+    private val ring137 = java.util.ArrayDeque<String>()
+    private val ring137Lock = Object()
+    @Volatile private var ring137DumpedAt = 0L
+
+    private fun ring137Add(stampedLine: String) {
+        synchronized(ring137Lock) {
+            ring137.addLast(stampedLine)
+            while (ring137.size > 100) ring137.removeFirst()
+        }
+    }
+
+    private fun ring137Note(note: String) = ring137Add("${stamp()} $note")
+
+    private fun dumpRing137(reason: String) {
+        val entries: List<String>
+        synchronized(ring137Lock) {
+            val now = System.currentTimeMillis()
+            if (now - ring137DumpedAt < 10_000) return
+            ring137DumpedAt = now
+            entries = ring137.toList()
+        }
+        log("aemu-137-ring: dump reason=$reason entries=${entries.size}")
+        for (e in entries) log("aemu-137-ring: $e")
+        log("aemu-137-ring: end reason=$reason")
+    }
+
     fun log(s: String) {
         val line = "${stamp()} $s"
+        if (s.startsWith("aemu-vpn:") || s.startsWith("aemu-137:")) runCatching { ring137Add(line) }
         lines.add(line)
         while (lines.size > 3000) lines.removeAt(0)
         runCatching {
@@ -1010,6 +1043,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         synchronized(procs) { procs[name] = p }
         pidOf(p)?.let { pgids.add(it) }
         log("· $name started")
+        ring137Note("service $name started")
         // netd syscall tracing (measurement build): the pump below stamps every line with the time
         // since this spawn and feeds NetdTrace; its digest lands in this log once the trace settles
         val trace = if (name == "netd" && env["QEMU_STRACE"] == "1" && !direct)
@@ -1094,7 +1128,11 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             installdTrace?.exited()
             installdTrace?.summary { s -> log(s) }
             val code = runCatching { p.waitFor() }.getOrDefault(-1)
-            if (!stopping) log("· $name exited, code $code")
+            if (!stopping) {
+                log("· $name exited, code $code")
+                ring137Note("service $name exited code $code")
+                if (name == "zygote" || name == "zygote_secondary") dumpRing137("$name-exit")
+            }
             // a restarted service is already running again under this name
             synchronized(procs) { if (procs[name].let { it == null || it === p }) props.put("init.svc.$name", "stopped") }
         }, "log-$name").apply { isDaemon = true; start() }
@@ -1471,6 +1509,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                     val p = synchronized(procs) { procs[name] } ?: continue
                     val code = runCatching { p.exitValue() }.getOrDefault(-1)
                     if (name == "zygote" || name == "zygote_secondary") {
+                        ring137Note("watchdog: $name dead, code $code")
+                        if (code == 137) dumpRing137("watchdog-$name-137")
                         if (state != State.FAILED && bootDoneAt == 0L && !(everBooted && zygoteRestarts < 6)) {
                             failure = "$name exited (code $code)" + if (code == 137) " — killed: the phone ran out of memory, or system_server died and took zygote with it (see the guest log)" else ""
                             if (code == 137 && guestLogHas("No original dex files found"))
@@ -1594,6 +1634,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     }
 
     private fun restartZygote() {
+        ring137Note("zygote restarting")
         // the stream keeps the dead system's last records above this marker
         logStream.mark("zygote restart")
         val z = img.services.firstOrNull { it.name == "zygote" } ?: return
