@@ -96,6 +96,21 @@ jobs:
           path: |
             app/src/main/assets/engines/kk/aemu-su
             app/src/main/assets/engines/kk/aemu-superuser.apk
+      - name: Build guest Magisk substitute stack
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          AEMU_KEYSTORE_B64: ${{ secrets.AEMU_KEYSTORE_B64 }}
+          AEMU_KEYSTORE_PASSWORD: ${{ secrets.AEMU_KEYSTORE_PASSWORD }}
+        run: |
+          echo "$AEMU_KEYSTORE_B64" | base64 -d > /tmp/aemulator.p12
+          export AEMU_KEYSTORE_FILE=/tmp/aemulator.p12
+          sh app/guest-substitute/build.sh
+          ls -l app/src/main/assets/engines/kk/aemu-magisk-sub.apk
+          sha256sum app/src/main/assets/engines/kk/aemu-magisk-sub.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aemu-magisk-sub-apk
+          path: app/src/main/assets/engines/kk/aemu-magisk-sub.apk
       - name: Build guest terminal app from source
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
