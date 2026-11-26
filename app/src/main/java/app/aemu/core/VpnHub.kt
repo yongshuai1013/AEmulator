@@ -43,6 +43,8 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
     private val flows = HashMap<Int, Flow>()
     private var nextFlow = 1
     private var nextListener = 1
+    /** VPN 137 measurement: sessions since boot, numbered in registration order */
+    private var sessionSeq = 0
     @Volatile private var session: Session? = null
     @Volatile private var exemptUid = -1
 
@@ -50,6 +52,11 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
 
     fun stop() {
         server.stop()
+        session?.let { s ->
+            val fc: Int; val lc: Int
+            synchronized(lock) { fc = flows.size; lc = listeners.size }
+            step(s, "hub-stop flows=$fc listeners=$lc")
+        }
         synchronized(lock) {
             session?.let { it.alive = false; closeFd(it.peerFd) }
             session = null
@@ -76,6 +83,8 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
 
     private class Session(val name0: String) {
         @Volatile var name = name0
+        /** VPN 137 measurement: this session's sequence number since boot (S1, S2, ...) */
+        @Volatile var seq = 0
         @Volatile var index = 0
         @Volatile var mtu = 1500
         @Volatile var addr = 0
@@ -127,7 +136,11 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
     /** Returns true when the frame's descriptor (if any) was taken over. */
     private fun handle(conn: Conn, type: Int, pl: ByteArray, fd: FileDescriptor?): Boolean {
         when (type) {
-            T_HELLO -> conn.send(T_SESSION_STATE, statePayload())
+            T_HELLO -> {
+                conn.send(T_SESSION_STATE, statePayload())
+                val s = session
+                step(s, "hello state-query -> up=${if (s != null && s.up) 1 else 0} name=${s?.name ?: ""} addr=${s?.let { ip(it.addr) } ?: "-"} mtu=${s?.mtu ?: 0} exempt=$exemptUid")
+            }
             T_TUN_PEER -> {
                 if (fd == null) return false
                 // A new channel while the old session is still registered means the old
@@ -147,17 +160,20 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                 s.tunOut = FileOutputStream(fd)
                 synchronized(lock) {
                     session?.let { it.alive = false; closeFd(it.peerFd) }
+                    s.seq = ++sessionSeq
                     session = s
                 }
+                step(s, "tun-channel-acquired" + if (stale != null) " replaces S${stale.seq} (stale session torn down first)" else "")
                 Thread({ tunReader(s) }, "vpnhub-tun").apply { isDaemon = true; start() }
                 conn.send(T_PEER_OK, ByteArray(0))
                 log("aemu-vpn: the hub holds the tun channel; waiting for the session's address")
                 return true
             }
-            T_SESSION_CFG -> if (pl.size >= 24) synchronized(lock) {
-                session?.let { s ->
-                    s.name = name16(pl, 0); s.index = le32(pl, 16); s.mtu = le32(pl, 20)
+            T_SESSION_CFG -> if (pl.size >= 24) {
+                val s = synchronized(lock) {
+                    session?.also { it.name = name16(pl, 0); it.index = le32(pl, 16); it.mtu = le32(pl, 20) }
                 }
+                if (s != null) step(s, "session-cfg name=${s.name} index=${s.index} mtu=${s.mtu}")
             }
             T_SESSION_UP -> if (pl.size >= 28) {
                 var s: Session? = null
@@ -172,17 +188,26 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                     broadcastState()
                     linkEvent(true, up)
                     log("aemu-vpn: session ${up.name} up at ${ip(up.addr)} mtu ${up.mtu}; guest connections will be detoured into the tunnel")
+                    val fc: Int; val lc: Int; val cc: Int
+                    synchronized(lock) { fc = flows.size; lc = listeners.size; cc = conns.size }
+                    step(up, "session-up name=${up.name} index=${up.index} addr=${ip(up.addr)} mtu=${up.mtu} flows=$fc listeners=$lc state-broadcast-to=$cc")
                 }
             }
             T_FLOW_NEW -> {
                 if (pl.size < 12) return false
                 val s = session
-                if (s == null || !s.up) { conn.send(T_FLOW_NO, ByteArray(0)); return false }
+                if (s == null || !s.up) {
+                    step(s, "flow-rejected uid=${le32(pl, 0)} dst=${ip(le32(pl, 4))}:${le16(pl, 8)} reason=no-live-session")
+                    conn.send(T_FLOW_NO, ByteArray(0)); return false
+                }
                 val f: Flow
+                val fcount: Int
                 synchronized(lock) {
                     f = Flow(nextFlow++, le32(pl, 0), le32(pl, 4), le16(pl, 8), le16(pl, 10))
                     flows[f.id] = f
+                    fcount = flows.size
                 }
+                step(s, "flow-new id=${f.id} uid=${f.uid} dst=${ip(f.dstIp)}:${f.dstPort} srcport=${f.srcPort} flows=$fcount")
                 val id = ByteArray(4); putLe32(id, 0, f.id)
                 conn.send(T_FLOW_OK, id)
             }
@@ -191,6 +216,7 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                 val f = synchronized(lock) { flows[le32(pl, 0)] }
                 val s = session
                 if (f == null || s == null) return false
+                step(s, "flow-fd id=${f.id}")
                 f.fd = fd
                 Thread({ flowReader(s, f) }, "vpnhub-flow").apply { isDaemon = true; start() }
                 return true
@@ -204,12 +230,15 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                 }
                 val id = ByteArray(4); putLe32(id, 0, l.id)
                 conn.send(T_LINKREG_OK, id)
+                step(session, "listener-registered id=${l.id} proto=${l.proto} listeners=${synchronized(lock) { listeners.size }}")
                 session?.takeIf { it.up }?.let { linkEventTo(l, true, it) }
                 return true
             }
             T_LINKUNREG -> if (pl.size >= 4) {
-                val l = synchronized(lock) { listeners.remove(le32(pl, 0)) }
+                val lid = le32(pl, 0)
+                val l = synchronized(lock) { listeners.remove(lid) }
                 if (l != null) closeFd(l.fd)
+                step(session, "listener-unregistered id=$lid found=${l != null} listeners=${synchronized(lock) { listeners.size }}")
             }
         }
         return false
@@ -243,9 +272,19 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         for (c in cs) runCatching { c.send(T_SESSION_DOWN, pl) }
     }
 
+    // ---- VPN 137 measurement: one line per lifecycle step, each opening with the
+    // session's sequence number, so two sessions' step sequences can be diffed line
+    // by line after a field run and the first divergent step read off directly.
+    // Record-only: nothing here feeds back into behaviour, and the volume is capped
+    // by construction — lifecycle and netlink events only, never per-packet.
+    private fun step(s: Session?, msg: String) {
+        log("aemu-137: S${s?.seq?.toString() ?: "-"} $msg")
+    }
+
     // The channel is a datagram pair: one read is one packet the guest wrote into the tunnel.
     private fun tunReader(s: Session) {
         val buf = ByteArray(65536)
+        var endedByWord = false
         try {
             while (s.alive) {
                 val n = s.tunIn!!.read(buf)
@@ -261,6 +300,7 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                     line.toIntOrNull()?.let { uid ->
                         exemptUid = uid
                         log("aemu-vpn: the VPN app registered its uid $uid as exempt from the detour")
+                        step(s, "exempt-registered uid=$uid")
                         broadcastState()
                     }
                     continue
@@ -278,6 +318,8 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                     buf[10] == 'D'.code.toByte()
                 ) {
                     log("aemu-vpn: SESSION_END from the VPN app on session ${s.name}: ending the session on its word")
+                    step(s, "session-end-word")
+                    endedByWord = true
                     break
                 }
                 s.appPkts++
@@ -285,6 +327,7 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
             }
         } catch (_: Throwable) {
         }
+        if (!endedByWord) step(s, "tun-channel-closed (ran dry or read failed)")
         sessionDown(s)
     }
 
@@ -326,9 +369,11 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         broadcastState()
         broadcastDown(s.name)
         log("aemu-vpn: session ${s.name} registry cleared (tun registration, $flowCount flow(s), exempt uid $hadExempt released); SESSION_DOWN broadcast")
+        step(s, "registry-cleared flows=$flowCount listeners=$listenerCount exempt=$hadExempt down-broadcast-to=${synchronized(lock) { conns.size }}")
         linkEvent(false, s)
         log("aemu-vpn: RTM_DELLINK for ${s.name} injected to $listenerCount link listener(s)")
         log("aemu-vpn: session ${s.name} over: ${s.appPkts} packets from the app, ${s.synthPkts} synthesized packets back")
+        step(s, "session-over appPkts=${s.appPkts} synthPkts=${s.synthPkts}")
     }
 
     // The synthesizer (M2's half of the terminator): the detoured connection's byte stream is
@@ -359,6 +404,7 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         if (f.open && s.alive) writePacket(s, tcpPacket(s, f, FLAG_FIN or FLAG_ACK, ByteArray(0)))
         f.open = false
         synchronized(lock) { flows.remove(f.id) }
+        step(s, "flow-end id=${f.id} flows=${synchronized(lock) { flows.size }}")
         closeFd(f.fd)
     }
 
@@ -442,13 +488,17 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         // parser), and the removal is what the framework's whole VPN teardown waits for.
         // Route-protocol listeners keep the binary rtnetlink message they had.
         val msg = if (l.proto == PROTO_UEVENT) ueventMessage(up, s) else linkMessage(up, s)
+        val typeName = if (l.proto == PROTO_UEVENT) (if (up) "uevent-add" else "uevent-remove")
+            else (if (up) "RTM_NEWLINK" else "RTM_DELLINK")
         try {
             synchronized(l.wlock) { l.out.write(msg); l.out.flush() }
+            step(s, "link-event type=$typeName listener=${l.id} proto=${l.proto} name=${s.name} index=${s.index}")
         } catch (_: Throwable) {
             // A listener that will not take the event is gone; the supervisor's own
             // LINKUNREG may never arrive, so drop it here too.
             synchronized(lock) { if (listeners[l.id] === l) listeners.remove(l.id) }
             closeFd(l.fd)
+            step(s, "link-event-failed type=$typeName listener=${l.id} proto=${l.proto} (listener dropped)")
         }
     }
 
