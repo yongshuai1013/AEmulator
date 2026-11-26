@@ -20,6 +20,9 @@ object Sdcard {
     fun setup(ctx: Context, paths: VmPaths, img: GuestImage, log: (String) -> Unit): File? {
         val d = choose(ctx, img, log) ?: return null
         LAYOUT.forEach { File(d, it).mkdirs() }
+        // Samsung: the card is /mnt/sdcard/external_sd, but qemu maps all of /mnt/sdcard to [d], so the placeholder in the
+        // guest tree is hidden and the path does not exist (Settings shows "00"). Create it inside the shared folder.
+        img.sdcardPath.trim('/').takeIf { it.startsWith("mnt/sdcard/") }?.let { File(d, it.removePrefix("mnt/sdcard/")).mkdirs() }
         val readme = File(d, "README-AEmulator.txt")
         if (!readme.isFile) runCatching {
             readme.writeText(
@@ -53,7 +56,7 @@ object Sdcard {
             }
         }
         ctx.getExternalFilesDir(null)?.let { tries.add(File(it, "sdcard-${img.id}")) }
-        tries.add(File(ctx.filesDir, "sdcard-${img.id}"))
+        tries.add(File(ctx.filesDir.canonicalFile, "sdcard-${img.id}"))   // canonical: see ImageStore.imagesDir
         for (t in tries) if (writable(t)) return t else log("sdcard: ${t.absolutePath} not writable, trying next")
         log("sdcard: no writable location")
         return null
