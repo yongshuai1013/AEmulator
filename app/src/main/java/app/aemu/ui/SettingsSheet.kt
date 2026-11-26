@@ -204,6 +204,7 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
 
             SuperuserSection(img, s.superuser) { s = s.copy(superuser = it) }
             SubstituteSection(img, s.magiskSub) { s = s.copy(magiskSub = it) }
+            ZygiskSpikeSection(img, s.zygiskSpike) { s = s.copy(zygiskSpike = it) }
             QemuZeroSection(img, s.qemuZero) { s = s.copy(qemuZero = it) }
             AgentSection(img, s) { s = it }
 
