@@ -11,7 +11,7 @@ import java.io.File
  *    owned and written by the Root Manager app inside the guest through the agent; the agent resolves it
  *    to uids and keeps <root>/dev/.aemu-hideuids current. The host only ever reads the list: [write]
  *    seeds the uid set from it (through the image's packages.xml) for the window before the agent is up,
- *    and the boot path hands it to the Magisk daemon as its denylist. packages.xml is the package
+ *    packages.xml is the package
  *    manager's own database (text form; Android 12+ writes a binary ABX form we do not parse — then only
  *    the agent's answer counts, and it comes as soon as it connects).
  *  - the APK import: the host streams the file over the agent socket and the agent writes it into the
@@ -36,9 +36,12 @@ object AgentSupport {
     const val JAR_PATH = "system/framework/aemu-agent.jar"
     const val JAR_NAME = "aemu-agent.jar"
     const val MAIN_CLASS = "app.aemu.agent.AgentStub"
-    /** the delivered inbox app (TreeFixer), installed at boot complete like the Magisk app */
+    /** the delivered inbox app (TreeFixer), installed at boot complete */
     const val APK_COPY = "data/adb/aemu-agent.apk"
     const val APP_PACKAGE = "app.aemu.agent"
+    /** the Magisk manager's package name: if a guest still carries that app it is never put on a hide
+     * list — it manages root, so it must always see the full guest (the agent refuses it at write time too) */
+    const val MAGISK_PACKAGE = "com.topjohnwu.magisk"
     /** guest path of the uid set the mount layer filters by (vmount.h reads <root>/dev/.aemu-hideuids) */
     const val HIDEUIDS = "dev/.aemu-hideuids"
     /** host socket name (VmPaths.socket), the guest connects to /dev/socket/aemu-agent */
@@ -95,7 +98,7 @@ object AgentSupport {
             // one-time migration: the list still lives in the legacy settings field (the host-side picker
             // the Root Manager replaces). Copy it into the guest once; from then on the file is the only
             // source and this branch never runs again for this image.
-            val migrated = s.hiddenApps.filter { it != MagiskCore.PACKAGE && it != APP_PACKAGE }.distinct()
+            val migrated = s.hiddenApps.filter { it != MAGISK_PACKAGE && it != APP_PACKAGE }.distinct()
             val done = runCatching {
                 val f = File(root, LIST_FILE).apply { parentFile?.mkdirs() }
                 f.writeText(migrated.joinToString("\n", postfix = if (migrated.isEmpty()) "" else "\n"))
@@ -109,7 +112,7 @@ object AgentSupport {
             }
         }
         // the places root is managed from are never hidden from (the agent refuses them at write time too)
-        val list = (hidden ?: emptyList()).filter { it != MagiskCore.PACKAGE && it != APP_PACKAGE }
+        val list = (hidden ?: emptyList()).filter { it != MAGISK_PACKAGE && it != APP_PACKAGE }
         if (list.isEmpty()) {
             if (uidFile.isFile && uidFile.delete()) log("agent: hide list empty, the uid set is removed (no reader is hidden)")
             return
