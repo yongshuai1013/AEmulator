@@ -19,7 +19,6 @@ import app.aemu.core.*
  * (the KK/GB engines and 32-bit firmwares), whose supervisors have no exec elevation point and
  * which could not run the arm64 su anyway — the row stays visible with an honest
  * not-supported label in place of a switch that would do nothing.
- * Independent of the Magisk switch; both may be on.
  */
 @Composable
 internal fun SuperuserSection(img: GuestImage, enabled: Boolean, setEnabled: (Boolean) -> Unit) {
