@@ -1055,6 +1055,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         // log; mirror them here like netd's, or a field run has to know to export zygote.log
         // before it can tell whether the watcher was on post at all
         val watchMirror = name == "zygote"
+        // the supervisor-side 137 measurement lines (aemu-137r:) are printed by EVERY
+        // service's supervisor (system_server's and netd's above all); mirror them from
+        // all services, or they die in the per-service logs like aemu-tun: did before them
         Thread({
             if (!direct) runCatching {
                 OutputStreamWriter(FileOutputStream(log, true)).use { w ->
@@ -1064,6 +1067,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                             w.write(it); w.write("\n"); w.flush()
                             if (nlMirror && (it.startsWith("aemu-nlreq:") || it.startsWith("aemu-nllink:"))) log(it)
                             if (watchMirror && (it.startsWith("aemu-watch:") || it.startsWith("aemu-crash: watcher"))) log(it)
+                            if (it.startsWith("aemu-137r:")) log(it)
                         }
                     } else {
                         var rawLines = 0
@@ -1091,6 +1095,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                                 log(line)
                             }
                             if (watchMirror && (line.startsWith("aemu-watch:") || line.startsWith("aemu-crash: watcher"))) {
+                                log(line)
+                            }
+                            if (line.startsWith("aemu-137r:")) {
                                 log(line)
                             }
                         }
