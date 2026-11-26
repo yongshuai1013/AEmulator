@@ -731,6 +731,17 @@ static long trap(long nr, long *a, void *uc) {
 
 #include "../vmount.h"
 
+// Ported from AEmulator Plus (2026-11-11): "/proc/<pid>/fd" is what an O_PATH descriptor of /proc/self/fd reads as.
+// bionic's realpath() (std::fs::canonicalize) opens the path that way, reads the descriptor's link and then checks
+// that the answer is the same file (fstat of the descriptor against stat of the answer): with "/dev/null" for the
+// answer it never is, and realpath fails with ENOENT. So an fd target that is a /proc fd directory itself is not
+// folded to /dev/null in the readlink filter below.
+static int is_proc_fddir(const char *t) {
+    if (!pre(t, "/proc/") || t[6] < '0' || t[6] > '9') return 0;
+    const char *q = t + 6;
+    while (*q >= '0' && *q <= '9') q++;
+    return seq(q, "/fd");
+}
 static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     int err = 0;
     switch (nr) {
@@ -881,7 +892,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             if (pre(q, "/fd/")) {
                 if (pre(t, "/memfd:aemu-ashmem")) memcpy(t, "/dev/ashmem", 12);
                 else if (!(pre(t, g_root) && (t[g_rootlen] == '/' || !t[g_rootlen])) && !pre(t, "/dev/") &&
-                         !(g_sdlen && pre(t, g_sd))) memcpy(t, "/dev/null", 10);
+                         !(g_sdlen && pre(t, g_sd)) && !is_proc_fddir(t)) memcpy(t, "/dev/null", 10);
             }
         }
         unxl(t);
