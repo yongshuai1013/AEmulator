@@ -487,6 +487,17 @@ class VmActivity : ComponentActivity() {
         guestAsync(script)
     }
 
+    /** Packs all host/guest logs + a state snapshot into a zip in Downloads (works without root and without a running guest). Ported from upstream AEmulator Plus (2026-11-27). */
+    private fun saveLogs() {
+        toast(getString(R.string.m_save_logs_start))
+        thread {
+            val r = runCatching { app.aemu.core.DiagExport.export(applicationContext, vm) }
+            runOnUiThread {
+                Toast.makeText(this, r.fold({ getString(R.string.m_save_logs_ok, it) }, { getString(R.string.m_save_logs_fail, it.toString().take(160)) }), Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
     /**
      * The frame is taken on the host (the fb0 copy, or the GPU bridge's surface through PixelCopy): `screencap` does
      * not exist before 4.0 and cannot read the bridge's frames. The PNG lands in the guest's Pictures folder.
@@ -894,6 +905,8 @@ class VmActivity : ComponentActivity() {
                     DropdownMenuItem(text = { Text(stringResource(if (vncOn.value) R.string.m_vnc_stop else R.string.m_vnc)) },
                         leadingIcon = { Icon(Icons.Rounded.Cast, null) },
                         onClick = { menu = false; toggleVnc() })
+                    DropdownMenuItem(text = { Text(stringResource(R.string.m_save_logs)) }, leadingIcon = { Icon(Icons.Rounded.Download, null) },
+                        onClick = { menu = false; saveLogs() })
                     DropdownMenuItem(text = { Text(stringResource(R.string.m_reset_menu_pos)) }, leadingIcon = { Icon(Icons.Rounded.RestartAlt, null) },
                         onClick = { menu = false; menuOffset = Offset.Zero; saveMenuOffset() })
                     HorizontalDivider()
