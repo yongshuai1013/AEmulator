@@ -140,6 +140,13 @@ sysfs /sys sysfs rw,relatime 0 0
             val link = File(r, "sdcard")
             if (link.isDirectory && link.list().isNullOrEmpty()) { link.delete(); runCatching { Os.symlink(sdcard.absolutePath, link.path) } }
         }
+        // partition seat (layer 1): the by-name devices and the mount table for this root too —
+        // a recovery script unmounting /system died with ENOENT because the by-name node it
+        // stats never existed. Only with the image's bootSeat setting on and a kept boot image.
+        if (settings?.bootSeat == true && PartitionSeat.bootImage(paths).isFile) {
+            PartitionSeat.plantByName(r, paths)
+            PartitionSeat.arm(r)
+        }
     }
 
     /** a ramdisk mount point may hold empty folders (TWRP: system/bin); it still gets linked to the partition */
