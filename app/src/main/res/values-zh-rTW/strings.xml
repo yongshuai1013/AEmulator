@@ -5,4 +5,10 @@
     <string name="m_save_logs_ok">日誌已儲存：%1$s</string>
     <string name="m_save_logs_fail">無法儲存日誌：%1$s</string>
     <string name="bluetooth_permission_denied">藍牙權限遭拒：客體將在沒有主機藍牙的情況下開機。</string>
+    <string name="vs_soc">向虛擬機回報的晶片（SoC）</string>
+    <string name="vs_soc_sub">寫入 /proc/cpuinfo、/sys/devices/soc0，以及屬性 ro.board.platform（所有 Android 版本）與 ro.soc.model / ro.soc.manufacturer（Android 12+）。核心數與 CPU 頻率也跟著改變。完全重新啟動虛擬機後生效。</string>
+    <string name="vs_soc_default">預設（%1$s）</string>
+    <string name="vs_soc_host">本機（這支手機）</string>
+    <string name="vs_soc_custom">自訂</string>
+    <string name="vs_soc_pick">選擇晶片</string>
 </resources>
