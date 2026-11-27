@@ -1,9 +1,0 @@
-service vendor.aemu-radio /system/bin/aemu-radio
-    class hal
-    user system
-    group system radio inet
-    interface android.hardware.radio@1.0::IRadio slot1
-    interface android.hardware.radio@1.1::IRadio slot1
-    interface android.hardware.radio@1.2::IRadio slot1
-    interface android.hardware.radio@1.3::IRadio slot1
-    interface android.hardware.radio@1.4::IRadio slot1

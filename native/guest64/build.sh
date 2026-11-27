@@ -64,13 +64,6 @@ if [ -f gralloc_qcom.c ]; then
   "$BIN/clang" --target=armv7a-linux-androideabi21 -mthumb $F -Wl,--hash-style=both -o "$A/$P#lib#libgralloc_qcom.so" gralloc_qcom.c -ldl -lc || exit 1
   "$BIN/llvm-strip" "$A/$P#lib64#libgralloc_qcom.so" "$A/$P#lib#libgralloc_qcom.so" 2>/dev/null || true
 fi
-# a kernel whose guest needs a radio HAL the GSI does not ship (10: android.hardware.radio@1.4::IRadio/slot1,
-# answered by translating to the host's RilStub on /dev/socket/rild). An ordinary dynamic program for the
-# GSI layer, like binderd; -fno-rtti because the service forges its HIDL vtable by declaration order and
-# must not grow typeinfo references to the platform's interface classes.
-if [ -f hal/radio_host.cpp ]; then
-  R="../../../app/src/main/assets/engines/n64-$TAG-gsi/system#bin#aemu-radio"
-  "$BIN/clang++" --target=aarch64-linux-android29 -O2 -Wall -pthread -fno-rtti -static-libstdc++ \
-    -Wl,--build-id=none -o "$R" hal/radio_host.cpp -ldl || exit 1
-  "$BIN/llvm-strip" "$R" 2>/dev/null || true
-fi
+# The radio HAL seat is the freestanding radio_service.c of native/radiohal now (single 1.0 declaration,
+# manual IServiceManager registration); hal/radio_host.cpp is frozen in the tree, no longer built: its
+# five-version fragment was ill-formed and its first registration attempt (1.4) aborted in libhidlbase.
