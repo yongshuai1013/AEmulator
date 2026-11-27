@@ -2765,10 +2765,65 @@ static int is_proc_fddir(const char *t) {
     while (*q >= '0' && *q <= '9') q++;
     return seq(q, "/fd");
 }
+// ---------------------------------------------------------------------------------------------------- 137 fix: relay context (jia)
+// The death this answers (field of 2026-11-27 11:41, trap2-death-desk.md): a guest handler running
+// under fatal_relay issued a trapped syscall near the bottom of its stack, and this function's header
+// housekeeping — tun_drain(), whose session-end branch carries a 0xb20 frame — took the last of the
+// stack; the second fault, inside the relay, killed the process. While a thread is anywhere inside
+// fatal_relay (the guest handler's whole run included), the trap header therefore skips
+// tun_drain()/hub_pump() and goes straight to the switch: the chores are opportunistic and
+// process-wide, and simply land on the next top-level trap, on any thread. Each skipped pass is
+// counted against the outermost relay on that thread and reported on its exit line (hk-skipped=).
+// The same depth powers the fuse in fatal_relay (yi): a nested delivery is never handled.
+// State is a small tid-keyed slot table in the pb_get mould (no TLS: guest threads are born of raw
+// clone). A slot is claimed on the 0->1 transition and freed on the 1->0 one; depths and the skip
+// counter are only ever mutated by the owning thread. If the table is full the relay runs unmarked
+// and both moves are inert — exactly the pre-fix behaviour.
+#define NRELAY 64
+static volatile long g_rl_tid[NRELAY];
+static volatile int g_rl_depth[NRELAY];
+static volatile int g_rl_skip[NRELAY];
+
+static int rl_find(long tid) { for (int i = 0; i < NRELAY; i++) if (g_rl_tid[i] == tid) return i; return -1; }
+
+static int rl_enter(void) {                       // the depth in place BEFORE this entry (0 = outermost)
+    long tid = S0(NR_gettid);
+    int i = rl_find(tid);
+    if (i < 0) {
+        for (int j = 0; j < NRELAY; j++) {
+            long z = 0;
+            if (__atomic_compare_exchange_n(&g_rl_tid[j], &z, tid, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) { i = j; break; }
+        }
+        if (i < 0) return 0;                      // table full: run unmarked
+        g_rl_depth[i] = 0; g_rl_skip[i] = 0;
+    }
+    return __atomic_fetch_add(&g_rl_depth[i], 1, __ATOMIC_ACQ_REL);
+}
+
+static int rl_leave(void) {                       // the finished outermost relay's skip count; -1 when not outermost/unmarked
+    long tid = S0(NR_gettid);
+    int i = rl_find(tid);
+    if (i < 0) return -1;
+    if (__atomic_fetch_sub(&g_rl_depth[i], 1, __ATOMIC_ACQ_REL) != 1) return -1;
+    int sk = g_rl_skip[i];
+    g_rl_skip[i] = 0;
+    __atomic_store_n(&g_rl_tid[i], 0L, __ATOMIC_RELEASE);
+    return sk;
+}
+
+static int rl_mark_skip(void) {                   // trap header, in relay context: count one skipped pass
+    int i = rl_find(S0(NR_gettid));
+    if (i < 0 || g_rl_depth[i] <= 0) return 0;
+    __atomic_fetch_add(&g_rl_skip[i], 1, __ATOMIC_ACQ_REL);
+    return 1;
+}
+
 static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     int err = 0;
-    if (g_tun_live) tun_drain();
-    hub_pump();                    // the VPN hub's broadcasts (a session ending above all): a no-op with no hub connection
+    if (!rl_mark_skip()) {         // in fatal_relay the header chores wait for the next top-level trap (137 fix, jia)
+        if (g_tun_live) tun_drain();
+        hub_pump();                // the VPN hub's broadcasts (a session ending above all): a no-op with no hub connection
+    }
     switch (nr) {
     case NR_openat: {
         char *b1 = PB(0);
@@ -3636,10 +3691,12 @@ static void on_crash(int sig, void *info, void *uc) {
 // debuggerd hook) runs from it with the flags and mask it asked for. Only when the guest has nothing left
 // (SIG_DFL) the crash is reported here, on the program's stderr, with the mappings of pc and the callers.
 static void fatal_relay(int sig, void *info, void *uc) {
+    rl_enter();                                                 // 137 fix (jia): mark this thread in-relay until the leave below
     ssc_probe(sig, uc);                                         // 137 measurement: name this delivery before anything touches it
     if (is_fatal(sig) && sig != 8 && ssc_is_ss()) cc_emit_entry(sig, info, uc);   // entry snapshot: print this delivery at the door
     if (sig == 11 || sig == 6) cc_note(sig, info, uc);          // crash capture: stash (and name a repeat fault)
     if (g_crash) {
+        rl_leave();                                             // on_crash does not return; the mark dies with the process either way
         on_crash(sig, info, uc);
         return;
     }
@@ -3660,8 +3717,20 @@ static void fatal_relay(int sig, void *info, void *uc) {
         h(sig, info, uc);
         if (ssc && ((struct sigctx *)((char *)uc + 176))->pc == saved.pc)
             cc_emit_ctx(sig, sfault, &saved, stid);
-    } else on_crash(sig, info, uc);
+    } else { rl_leave(); on_crash(sig, info, uc); }              // on_crash does not return
     if (g_is32) *(u64 *)((char *)uc + 40) &= ~SYSBIT;
+    int hksk = rl_leave();                                      // 137 fix (jia): unmark; report the passes this relay deferred
+    if (hksk > 0) {
+        char line[128]; u64 o = 0;
+        tun_cat(line, &o, "aemu-137r: relay-exit sig=");
+        tun_catn(line, &o, (u64)sig);
+        tun_cat(line, &o, " tid=");
+        tun_catn(line, &o, (u64)S0(NR_gettid));
+        tun_cat(line, &o, " hk-skipped=");
+        tun_catn(line, &o, (u64)hksk);
+        tun_cat(line, &o, "\n");
+        say(line);
+    }
 }
 
 static void on_sigsys(int sig, void *info, void *uc) {
