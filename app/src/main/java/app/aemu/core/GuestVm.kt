@@ -140,7 +140,15 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         img.settings.basebandOverride, img.settings.operatorName, img.settings.operatorNumeric,
         simPresentSetting = img.settings.simPresent, simNumberSetting = img.settings.simNumber,
         simIccidSetting = img.settings.simIccid,
-        networkTypeSetting = img.settings.networkType)
+        networkTypeSetting = img.settings.networkType,
+        sim = SimCard(
+            present = img.settings.simPresent,
+            operator = SimCard.cleanOperator(img.settings.operatorName),
+            mcc = SimCard.cleanMcc(img.settings.operatorNumeric.filter { it.isDigit() }.take(3)),
+            mnc = SimCard.cleanMnc(img.settings.operatorNumeric.filter { it.isDigit() }.drop(3)),
+            number = SimCard.cleanNumber(img.settings.simNumber),
+            iccid = SimCard.cleanIccid(img.settings.simIccid),
+        ))
     val vold = VoldStub(paths, img.sdcardPath, ::log, others = img.volumes, api = img.api)
     var onFrame: (() -> Unit)? = null
     val frames = FrameBell(paths, ::log) { onFrame?.invoke() }
@@ -684,7 +692,10 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         frames.serve()
         if (s.bluetooth && bluetoothSupported) bluetooth.serve()
         if (s.agent) agent.serve()
-        if (s.radio) ril.serve() else log("radio: emulation disabled in settings")
+        if (s.radio) {
+            if (img.api >= 26) TreeFixer(ctx, paths, img, ::log).writeRadioHalConfig { ril.halConfig(it) }
+            ril.serve()
+        } else log("radio: emulation disabled in settings")
         vold.serve()
         // у vold производителей бывают дополнительные сокеты (Samsung: usbstorage, enc_report) — отвечаем «ладно»
         runCatching {
