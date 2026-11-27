@@ -88,6 +88,8 @@ static int g_uid, g_gid;        // the ids the guest believes it has
 static u32 g_real_uid;
 static char g_qemu[512];        // qemu-arm for the firmware's 32-bit programs (AEMU64_QEMU)
 static int g_crash;
+static int g_seat_pid1;         // AEMU64_PID1: the seat /init is told it is pid 1 (itself only)
+static long g_seat_pid;         // the host pid of the process that became the seat /init
 static u64 g_logdev, g_logino;      // the service log on descriptor 2 (a file or a pipe to the app)
 static int g_logpipe;
 static u64 g_inino;                 // ...and the pipe on descriptor 0
@@ -687,6 +689,10 @@ static long trap(long nr, long *a, void *uc) {
 
 #define PB(i) ((*pbp ? *pbp : (*pbp = pb_get())) + (i) * PATH_MAX)
 
+// Partition seat (this generation only): vmount also seats the partition roots and counts
+// Magisk's own mounts. The other generations preprocess vmount.h exactly as before, so
+// their shipped launchers stay byte-identical.
+#define VM_PARTROOTS 1
 #include "../vmount.h"
 
 static long trap2_base(long nr, long *a, void *uc, char **pbp) {
@@ -970,6 +976,11 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     }
     case NR_getuid: case NR_geteuid: return g_uid;
     case NR_getgid: case NR_getegid: return g_gid;
+    // Partition seat (AEMU64_PID1): the seat /init itself is told it is pid 1, as it would
+    // be on a device; its children (their real pid differs from the recorded one) and every
+    // other process get the true answer. Only reached when the filter traps these at all.
+    case NR_getpid: { long self = S0(NR_getpid); return (g_seat_pid1 && self == g_seat_pid) ? 1 : self; }
+    case NR_gettid: { long self = S0(NR_gettid); return (g_seat_pid1 && self == g_seat_pid) ? 1 : self; }
     case NR_setuid: g_uid = (int)a[0]; return 0;
     case NR_setgid: g_gid = (int)a[0]; return 0;
     case NR_setreuid: case NR_setresuid: if ((int)a[1] != -1) g_uid = (int)a[1]; else if ((int)a[0] != -1) g_uid = (int)a[0]; return 0;
@@ -1260,6 +1271,10 @@ static void install_filter(void) {
     f[n++] = JEQ(NR_statx, L_TRAP, 0);
     f[n++] = JEQ(NR_uname, L_TRAP, 0);
     if (g_vm) f[n++] = JEQ(268 /* setns */, L_TRAP, 0);
+    // Partition seat: only with AEMU64_PID1 (read from the environment above, before this
+    // filter is installed) are pid questions trapped at all; every other guest's filter
+    // stays exactly as it was.
+    if (g_seat_pid1) { f[n++] = JEQ(NR_getpid, L_TRAP, 0); f[n++] = JEQ(NR_gettid, L_TRAP, 0); }
     // Added for AEmulator Plus (2026-11-21): directory reads, to show a device node (a whiteout) as one (vmount.h)
     if (g_vm) f[n++] = JEQ(61 /* getdents64 */, L_TRAP, 0);
     f[n++] = JEQ(NR_rt_sigprocmask, L_SIG, 0);
@@ -1356,6 +1371,7 @@ void aemu_main(u64 *sp) {
     if ((r = env_get(envp, "AEMU64_UTS_RELEASE")) && slen(r) < sizeof g_uts_rel) memcpy(g_uts_rel, r, slen(r) + 1);
     if ((r = env_get(envp, "AEMU64_UTS_VERSION")) && slen(r) < sizeof g_uts_ver) memcpy(g_uts_ver, r, slen(r) + 1);
     g_crash = env_get(envp, "AEMU64_CRASH") != 0;
+    if (env_get(envp, "AEMU64_PID1")) { g_seat_pid1 = 1; g_seat_pid = S0(NR_getpid); }
     if ((r = env_get(envp, "AEMU64_INPUT")) && slen(r) < sizeof g_input) memcpy(g_input, r, slen(r) + 1);
     if ((r = env_get(envp, "AEMU64_SDCARD")) && slen(r) < sizeof g_sd) { g_sdlen = slen(r); memcpy(g_sd, r, g_sdlen + 1); }
     if ((r = env_get(envp, "AEMU64_QEMU")) && slen(r) < sizeof g_qemu) memcpy(g_qemu, r, slen(r) + 1);
