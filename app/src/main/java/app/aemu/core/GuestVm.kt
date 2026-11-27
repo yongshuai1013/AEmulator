@@ -59,7 +59,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
 
     /** host Bluetooth bridge (AEmulator-Plus #18) can serve this image: the 4.4 engine, API 9–25, or a
      * 64-bit guest at API 23–27 (per-generation jars from guest-bt-n64), not a recovery boot */
-    private val bluetoothSupported get() =
+    val bluetoothSupported get() =
         (engine == Engine.KK && img.api in 9..25 || engine == Engine.N64 && img.api in 23..27) && !recoveryMode
     private val bluetooth = BluetoothBridge(ctx, paths, { settings.bluetooth && bluetoothSupported }, ::log)
     private val agentSupported get() = AgentSupport.offered(paths.root, engine, img.api, recoveryMode)
