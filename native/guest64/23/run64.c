@@ -2865,7 +2865,7 @@ static int rl_trap_begin(void) {                  // yi': >=0 = run this trap ou
     if (i < 0 || g_rl_depth[i] <= 0) return -1;   // not in a relay: nothing changes
     if (g_rl_onstk[i]) return -1;                 // already out there: a nested trap rides the same big stack
     if (__atomic_exchange_n(&g_fm_said, 1, __ATOMIC_ACQ_REL) == 0)
-        say("aemu-137r: mode bigstack+faultmap+fdlen (yi' restored; faultmap with the fd-side fstat length)\n");
+        say("aemu-137r: mode bigstack+faultmap+fdlen2 (yi' restored; fd-side fstat length via /proc/<pid>/fd)\n");
     if (!g_rl_stk[i]) g_rl_stk[i] = rl_mmap_stack();
     if (!g_rl_stk[i]) return -1;                  // no stack to give: the pre-fix behaviour
     g_rl_onstk[i] = 1;
@@ -3673,9 +3673,13 @@ static void ssc_probe(int sig, void *uc) {
 // The maps read is this process's own (this image runs inside the guest process it
 // names); the row's path is statted as printed first and through xl() if that fails,
 // and the form that answered is the one printed. The account also reads the length
-// from the fd side (fdlen): our own fd table is scanned for an fd whose fstat names
+// from the fd side (fdlen): the fd table is scanned for an fd whose fstat names
 // the row's inode, so a deleted memfd's length — unreadable by path — is read there,
-// or reported as none with its reason. A fault in no row prints no-map with
+// or reported as none with its reason and, where one exists, its errno. The table
+// is named by number — /proc/<pid>/fd, pid = S0(NR_getpid), the same pid the maps
+// read's "self" resolves to — because the /proc/self/fd doorway would not open as
+// a directory in the 15:42 field (fdlen v1 came back none(dir-fail), the scan
+// never ran). A fault in no row prints no-map with
 // the two neighbour rows, the nearer file row carrying the account; an anonymous row
 // prints as anon; a maps read that fails prints its error. Observation only: nothing
 // here changes what the relay does with the delivery.
@@ -3703,15 +3707,21 @@ static void fm_signed(i64 v) {                     // a length distance, sign an
     else say(utoa((u64)v, t + sizeof t));
 }
 
-static long fm_fdlen(u64 ino, u64 *len) {          // the fd-side length of one inode: scan our own fd
-    static char buf[8192];                          // table for an fd whose fstat names this inode
-    long dfd = S4(NR_openat, AT_FDCWD, "/proc/self/fd", 0x10000 /* O_DIRECTORY */, 0);
-    if (dfd < 0) return -2;                         // the table itself would not open
+static long fm_fdlen(u64 ino, u64 *len, long *err) {   // the fd-side length of one inode: scan the
+    static char buf[8192];                              // fd table for an fd whose fstat names this
+    char path[48]; u64 o = 0;                           // inode. The table is named by number —
+    tun_cat(path, &o, "/proc/");                        // /proc/<pid>/fd with pid = S0(NR_getpid),
+    tun_catn(path, &o, (u64)S0(NR_getpid));             // the pid the maps read's "/proc/self/maps"
+    tun_cat(path, &o, "/fd");                           // resolves to — not through the self
+    long dfd = S4(NR_openat, AT_FDCWD, path, 0x10000 /* O_DIRECTORY */, 0);   // doorway, which would
+    if (dfd < 0) { *err = -dfd; return -2; }            // not open (v1); a failure's errno rides *err
     long any = -1; u64 anylen = 0;
-    int done = 0, scanned = 0;
+    int done = 0, scanned = 0, readany = 0;
     while (!done) {
         long n = S3(NR_getdents64, dfd, buf, sizeof buf);
+        if (n < 0 && !readany) { *err = -n; S1(NR_close, dfd); return -2; }   // opened, but not one entry read
         if (n <= 0) break;
+        readany = 1;
         long b = 0;
         while (b < n) {
             u16 rl = *(u16 *)(buf + b + 16);
@@ -3761,9 +3771,10 @@ static void fm_acct(const char *rel, struct fmrow *r, u64 fault) {   // the leng
     if (deleted) say(" deleted=1");
     if (!r->ino) say(" fdlen=none(no-ino)");
     else {
-        u64 fl = 0; long fdn = fm_fdlen(r->ino, &fl);
+        u64 fl = 0; long fe = 0; long fdn = fm_fdlen(r->ino, &fl, &fe);
         if (fdn >= 0) { say(" fdlen="); say(utoa(fl, t + sizeof t)); say(" fd="); say(utoa((u64)fdn, t + sizeof t)); }
-        else say(fdn == -2 ? " fdlen=none(dir-fail)" : " fdlen=none(no-fd)");
+        else if (fdn == -2) { say(" fdlen=none(dir-fail,e="); say(utoa((u64)fe, t + sizeof t)); say(")"); }
+        else say(" fdlen=none(no-fd,e=0)");   // the walk ran to its end: no errno exists, e=0 by convention
     }
     say("\n");
 }
