@@ -26,6 +26,11 @@ class GuestScreen(ctx: Context, private val w: Int, private val h: Int) : View(c
     var fb: File? = null
     @Volatile var passthrough = false
         set(v) { field = v; postInvalidate() }
+    /** Added for AEmulator Plus (2026-11-19): the screen was set up for the in-app GPU bridge (KK engine, API < 21). The bridge is only
+     *  really there when GuestVm.glUp started it; when the standalone glserverd serves the guest instead, or the open bridge (GlHost)
+     *  whose frames come back into the guest's window buffers, nothing draws into the SurfaceView, so this view has to show fb0 itself
+     *  (see VmActivity, the passthrough sync). */
+    @Volatile var bridgeMode = false
     @Volatile var fps = 0f
         private set
     /** frames this screen has shown since the view started, by either path (the testers compare it with the guest's count) */
