@@ -187,6 +187,10 @@
     <string name="m_reboot">Reboot</string>
     <string name="m_clip_empty">Clipboard is empty</string>
     <string name="m_screenshot_saved">Saved: %1$s</string>
+    <string name="m_save_logs">Save logs to Downloads</string>
+    <string name="m_save_logs_start">Saving logs…</string>
+    <string name="m_save_logs_ok">Logs saved: %1$s</string>
+    <string name="m_save_logs_fail">Could not save logs: %1$s</string>
     <string name="m_failed">Failed</string>
     <string name="m_sms_sent">SMS delivered to inbox</string>
     <string name="m_sms_from">From</string>
