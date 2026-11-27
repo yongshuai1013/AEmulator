@@ -3481,6 +3481,59 @@ static int ssc_is_ss(void) {
     return 0;
 }
 
+// ssc-probe (137 measurement, one field run): a single line at the relay's entry, before
+// cc_note, naming what this delivery carried — the signal, this thread, the guest handler's
+// class (0 = DFL, 1 = IGN, 2 = a real handler), the identity test's verdict, the process
+// name read raw, the faulting pc and the monotonic clock. Pure observation: the name is
+// read and the verdict computed locally, so ssc_is_ss is not called and its latch is never
+// set here — the value printed is exactly what ssc_is_ss() would return at this instant
+// (the latch if already set, else this read's match), and no state the relay later reads
+// changes. The name's trailing newline is printed as the two characters "\n" so the record
+// stays one line and the 13- vs 14-byte form stays visible.
+static void ssc_probe(int sig, void *uc) {
+    if (!is_fatal(sig)) return;
+    char comm[24];
+    long n = -1;
+    long fd = S4(NR_openat, AT_FDCWD, "/proc/self/comm", 0 /*O_RDONLY*/, 0);
+    if (fd >= 0) { n = S3(NR_read, fd, comm, sizeof comm - 1); S1(NR_close, fd); }
+    if (n < 0) n = 0;
+    comm[n] = 0;
+    int match = 0;
+    if (n == 13 || (n == 14 && comm[13] == '\n')) {
+        static const char want[] = "system_server";
+        int i = 0;
+        while (i < 13 && comm[i] == want[i]) i++;
+        match = i == 13;
+    }
+    int ssc = g_ssc_ss || match;
+    void (*h)(int, void *, void *) = g_fatal[sig & 31];
+    int hcat = (u64)h == 0 ? 0 : (u64)h == 1 ? 1 : 2;
+    struct sigctx *c = (struct sigctx *)((char *)uc + 176);
+    char hx[19] = "0x";
+    for (int i = 0; i < 16; i++) hx[2 + i] = "0123456789abcdef"[(c->pc >> (60 - 4 * i)) & 15];
+    hx[18] = 0;
+    char line[192]; u64 o = 0;
+    tun_cat(line, &o, "aemu-137r: ssc-probe sig=");
+    tun_catn(line, &o, (u64)sig);
+    tun_cat(line, &o, " tid=");
+    tun_catn(line, &o, (u64)S0(NR_gettid));
+    tun_cat(line, &o, " h=");
+    tun_catn(line, &o, (u64)hcat);
+    tun_cat(line, &o, " ssc=");
+    tun_catn(line, &o, (u64)ssc);
+    tun_cat(line, &o, " comm=");
+    for (long i = 0; i < n; i++) {
+        if (comm[i] == '\n') tun_cat(line, &o, "\\n");
+        else { line[o++] = comm[i]; line[o] = 0; }
+    }
+    tun_cat(line, &o, " pc=");
+    tun_cat(line, &o, hx);
+    tun_cat(line, &o, " t=");
+    tun_catn(line, &o, (u64)ssw_now_ms());
+    tun_cat(line, &o, "\n");
+    say(line);
+}
+
 static void on_crash(int sig, void *info, void *uc) {
     struct { u64 fault; u64 regs[31]; u64 sp, pc, pstate; } *c = (void *)((char *)uc + 176);
     char t[24];
@@ -3557,6 +3610,7 @@ static void on_crash(int sig, void *info, void *uc) {
 // debuggerd hook) runs from it with the flags and mask it asked for. Only when the guest has nothing left
 // (SIG_DFL) the crash is reported here, on the program's stderr, with the mappings of pc and the callers.
 static void fatal_relay(int sig, void *info, void *uc) {
+    ssc_probe(sig, uc);                                         // 137 measurement: name this delivery before anything touches it
     if (sig == 11 || sig == 6) cc_note(sig, info, uc);          // crash capture: stash (and name a repeat fault)
     if (g_crash) {
         on_crash(sig, info, uc);
