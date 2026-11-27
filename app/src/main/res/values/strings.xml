@@ -175,6 +175,12 @@
     <string name="vs_hardware_default">Firmware default</string>
     <string name="vs_hardware_pick">Choose</string>
     <string name="vs_hardware_sub">Value of ro.hardware given to the guest at launch. The system looks up HAL libraries by it (gralloc.&lt;value&gt;.so, lights.&lt;value&gt;.so…), so change it only if you know what the firmware expects. Takes effect after a full VM restart.</string>
+    <string name="vs_soc">Chip (SoC) reported to the guest</string>
+    <string name="vs_soc_sub">Written to /proc/cpuinfo and /sys/devices/soc0, and to the properties ro.board.platform (every Android version) and ro.soc.model / ro.soc.manufacturer (Android 12+). The core count and CPU frequencies follow it. Takes effect after a full VM restart.</string>
+    <string name="vs_soc_default">Default (%1$s)</string>
+    <string name="vs_soc_host">Host (this phone)</string>
+    <string name="vs_soc_custom">Custom</string>
+    <string name="vs_soc_pick">Choose a chip</string>
     <string name="vs_baseband">Baseband version</string>
     <string name="vs_baseband_sub">The modem firmware version the guest sees in About phone. Effective now: %1$s. Clear it to fall back to the factory package\'s version. Applies at the next boot</string>
     <string name="m_power_menu">Power menu</string>
