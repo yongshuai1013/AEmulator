@@ -137,6 +137,10 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         var conn: VpnTcpConn? = null
         /** Byte counters already folded into the session totals (reap/sessionDown once). */
         var counted = false
+        /** tcpstat instrument: the terminator reported the real connection up. */
+        @Volatile var established = false
+        /** tcpstat instrument: sample lines already spent on this flow (the fuse). */
+        var tcpstatLines = 0
     }
 
     /** A closed flow's afterglow (design section 2): the tuple and the closing sequence
@@ -290,7 +294,7 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                 f.fd = fd
                 val tc = VpnTcpConn(f.id, s.seq, f.dstIp, f.dstPort, s.addr, f.srcPort, s.mtu,
                     { pkt -> writePacket(s, pkt) },
-                    { log("aemu-vpn: flow ${f.id} established dst=${ip(f.dstIp)}:${f.dstPort}") },
+                    { f.established = true; log("aemu-vpn: flow ${f.id} established dst=${ip(f.dstIp)}:${f.dstPort}") },
                     log)
                 f.conn = tc
                 tc.open(System.currentTimeMillis())
@@ -471,11 +475,13 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         val flowCount: Int
         val listenerCount: Int
         val hadExempt: Int
+        var closingFlows: List<Flow> = emptyList()
         synchronized(lock) {
             if (session !== s) return
             session = null
             s.alive = false
             flowCount = flows.size
+            closingFlows = flows.values.filter { it.conn != null }
             for (f in flows.values) {
                 f.open = false
                 f.conn?.let { c ->
@@ -494,6 +500,7 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
             hadExempt = exemptUid
             exemptUid = -1
         }
+        for (f in closingFlows) tcpstatFinal(f)
         closeFd(s.peerFd)
         broadcastState()
         broadcastDown(s.name)
@@ -568,10 +575,13 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
      * a tick only ever touches flows in the live registry, so nothing here can act
      * inside a later session. */
     private fun timerLoop() {
+        var tickN = 0
         while (timerAlive) {
             try { Thread.sleep(100) } catch (_: InterruptedException) { return }
             val now = System.currentTimeMillis()
             val fs = synchronized(lock) { flows.values.toList() }
+            tickN++
+            if (tickN % 10 == 0) tcpstatSample(fs)
             for (f in fs) {
                 val c = f.conn ?: continue
                 c.tick(now)
@@ -606,8 +616,149 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         }
         f.open = false
         closeFd(f.fd)
+        tcpstatFinal(f)
         log("aemu-vpn: flow ${f.id} closed reason=${c.closeReason} up=${c.upBytes} down=${c.downBytes}")
         step(s, "flow-closed id=${f.id} reason=${c.closeReason} flows=${synchronized(lock) { flows.size }}")
+    }
+
+    // ---- tcpstat instrument (egress-runtime-desk.md item E3): once a second the timer
+    // reads the host kernel's own view of the agent's egress sockets out of
+    // /proc/net/tcp{,6} and logs the entries whose remote address matches a live flow's
+    // destination — state, queues and retransmit count. This is the one observation that
+    // separates the three shapes the field evidence cannot: a socket stuck in SYN-SENT
+    // with retransmits climbing died at handshake depth; an ESTABLISHED socket whose
+    // tx_queue never drains lost its data (or the ACKs) outside; an ESTABLISHED socket
+    // whose tx_queue drained while rx stays silent means the server took the bytes and
+    // never answered — and an established flow with no kernel entry at all would break
+    // the model outright. Record-only: nothing here feeds back into behaviour. Sample
+    // lines are fused per flow (TCPSTAT_MAX_LINES); a closing flow always gets one
+    // final snapshot regardless of the fuse.
+
+    @Volatile private var tcpstatBroken = false
+    @Volatile private var tcpstat6Noted = false
+
+    private class TcpEntry(val v6: Boolean, val localText: String, val remoteIp: Int, val remotePort: Int,
+                           val stateHex: String, val txQueue: Long, val rxQueue: Long, val retr: Long)
+
+    private fun tcpstatSample(fs: List<Flow>) {
+        if (tcpstatBroken) return
+        val groups = fs.filter { it.conn != null }.groupBy { it.dstIp to it.dstPort }
+        if (groups.isEmpty()) return
+        val entries = tcpstatRead() ?: return
+        for ((dst, gfs) in groups) {
+            if (gfs.all { it.tcpstatLines >= TCPSTAT_MAX_LINES }) continue
+            val ids = gfs.joinToString(",") { it.id.toString() }
+            val matched = entries.filter { it.remoteIp == dst.first && it.remotePort == dst.second }
+            if (matched.isEmpty()) {
+                if (gfs.any { it.established }) {
+                    log("aemu-tcpstat: flows=$ids dst=${ip(dst.first)}:${dst.second} state=NONE (agent claims egress, kernel has no entry)")
+                    for (f in gfs) f.tcpstatLines++
+                }
+                continue
+            }
+            for (e in matched) {
+                log("aemu-tcpstat: flows=$ids dst=${ip(dst.first)}:${dst.second} local=${e.localText} state=${e.stateHex}(${tcpStateName(e.stateHex)}) txq=${e.txQueue} rxq=${e.rxQueue} retr=${e.retr} src=${if (e.v6) "tcp6" else "tcp"}")
+                for (f in gfs) f.tcpstatLines++
+            }
+        }
+    }
+
+    /** The closing snapshot for one flow: the kernel's last word on its destination. */
+    private fun tcpstatFinal(f: Flow) {
+        if (tcpstatBroken || f.conn == null) return
+        val entries = tcpstatRead() ?: return
+        val matched = entries.filter { it.remoteIp == f.dstIp && it.remotePort == f.dstPort }
+        if (matched.isEmpty()) {
+            if (f.established) {
+                log("aemu-tcpstat: flow=${f.id} dst=${ip(f.dstIp)}:${f.dstPort} state=NONE (agent claims egress, kernel has no entry) final=1")
+            }
+            return
+        }
+        for (e in matched) {
+            log("aemu-tcpstat: flow=${f.id} dst=${ip(f.dstIp)}:${f.dstPort} local=${e.localText} state=${e.stateHex}(${tcpStateName(e.stateHex)}) txq=${e.txQueue} rxq=${e.rxQueue} retr=${e.retr} src=${if (e.v6) "tcp6" else "tcp"} final=1")
+        }
+    }
+
+    /** Reads and parses both /proc tables. If /proc/net/tcp itself cannot be read, log
+     * once and disable the sampler for the hub's lifetime — no retry, no workaround. */
+    private fun tcpstatRead(): List<TcpEntry>? {
+        val out = ArrayList<TcpEntry>()
+        val v4 = try {
+            java.io.File("/proc/net/tcp").readLines()
+        } catch (t: Throwable) {
+            if (!tcpstatBroken) {
+                tcpstatBroken = true
+                log("aemu-tcpstat: /proc/net/tcp unreadable (${t.javaClass.simpleName}: ${t.message}); sampler disabled")
+            }
+            return null
+        }
+        for (line in v4) parseTcpLine(line, false)?.let { out.add(it) }
+        val v6 = try {
+            java.io.File("/proc/net/tcp6").readLines()
+        } catch (t: Throwable) {
+            if (!tcpstat6Noted) {
+                tcpstat6Noted = true
+                log("aemu-tcpstat: /proc/net/tcp6 unreadable (${t.javaClass.simpleName}: ${t.message}); continuing with tcp only")
+            }
+            emptyList()
+        }
+        for (line in v6) parseTcpLine(line, true)?.let { out.add(it) }
+        return out
+    }
+
+    private fun parseTcpLine(line: String, v6: Boolean): TcpEntry? {
+        val t = line.trim().split(Regex("\\s+"))
+        if (t.size < 7) return null
+        val local = t[1]; val remote = t[2]
+        val li = local.lastIndexOf(':'); val ri = remote.lastIndexOf(':')
+        if (li < 0 || ri < 0) return null
+        val remoteAddrHex = remote.substring(0, ri)
+        val remotePort = remote.substring(ri + 1).toIntOrNull(16) ?: return null
+        val localAddrHex = local.substring(0, li)
+        val localPort = local.substring(li + 1).toIntOrNull(16) ?: return null
+        val remoteIp: Int
+        val localText: String
+        if (!v6) {
+            remoteIp = procHexIp(remoteAddrHex) ?: return null
+            val lip = procHexIp(localAddrHex) ?: return null
+            localText = "${ip(lip)}:$localPort"
+        } else {
+            // Only the IPv4-mapped form can belong to a hub flow (the detour is IPv4-only).
+            if (!isV4Mapped(remoteAddrHex)) return null
+            remoteIp = procHexIp(remoteAddrHex.substring(24)) ?: return null
+            val lip = if (isV4Mapped(localAddrHex)) procHexIp(localAddrHex.substring(24)) else null
+            localText = if (lip != null) "${ip(lip)}:$localPort" else local
+        }
+        val queues = t[4].split(":")
+        if (queues.size != 2) return null
+        val txq = queues[0].toLongOrNull(16) ?: return null
+        val rxq = queues[1].toLongOrNull(16) ?: return null
+        val retr = t[6].toLongOrNull(16) ?: return null
+        return TcpEntry(v6, localText, remoteIp, remotePort, t[3].uppercase(), txq, rxq, retr)
+    }
+
+    private fun isV4Mapped(hex: String) =
+        hex.length == 32 && hex.regionMatches(0, "0000000000000000FFFF", 0, 20, ignoreCase = true)
+
+    /** /proc stores an IPv4 address as one little-endian word: the dotted form reversed. */
+    private fun procHexIp(hex: String): Int? {
+        if (hex.length != 8) return null
+        val v = hex.toLongOrNull(16) ?: return null
+        val b0 = (v and 0xff).toInt(); val b1 = ((v ushr 8) and 0xff).toInt()
+        val b2 = ((v ushr 16) and 0xff).toInt(); val b3 = ((v ushr 24) and 0xff).toInt()
+        return (b0 shl 24) or (b1 shl 16) or (b2 shl 8) or b3
+    }
+
+    /** /proc/net/tcp state codes: 01 ESTABLISHED, 02 SYN-SENT, 03 SYN-RECV,
+     * 04 FIN-WAIT-1, 05 FIN-WAIT-2, 06 TIME-WAIT, 07 CLOSE, 08 CLOSE-WAIT,
+     * 09 LAST-ACK, 0A LISTEN, 0B CLOSING, 0C NEW-SYN-RECV. The raw hex is always
+     * printed alongside the name so the decode can be checked against the table. */
+    private fun tcpStateName(hex: String) = when (hex) {
+        "01" -> "ESTABLISHED"; "02" -> "SYN-SENT"; "03" -> "SYN-RECV"
+        "04" -> "FIN-WAIT-1"; "05" -> "FIN-WAIT-2"; "06" -> "TIME-WAIT"
+        "07" -> "CLOSE"; "08" -> "CLOSE-WAIT"; "09" -> "LAST-ACK"
+        "0A" -> "LISTEN"; "0B" -> "CLOSING"; "0C" -> "NEW-SYN-RECV"
+        else -> "UNKNOWN"
     }
 
     /** Writes one packet into the tunnel; returns false when the write failed.
@@ -737,6 +888,7 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
     }
 
     private fun putLe16(b: ByteArray, off: Int, v: Int) { b[off] = v.toByte(); b[off + 1] = (v ushr 8).toByte() }
+        const val TCPSTAT_MAX_LINES = 20
         const val T_HELLO = 1
         const val T_SESSION_STATE = 2
         const val T_TUN_PEER = 3
