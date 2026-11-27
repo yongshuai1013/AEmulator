@@ -2865,7 +2865,7 @@ static int rl_trap_begin(void) {                  // yi': >=0 = run this trap ou
     if (i < 0 || g_rl_depth[i] <= 0) return -1;   // not in a relay: nothing changes
     if (g_rl_onstk[i]) return -1;                 // already out there: a nested trap rides the same big stack
     if (__atomic_exchange_n(&g_fm_said, 1, __ATOMIC_ACQ_REL) == 0)
-        say("aemu-137r: mode bigstack+faultmap (yi' restored; fault-page map dump at the entry snapshot)\n");
+        say("aemu-137r: mode bigstack+faultmap+fdlen (yi' restored; faultmap with the fd-side fstat length)\n");
     if (!g_rl_stk[i]) g_rl_stk[i] = rl_mmap_stack();
     if (!g_rl_stk[i]) return -1;                  // no stack to give: the pre-fix behaviour
     g_rl_onstk[i] = 1;
@@ -3672,7 +3672,10 @@ static void ssc_probe(int sig, void *uc) {
 // read as arithmetic (the fault's file offset against EOF) instead of as a smell.
 // The maps read is this process's own (this image runs inside the guest process it
 // names); the row's path is statted as printed first and through xl() if that fails,
-// and the form that answered is the one printed. A fault in no row prints no-map with
+// and the form that answered is the one printed. The account also reads the length
+// from the fd side (fdlen): our own fd table is scanned for an fd whose fstat names
+// the row's inode, so a deleted memfd's length — unreadable by path — is read there,
+// or reported as none with its reason. A fault in no row prints no-map with
 // the two neighbour rows, the nearer file row carrying the account; an anonymous row
 // prints as anon; a maps read that fails prints its error. Observation only: nothing
 // here changes what the relay does with the delivery.
@@ -3698,6 +3701,36 @@ static void fm_signed(i64 v) {                     // a length distance, sign an
     char t[24];
     if (v < 0) { say("-"); say(utoa((u64)(-v), t + sizeof t)); }
     else say(utoa((u64)v, t + sizeof t));
+}
+
+static long fm_fdlen(u64 ino, u64 *len) {          // the fd-side length of one inode: scan our own fd
+    static char buf[8192];                          // table for an fd whose fstat names this inode
+    long dfd = S4(NR_openat, AT_FDCWD, "/proc/self/fd", 0x10000 /* O_DIRECTORY */, 0);
+    if (dfd < 0) return -2;                         // the table itself would not open
+    long any = -1; u64 anylen = 0;
+    int done = 0, scanned = 0;
+    while (!done) {
+        long n = S3(NR_getdents64, dfd, buf, sizeof buf);
+        if (n <= 0) break;
+        long b = 0;
+        while (b < n) {
+            u16 rl = *(u16 *)(buf + b + 16);
+            const char *nm = buf + b + 19;
+            if (!rl) { done = 1; break; }
+            b += rl;
+            if (nm[0] < '0' || nm[0] > '9') continue;
+            if (++scanned > 4096) { done = 1; break; }   // a table past this many entries is not walked further
+            long fdn = (long)atou(nm);
+            if (fdn == dfd) continue;               // the walk's own fd names the table, not a file
+            struct kstat st;
+            if (S2(NR_fstat, fdn, &st) != 0 || st.st_ino != ino) continue;
+            if ((st.st_mode & 0170000) == 0100000) { *len = (u64)st.st_size; S1(NR_close, dfd); return fdn; }
+            if (any < 0) { any = fdn; anylen = (u64)st.st_size; }   // a non-regular namesake: kept, not preferred
+        }
+    }
+    S1(NR_close, dfd);
+    if (any >= 0) { *len = anylen; return any; }
+    return -1;                                      // the whole table walked: no fd names this inode
 }
 
 static void fm_acct(const char *rel, struct fmrow *r, u64 fault) {   // the length account of one file row
@@ -3726,6 +3759,12 @@ static void fm_acct(const char *rel, struct fmrow *r, u64 fault) {   // the leng
         say(" stat="); say(how); say(" host="); say(used);
     } else { say(" stat=fail host="); say(pbuf); }
     if (deleted) say(" deleted=1");
+    if (!r->ino) say(" fdlen=none(no-ino)");
+    else {
+        u64 fl = 0; long fdn = fm_fdlen(r->ino, &fl);
+        if (fdn >= 0) { say(" fdlen="); say(utoa(fl, t + sizeof t)); say(" fd="); say(utoa((u64)fdn, t + sizeof t)); }
+        else say(fdn == -2 ? " fdlen=none(dir-fail)" : " fdlen=none(no-fd)");
+    }
     say("\n");
 }
 
