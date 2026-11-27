@@ -80,6 +80,15 @@ data class VmSettings(
     /** ro.hardware given to the guest at launch; blank = whatever the firmware defines (AEmulator Plus) */
     val hardware: String = "",
     /**
+     * The chip the guest reports (see [SocProfiles], ported from AEmulator Plus .17): a preset id, "host",
+     * "custom" (with [socCustom]), or blank. Blank = no preset: the image's own identity stands exactly as
+     * before this setting existed (cpuinfo from the image's platform, no soc0 nodes, no SoC properties).
+     * The importer pre-fills it from the firmware's own platform when a preset row matches.
+     */
+    val soc: String = "",
+    /** The chip described by the user, used when [soc] is "custom". */
+    val socCustom: SocSpec? = null,
+    /**
      * Radio technology the fake modem reports (a NetworkType value: 2G … LTE). Default UMTS —
      * the value this fork's modem always reported before the setting existed (AEmulator Plus's
      * own default is EDGE; the field and picker are theirs).
@@ -151,6 +160,7 @@ data class VmSettings(
         .put("hostBattery", hostBattery)
         .put("vibration", vibration)
         .put("hardware", hardware)
+        .put("soc", soc).apply { if (socCustom != null) put("socCustom", socCustom.toJson()) }
         .put("networkType", networkType)
         .put("storageGb", storageGb)
         .put("storageType", storageType)
@@ -243,6 +253,8 @@ data class VmSettings(
                 hostBattery = o.optBoolean("hostBattery", true),
                 vibration = o.optBoolean("vibration", true),
                 hardware = cleanHardware(o.optString("hardware", "")),
+                soc = SocProfiles.clean(o.optString("soc", "")),
+                socCustom = SocSpec.fromJson(o.optJSONObject("socCustom")),
                 networkType = NetworkType.normalize(o.optInt("networkType", NetworkType.UMTS)),
                 storageGb = StorageSpoof.sanitizeGb(o.optInt("storageGb", 0)),
                 storageType = StorageType.parse(o.optString("storageType", ""))?.id ?: "",
