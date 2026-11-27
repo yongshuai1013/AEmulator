@@ -13,6 +13,22 @@
 #   ANDROID_HOME=/path/to/sdk ./build.sh     (android-19 jar is enough; BT picks the newest build-tools)
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
+# Source stamp (agent-src.sha256, next to this script): GuestVm's install gate compares the
+# delivered APK's bytes, but versionCode is still the auxiliary signal — and it only moves
+# when a human remembers to move it, which is exactly how one agent rebuild shipped in the
+# tree for two field runs without ever being installed. This stamp makes forgetting loud:
+# it hashes every build input of this app and the build refuses to run when the inputs have
+# moved since the stamp was written. When you change anything in this directory: bump
+# android:versionCode in AndroidManifest.xml, then refresh the stamp with:
+#   { cat AndroidManifest.xml build.sh isoprobe.c; find java -type f | LC_ALL=C sort | xargs cat; } | sha256sum | cut -d' ' -f1 > agent-src.sha256
+src_stamp() {
+    ( cd "$here" && { cat AndroidManifest.xml build.sh isoprobe.c; find java -type f | LC_ALL=C sort | xargs cat; } | sha256sum | cut -d' ' -f1 )
+}
+if [ ! -f "$here/agent-src.sha256" ] || [ "$(cat "$here/agent-src.sha256")" != "$(src_stamp)" ]; then
+    echo "guest-agent-app: sources changed since agent-src.sha256 was stamped" >&2
+    echo "bump android:versionCode in AndroidManifest.xml, then refresh the stamp (see the comment above this check in build.sh)" >&2
+    exit 1
+fi
 SDK=${ANDROID_HOME:?set ANDROID_HOME to the Android SDK}
 JAR="$SDK/platforms/android-19/android.jar"
 [ -f "$JAR" ] || JAR=$(ls "$SDK"/platforms/*/android.jar | sort -V | tail -1)
