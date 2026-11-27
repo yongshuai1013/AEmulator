@@ -41,6 +41,8 @@ class RilStub(
     private val simIccidSetting: String = "",
     /** radio technology from the image settings (a NetworkType value); UMTS = what this modem always reported */
     networkTypeSetting: Int = NetworkType.UMTS,
+    /** the SIM as a card model, built by GuestVm from the same flat settings above; identity source of the HIDL HAL line */
+    private val sim: SimCard = SimCard(),
 ) {
     /** technology of the registration state and of RIL_REQUEST_VOICE_RADIO_TECH, sanitized for this firmware's API level */
     @Volatile var networkType: Int = NetworkType.sanitize(networkTypeSetting, api)
@@ -48,6 +50,11 @@ class RilStub(
         private set
 
     private val server = UnixServer(paths.socket("rild"), "rild") { c -> serveOne(c) }
+    /** the SIM as the HAL service reports it; blank settings resolve to the firmware's APN operator */
+    private val card: SimCards.Resolved by lazy { SimCards.resolve(sim, pickOperator()) }
+    private val simFiles: LegacySimIo.Files by lazy {
+        LegacySimIo.Files(SimCards.efIccid(card.iccid), SimCards.efSpn(card.operator), SimCards.efMsisdn(card.number), SimCards.efAd(card.mnc))
+    }
     /** operator name the modem reports (RIL_REQUEST_OPERATOR): the settings value or the generic default */
     private val operatorName: String get() = operatorNameSetting.ifBlank { VmSettings.DEFAULT_OPERATOR_NAME }
     /** operator PLMN (MCC+MNC) the modem reports: the settings value or the test network 00101 */
@@ -67,8 +74,59 @@ class RilStub(
             .getOrDefault(false)
     }
 
-    fun serve() = server.start(log)
-    fun stop() = server.stop()
+    fun halConfig(secbridge: Boolean): String {
+        fun hex(b: ByteArray?) = b?.joinToString("") { "%02x".format(it) }.orEmpty()
+        val numeric = card.mcc + card.mnc
+        return buildString {
+            append("sim=").append(if (sim.present) 1 else 0).append('\n')
+            append("up=").append(if (simPresent) 1 else 0).append('\n')
+            append("rat=").append(networkType).append('\n')
+            append("imsi=").append(card.imsi).append('\n')
+            append("mcc=").append(card.mcc).append('\n')
+            append("mnc=").append(card.mnc).append('\n')
+            append("numeric=").append(numeric).append('\n')
+            append("operator=").append(card.operator).append('\n')
+            append("short=").append(card.operator.take(8)).append('\n')
+            append("imei=").append(imei).append('\n')
+            append("imeisv=").append(IMEISV).append('\n')
+            append("baseband=").append(basebandVersion).append('\n')
+            append("ef_iccid=").append(hex(simFiles.iccid)).append('\n')
+            append("ef_spn=").append(hex(simFiles.spn)).append('\n')
+            append("ef_msisdn=").append(hex(simFiles.msisdn)).append('\n')
+            append("ef_ad=").append(hex(simFiles.ad)).append('\n')
+            append("secbridge=").append(if (secbridge) 1 else 0).append('\n')
+        }
+    }
+
+    private val halServer = UnixServer(paths.socket("aemu-radio"), "aemu-radio") { c -> serveHal(c) }
+    @Volatile private var halOut: OutputStream? = null
+
+    private fun serveHal(c: LocalSocket) {
+        val o = c.outputStream
+        halOut = o
+        log("radio: HAL service connected")
+        try {
+            val buf = ByteArray(256)
+            val ins = c.inputStream
+            while (true) {
+                val n = try { ins.read(buf) } catch (e: Exception) { -1 }
+                if (n < 0) break
+            }
+        } finally {
+            if (halOut === o) halOut = null
+        }
+    }
+
+    private fun halSend(line: String): Boolean {
+        val o = halOut ?: return false
+        return runCatching { synchronized(o) { o.write((line + "\n").toByteArray()); o.flush() } }.isSuccess
+    }
+
+    fun serve(): Boolean {
+        if (api >= 26) halServer.start(log)
+        return server.start(log)
+    }
+    fun stop() { halServer.stop(); server.stop() }
 
     @Volatile private var out: OutputStream? = null
     /** fake call: number and CallState (4 incoming, 0 active); null when idle */
@@ -76,7 +134,7 @@ class RilStub(
 
     /** Incoming call from [number], like "gsm call" in the SDK emulator console. False when telephony is not up. */
     fun ring(number: String): Boolean {
-        val o = out ?: return false
+        val o = out ?: return halSend("ring " + number.filter { it.isDigit() || it == '+' }.ifEmpty { "0" })
         call = number to CALL_INCOMING
         unsol(o, UNSOL_RESPONSE_CALL_STATE_CHANGED, ByteArray(0))
         unsol(o, UNSOL_CALL_RING, ByteArray(0))
@@ -89,7 +147,7 @@ class RilStub(
      * The text goes as UCS-2; longer texts are split into concatenated parts (UDH, 67 characters each).
      */
     fun sms(from: String, text: String): Boolean {
-        val o = out ?: return false
+        val o = out ?: return halSms(from, text)
         val parts = if (text.length <= 70) listOf(text) else text.chunked(67)
         val ref = (System.nanoTime() and 0xff).toInt()
         parts.forEachIndexed { i, part ->
@@ -126,6 +184,30 @@ class RilStub(
         val s = if (d.length % 2 == 1) d + "F" else d
         return ByteArray(s.length / 2) { i -> ((s[2 * i + 1].digitToIntOrNull(16) ?: 0xf) shl 4 or (s[2 * i].digitToInt(16))).toByte() }
     }
+
+    /** SMS through the HAL service when telephony speaks HIDL and the legacy socket has no client */
+    private fun halSms(from: String, text: String): Boolean {
+        val parts = if (text.length <= 70) listOf(text) else text.chunked(67)
+        val ref = (System.nanoTime() and 0xff).toInt()
+        return parts.mapIndexed { i, part ->
+            halSend("sms " + smsPdu(from, part, if (parts.size > 1) Triple(ref, parts.size, i + 1) else null))
+        }.all { it }
+    }
+
+    /** First generic ("default") APN of the firmware; 310/260 as a last resort. */
+    private fun pickOperator(): Pair<String, String> = runCatching {
+        val xml = File(paths.root, "system/etc/apns-conf.xml").readText()
+        for (m in Regex("<apn\\b([^>]*)>", RegexOption.DOT_MATCHES_ALL).findAll(xml)) {
+            val a = m.groupValues[1]
+            fun attr(n: String) = Regex("\\b$n\\s*=\\s*\"([^\"]*)\"").find(a)?.groupValues?.get(1)
+            val mcc = attr("mcc") ?: continue
+            val mnc = attr("mnc") ?: continue
+            val type = attr("type")
+            if (attr("mvno_type") != null) continue
+            if (type == null || type.contains("default") || type == "*") return@runCatching mcc to mnc
+        }
+        null
+    }.getOrNull() ?: ("310" to "260")
 
     private val connects = ArrayDeque<Long>()
     /** set when telephony keeps crashing against the fake modem: fall back to "radio unavailable" */
