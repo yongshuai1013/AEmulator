@@ -74,6 +74,21 @@ class RilStub(
             .getOrDefault(false)
     }
 
+    /**
+     * Modified for AEmulator Plus, 2026-11-26: a custom RIL class (CyanogenMod's SamsungExynos4RIL, set by ro.telephony.ril_class)
+     * parses the call list with the stock AOSP RIL.responseCallList, which has no Samsung call type int. With the extra int
+     * every field after isVoicePrivacy shifted by one: the number was read as an empty string, the presentation came out as
+     * the first characters of the real number ("illegal presentation 3211307") and GET_CURRENT_CALLS failed on every poll,
+     * so a ringing call never reached the phone app. Stock Samsung firmware has no such property and keeps the extra int.
+     */
+    private val aospCallList: Boolean by lazy {
+        listOf("system/build.prop", "default.prop", "system/default.prop", "system/system.prop", "system/etc/system.prop", "vendor/build.prop")
+            .any { f ->
+                runCatching { File(paths.root, f).readLines() }.getOrDefault(emptyList())
+                    .any { it.trim().startsWith("ro.telephony.ril_class=") && it.substringAfter('=').trim().isNotEmpty() }
+            }
+    }
+
     fun halConfig(secbridge: Boolean): String {
         fun hex(b: ByteArray?) = b?.joinToString("") { "%02x".format(it) }.orEmpty()
         val numeric = card.mcc + card.mnc
@@ -423,7 +438,7 @@ class RilStub(
         b.write(le(0)); b.write(le(1)); b.write(le(0))         // not multiparty, mobile terminated, als
         b.write(le(1))                                         // voice
         b.write(le(0))                                         // no voice privacy
-        if (samsung && api >= 18) b.write(le(0))               // Samsung 4.3: CallDetails call type (voice)
+        if (samsung && api >= 18 && !aospCallList) b.write(le(0)) // Samsung 4.3: CallDetails call type (voice); custom RIL classes (CM) parse the AOSP layout, no extra int
         b.write(str(number)); b.write(le(0))                   // number, presentation allowed
         b.write(str(null)); b.write(le(2))                     // no name, presentation unknown
         b.write(le(0))                                         // no UUS info
