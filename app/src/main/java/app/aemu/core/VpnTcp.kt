@@ -65,6 +65,7 @@ class VpnTcpConn(
     private var oooBytes = 0
     private val deliverQ = ArrayDeque<ByteArray>()
     private var deliverQBytes = 0
+    private var downSeen = false   // gate2 egress series: the first downstream byte has arrived
     private var eofDelivered = false
     private var abortive = false
     private var pktId = 0
@@ -101,6 +102,7 @@ class VpnTcpConn(
             phase = PHASE_SYN
             emitLocked(buildLocked(FLAG_SYN, isn, 0, EMPTY, true))
             log("aemu-vpn: flow $id syn-sent dst=${serverIp ushr 24}.${(serverIp ushr 16) and 0xff}.${(serverIp ushr 8) and 0xff}.${serverIp and 0xff}:$serverPort srcport=$srcPort gen=$gen")
+            log("aemu-egress: flow $id connect dst=${serverIp ushr 24}.${(serverIp ushr 16) and 0xff}.${(serverIp ushr 8) and 0xff}.${serverIp and 0xff}:$serverPort t=$now")
         }
     }
 
@@ -218,6 +220,7 @@ class VpnTcpConn(
                     phase = PHASE_ESTABLISHED
                     emitLocked(ackLocked())
                     onEstablished()
+                    log("aemu-egress: flow $id established afterMs=${System.currentTimeMillis() - connectStart}")
                     if (payloadLen > 0) {
                         receiveDataLocked(rcvNxt, p, payloadOff, payloadLen)
                         emitLocked(ackLocked())
@@ -334,6 +337,7 @@ class VpnTcpConn(
         dead = true
         closeReason = reason
         this.abortive = abortive
+        if (abortive) log("aemu-egress: flow $id dead reason=$reason up=$upBytes down=$downBytes")
         unacked.clear()
         pending.clear()
         pendingBytes = 0
@@ -378,6 +382,10 @@ class VpnTcpConn(
             s += trim
             o += trim.toInt()
             l -= trim.toInt()
+        }
+        if (!downSeen && l > 0) {
+            downSeen = true
+            log("aemu-egress: flow $id first-down bytes=$l afterMs=${System.currentTimeMillis() - connectStart}")
         }
         if (s == rcvNxt) {
             enqueueDeliverLocked(p, o, l)
