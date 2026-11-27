@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AEmulator: partition seat (VmSettings.bootSeat). -->
+<resources>
+    <string name="vm_boot_seat_title">Boot seat: partitions + the ramdisk’s own init</string>
+    <string name="vm_boot_seat_sub">The partitions are presented as devices (by-name nodes, a real mount table) in every boot mode, and a boot runs the boot image ramdisk’s /init as the first guest process — it sets up and hands over itself, like on a device — instead of the host’s service plan. For images imported with this build (their boot image is kept). Experimental; applies at the next full boot.</string>
+</resources>
