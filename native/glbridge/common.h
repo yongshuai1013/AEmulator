@@ -5,7 +5,9 @@
 #include <stdint.h>
 
 #define AEMU_GL_PROTOCOL 1
-#define AEMU_GL_SOCKET "/dev/socket/aemu_gl"
+#ifndef AEMU_GL_SOCKET
+#define AEMU_GL_SOCKET "/dev/socket/aemu_gl"     /* (a desktop test builds with another path) */
+#endif
 #define NIL 0xffffffffu
 
 /* Calls that are not GL entry points. "->" is what the host answers. */
@@ -35,7 +37,21 @@ enum {
     OP_IMAGE_DATA,          /* u64 buffer id, u64 write count, u32 w, u32 h, u32 stride, u32 format, block (top row first) */
     OP_PRESENT,             /* u64 buffer id, u32 w, u32 h: the composed frame, to the screen -> u32 1, or 0: not a
                                buffer the host has. Sent by the guest's hwcomposer. */
+    OP_SWAP_FMT,            /* u32 w, u32 h, u32 bits per pixel (16, 24, 32), u32 row pitch in bytes, then the layout: u32 offset and
+                               length (bits) of red, green, blue, alpha -> (h - 1) * pitch + w * bpp / 8 bytes, the frame in that
+                               layout, TOP row first. The conversion is the host's (native code): a guest that runs in a translator
+                               (x86 firmware) spends milliseconds a frame on it, and the bytes go straight into the window's buffer.
+                               See AEMU_CAP_SWAP_FMT. */
+    OP_IMAGE_TEX2,          /* u32 target, u32 w, u32 h, u32 row pitch in pixels, u32 HAL format (1 RGBA_8888, 2 RGBX_8888, 3 RGB_888,
+                               4 RGB_565), block of ((h - 1) * pitch + w) pixels as the buffer holds them: a window buffer as a texture
+                               without the guest widening or repacking it. See AEMU_CAP_IMAGE_TEX2. */
 };
+
+/* What the host can do beyond protocol 1. The guest asks once, after OP_HELLO, with an OP_PING that carries AEMU_CAPS_PROBE; a host that
+ * knows the probe answers 1 | caps << 1, an older one answers 1 (and the guest keeps to the calls it knows). */
+#define AEMU_CAPS_PROBE     0xAE000001u
+#define AEMU_CAP_SWAP_FMT   1u
+#define AEMU_CAP_IMAGE_TEX2 2u
 
 /* how many values glGet* gives for a name; 0: a list whose length is another name's value (each side asks for it) */
 static inline uint32_t aemu_get_count0(uint32_t pname, uint32_t *count_name) {
