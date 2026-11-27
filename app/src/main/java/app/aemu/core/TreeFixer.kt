@@ -152,7 +152,166 @@ class TreeFixer(
         keyLayout()
         for (n in LOGS) File(root, "dev/log/$n").let { if (!it.isFile) { it.parentFile?.mkdirs(); it.createNewFile() } }
         makeFb()
+        installRadioHal()
         dumpModes("fixup")
+    }
+
+    private val RADIO_HAL_ASSET = "engines/radio-hal/vendor#bin#hw#android.hardware.radio@1.0-service.aemu"
+    private val RADIO_HAL_BIN = "android.hardware.radio@1.0-service.aemu"
+
+    private val RADIO_HAL_XML = """    <hal format="hidl">
+        <name>android.hardware.radio</name>
+        <transport>hwbinder</transport>
+        <version>1.0</version>
+        <interface>
+            <name>IRadio</name>
+            <instance>slot1</instance>
+        </interface>
+    </hal>
+"""
+
+    private val manifestHalBlock = Regex("[ \\t]*<hal\\b[^>]*>.*?</hal>[ \\t]*\\r?\\n?", RegexOption.DOT_MATCHES_ALL)
+    private val manifestHalName = Regex("<name>\\s*([^<\\s]+)\\s*</name>")
+    private val manifestHalFormat = Regex("<hal\\b[^>]*\\bformat=\"([a-z]+)\"")
+
+    private fun deviceManifestFiles(): List<File> =
+        listOf("vendor/etc/vintf/manifest.xml", "system/vendor/etc/vintf/manifest.xml", "odm/etc/vintf/manifest.xml").map { File(root, it) } +
+            listOf("vendor/etc/vintf/manifest", "system/vendor/etc/vintf/manifest").flatMap { File(root, it).listFiles().orEmpty().toList() }
+
+    private fun skuManifests(): List<File> =
+        listOf("vendor/etc/vintf", "system/vendor/etc/vintf", "odm/etc/vintf").flatMap { d ->
+            File(root, d).listFiles()?.filter { it.isFile && it.name.startsWith("manifest_") && it.name.endsWith(".xml") }?.sortedBy { it.name }.orEmpty()
+        }
+
+    private fun firmwareDeclaresHidl(halName: String): Boolean {
+        val legacy = listOf("vendor/manifest.xml", "system/vendor/manifest.xml", "odm/manifest.xml").map { File(root, it) }
+        val seen = HashSet<String>()
+        return (deviceManifestFiles() + skuManifests() + legacy).any { f ->
+            f.isFile && seen.add(runCatching { f.canonicalPath }.getOrDefault(f.path)) && runCatching {
+                val text = f.readText().replace(RADIO_HAL_XML, "")
+                manifestHalBlock.findAll(text).any { b ->
+                    manifestHalName.find(b.value)?.groupValues?.get(1) == halName && manifestHalFormat.find(b.value)?.groupValues?.get(1) == "hidl"
+                }
+            }.getOrDefault(false)
+        }
+    }
+
+    fun writeRadioHalConfig(config: (secbridge: Boolean) -> String) {
+        if (img.api < 26 || !File(root, "vendor/bin/hw/$RADIO_HAL_BIN").isFile) return
+        runCatching {
+            val f = File(root, "vendor/etc/aemu-radio.conf")
+            f.parentFile?.mkdirs()
+            f.writeText(config(firmwareDeclaresHidl("vendor.samsung.hardware.radio.secbridge")))
+            f.setReadable(true, false)
+        }.onFailure { log("radio HAL: configuration not written: ${it.message}") }
+    }
+
+    /**
+     * One-time removal of the previous seat's implants in an existing tree: the n64-29-gsi overlay put
+     * vendor/etc/init/aemu-radio.rc (starting /system/bin/aemu-radio, the retired radio_host) and a
+     * five-version fragment into trees that were imported before this seat. The new rc has another name,
+     * so the old one would never be overwritten — it would keep starting the old service, which races the
+     * new one's registration (and its fragment is the ill-formed five-version shape that voids the whole
+     * device manifest). Runs before the seat gate: a tree keeps neither even when the seat stays off.
+     */
+    private fun dropStaleRadioHal() {
+        runCatching {
+            val rc = File(root, "vendor/etc/init/aemu-radio.rc")
+            if (rc.isFile) { rc.delete(); log("radio HAL: stale aemu-radio.rc of the previous seat removed") }
+            val frag = File(root, "vendor/etc/vintf/manifest/aemu-radio.xml")
+            if (frag.isFile && frag.readText().contains("<version>1.4</version>")) {
+                frag.delete(); log("radio HAL: stale five-version aemu-radio.xml of the previous seat removed")
+            }
+        }
+    }
+
+    private fun declareInMonolithicManifests(halName: String, halXml: String) {
+        // Android 10+ (API 29) reads the monolithic manifest AND the fragment directory, so the same HAL in both is
+        // a VINTF conflict: hwservicemanager then cannot read the device manifest at all and every HAL lookup fails.
+        // From API 29 the fragment alone is enough; a copy an earlier start put into the monolithic manifest is taken out again.
+        if (img.api >= 29) {
+            for (rel in listOf("vendor/etc/vintf/manifest.xml", "system/vendor/etc/vintf/manifest.xml", "odm/etc/vintf/manifest.xml")) {
+                val f = File(root, rel)
+                if (!f.isFile) continue
+                runCatching {
+                    val text = f.readText()
+                    if (!text.contains(halXml)) return@runCatching
+                    f.setWritable(true); f.writeText(text.replace(halXml, "")); f.setReadable(true, false)
+                    log("$rel: $halName declaration of the engine removed (the fragment declares it, Android ${img.api} reads both)")
+                }.onFailure { log("$rel: $halName declaration not removed: ${it.message}") }
+            }
+            return
+        }
+        val seenM = HashSet<String>()
+        val nameRe = Regex("<name>\\s*" + Regex.escape(halName) + "\\s*</name>")
+        for (rel in listOf("vendor/etc/vintf/manifest.xml", "system/vendor/etc/vintf/manifest.xml", "odm/etc/vintf/manifest.xml")) {
+            val f = File(root, rel)
+            if (!f.isFile || !seenM.add(runCatching { f.canonicalPath }.getOrDefault(f.path))) continue
+            runCatching {
+                val text = f.readText()
+                if (nameRe.containsMatchIn(text)) return@runCatching
+                val at = text.lastIndexOf("</manifest>")
+                if (at < 0) return@runCatching
+                f.setWritable(true); f.writeText(text.substring(0, at) + halXml + text.substring(at)); f.setReadable(true, false)
+                log("$rel: $halName declared in the monolithic manifest (the fragment directory is not read before Android 10)")
+            }.onFailure { log("$rel: $halName declaration not added: ${it.message}") }
+        }
+    }
+
+    private fun installRadioHal() {
+        dropStaleRadioHal()
+        if (img.api < 26 || !img.settings.radio || !kernel.treble || isPure32Tree(root)) return
+        if (!EngineAssets.exists(ctx, RADIO_HAL_ASSET)) { log("radio HAL: no service in the engine set, telephony stays without a modem"); return }
+        if (!File(root, "vendor").isDirectory) return
+        val bin = File(root, "vendor/bin/hw/$RADIO_HAL_BIN")
+        runCatching {
+            bin.parentFile?.mkdirs()
+            val same = bin.isFile && bin.length() == EngineAssets.size(ctx, RADIO_HAL_ASSET) &&
+                bin.readBytes().contentEquals(EngineAssets.open(ctx, RADIO_HAL_ASSET).use { it.readBytes() })
+            if (!same) {
+                bin.delete()
+                EngineAssets.open(ctx, RADIO_HAL_ASSET).use { src -> bin.outputStream().use { src.copyTo(it) } }
+            }
+            bin.setReadable(true, false); bin.setExecutable(true, false)
+            val rc = File(root, "vendor/etc/init/$RADIO_HAL_BIN.rc")
+            rc.parentFile?.mkdirs()
+            val rcText = "service aemu-radio /vendor/bin/hw/$RADIO_HAL_BIN\n    class hal\n    user radio\n    group radio\n"
+            if (!rc.isFile || rc.readText() != rcText) rc.writeText(rcText)
+            rc.setReadable(true, false)
+        }.onFailure { log("radio HAL: service not installed: ${it.message}"); return }
+        val frag = File(root, "vendor/etc/vintf/manifest/aemu-radio.xml")
+        val hal = RADIO_HAL_XML
+        val monolithic = listOf("vendor/etc/vintf/manifest.xml", "system/vendor/etc/vintf/manifest.xml", "odm/etc/vintf/manifest.xml")
+        val legacy = listOf("vendor/manifest.xml", "system/vendor/manifest.xml")
+        val ours = fun(f: File) = f.isFile && runCatching { f.readText().contains(hal) }.getOrDefault(false)
+        val already = (monolithic + legacy).map { File(root, it) }.any(ours) || frag.isFile
+        if (!already && firmwareDeclaresHidl("android.hardware.radio")) { log("radio HAL: the firmware already declares android.hardware.radio, not declared again"); return }
+        if (img.api >= 29) {
+            runCatching {
+                frag.parentFile?.mkdirs()
+                val xml = "<manifest version=\"1.0\" type=\"device\">\n" + hal + "</manifest>\n"
+                if (!frag.isFile || frag.readText() != xml) { frag.writeText(xml); frag.setReadable(true, false) }
+            }.onFailure { log("radio HAL: fragment not written: ${it.message}"); return }
+            declareInMonolithicManifests("android.hardware.radio", hal)
+        } else {
+            frag.delete()
+            val target = (monolithic.take(2) + legacy).map { File(root, it) }.firstOrNull { it.isFile }
+            for (rel in monolithic + legacy) {
+                val f = File(root, rel)
+                if (f == target || !ours(f)) continue
+                runCatching { f.setWritable(true); f.writeText(f.readText().replace(hal, "")); f.setReadable(true, false) }
+            }
+            if (target == null) { log("radio HAL: no device manifest to declare in"); return }
+            runCatching {
+                val text = target.readText()
+                if (text.contains(hal)) return@runCatching
+                val at = text.lastIndexOf("</manifest>")
+                if (at < 0) return@runCatching
+                target.setWritable(true); target.writeText(text.substring(0, at) + hal + text.substring(at)); target.setReadable(true, false)
+                log("${target.name}: radio@1.0 declared")
+            }.onFailure { log("radio HAL: declaration not added: ${it.message}"); return }
+        }
+        log("radio HAL: android.hardware.radio@1.0::IRadio/slot1 installed")
     }
 
     /**
