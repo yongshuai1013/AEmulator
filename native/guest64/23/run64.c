@@ -3402,9 +3402,10 @@ static void cc_mod(u64 addr, char *out, u64 cap) {
 // thread, the signal, the fault address, pc/lr with their mappings, sp, and the VPN session tag
 // this process's supervisor currently carries (the aemu-137r tag of the session now up, so a death
 // can be read next to the session it died in). g_cc_done keeps it to one line per process,
-// whichever path gets here first.
-static void cc_emit_ctx(int sig, u64 fault, struct sigctx *c, long tid) {
-    if (__atomic_exchange_n(&g_cc_done, 1, __ATOMIC_ACQUIRE)) return;
+// whichever path gets here first. The entry variant of the same line (cc_emit_entry below)
+// is not gated by g_cc_done and appends entry=1 plus the full register set.
+static void cc_emit_ctx_e(int sig, u64 fault, struct sigctx *c, long tid, int entry) {
+    if (!entry && __atomic_exchange_n(&g_cc_done, 1, __ATOMIC_ACQUIRE)) return;
     int ownfd = -1;
     if (g_sayfd < 0) {                                          // land in <root>/dev/aemu_crash.log too, as on_crash does
         static char lp[600];
@@ -3426,8 +3427,16 @@ static void cc_emit_ctx(int sig, u64 fault, struct sigctx *c, long tid) {
     say(" lr="); hex(c->regs[30]); say(" ("); say(lrmod); say(")");
     say(" sp="); hex(c->sp);
     { char stag[16]; u64 so = 0; stag[0] = 0; r137_tag_into(stag, &so, g_137r_cur, r137_pending()); say(" sess="); say(stag); }
+    if (entry) {
+        say(" entry=1");
+        for (int i = 0; i < 31; i++) { say(" x"); say(utoa((u64)i, t + sizeof t)); say("="); hex(c->regs[i]); }
+    }
     say("\n");
     if (ownfd >= 0) { S1(NR_close, ownfd); g_sayfd = -1; }
+}
+
+static void cc_emit_ctx(int sig, u64 fault, struct sigctx *c, long tid) {
+    cc_emit_ctx_e(sig, fault, c, tid, 0);
 }
 
 static void cc_emit(int sig, void *info, void *uc) {
@@ -3461,6 +3470,13 @@ static void cc_note(int sig, void *info, void *uc) {
 // neither redirected execution onto a throw path — the handled exit, ART's implicit checks — nor
 // repaired the fault, so the delivery in flight is the death). Observation only: the relay then
 // does exactly what it did before, and g_cc_done still keeps the process to one aemu-crash line.
+// The probe field then proved that naming point unreachable for this process: the relay is
+// called and the identity test passes, yet the handler branch consumes the death exactly as
+// the seven fields showed — the handler never comes back, so the pc comparison never runs.
+// The snapshot is therefore also printed at the door (cc_emit_entry): same line, entry=1,
+// full registers, not gated by g_cc_done, so a survived fault prints too and cannot silence
+// the death's own naming; whether a door print was the death is read from what follows it
+// (the zygote's exit line), not from the line itself.
 // Identity is the process name the guest itself set, read back from /proc/self/comm and latched
 // only on a match, so a forked child is judged by its own name, never its parent's.
 
@@ -3532,6 +3548,16 @@ static void ssc_probe(int sig, void *uc) {
     tun_catn(line, &o, (u64)ssw_now_ms());
     tun_cat(line, &o, "\n");
     say(line);
+}
+
+// Entry snapshot: the same structured line, printed at the relay's door — after the
+// probe, before cc_note and before the guest handler runs — for the one process whose
+// death the after-handler naming can never reach (see the capture note above).
+// Observation only: nothing the relay does afterwards changes, and the after-handler
+// naming point in fatal_relay is untouched.
+static void cc_emit_entry(int sig, void *info, void *uc) {
+    struct sigctx *c = (struct sigctx *)((char *)uc + 176);
+    cc_emit_ctx_e(sig, *(u64 *)((char *)info + 16), c, S0(NR_gettid), 1);   // siginfo's si_addr, as in cc_emit
 }
 
 static void on_crash(int sig, void *info, void *uc) {
@@ -3611,6 +3637,7 @@ static void on_crash(int sig, void *info, void *uc) {
 // (SIG_DFL) the crash is reported here, on the program's stderr, with the mappings of pc and the callers.
 static void fatal_relay(int sig, void *info, void *uc) {
     ssc_probe(sig, uc);                                         // 137 measurement: name this delivery before anything touches it
+    if (is_fatal(sig) && sig != 8 && ssc_is_ss()) cc_emit_entry(sig, info, uc);   // entry snapshot: print this delivery at the door
     if (sig == 11 || sig == 6) cc_note(sig, info, uc);          // crash capture: stash (and name a repeat fault)
     if (g_crash) {
         on_crash(sig, info, uc);
