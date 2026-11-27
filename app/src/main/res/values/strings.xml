@@ -426,4 +426,5 @@
     <string name="as_library_3d">3D firmware library</string>
     <string name="as_library_3d_sub">Show imported firmwares and containers as 3D phones you swipe through, instead of the card list. Off by default.</string>
     <string name="sim_country_emulator">Emulator</string>
+    <string name="bluetooth_permission_denied">Bluetooth permission denied: the guest will boot without host Bluetooth.</string>
 </resources>
