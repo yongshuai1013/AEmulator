@@ -138,6 +138,14 @@ data class VmSettings(
     /** the guest agent (identity sync for the per-app views, the APK import inbox): a guest service the host starts at boot, see AgentSupport; applies at the next full VM boot */
     val agent: Boolean = false,
     /**
+     * Partition seat (arm64 guests whose boot.img was kept at import): the host presents the
+     * partitions as devices (by-name nodes, the supervisor's mount table on) in every boot
+     * mode, and a boot runs the boot image ramdisk's /init as the first guest process — it
+     * sets up and hands over itself, like on a device — instead of the host's service plan.
+     * See PartitionSeat. Applies at the next full VM boot.
+     */
+    val bootSeat: Boolean = false,
+    /**
      * Legacy: the hide list of the per-app views, back when the host's settings page owned it. The list
      * itself lives in the guest now (AgentSupport.LIST_FILE, managed by the Root Manager app in the
      * guest); this field is kept only as the one-time migration source AgentSupport.write copies into
@@ -175,6 +183,7 @@ data class VmSettings(
         .put("magiskSub", magiskSub).put("zygiskSpike", zygiskSpike)
         .put("qemuZero", qemuZero)
         .put("agent", agent)
+        .put("bootSeat", bootSeat)
         .put("hiddenApps", org.json.JSONArray(hiddenApps))
 
     companion object {
@@ -273,6 +282,7 @@ data class VmSettings(
                 zygiskSpike = o.optBoolean("zygiskSpike", d.zygiskSpike),
                 qemuZero = o.optBoolean("qemuZero", d.qemuZero),
                 agent = o.optBoolean("agent", d.agent),
+                bootSeat = o.optBoolean("bootSeat", false),
                 hiddenApps = o.optJSONArray("hiddenApps")?.let { a -> (0 until a.length()).mapNotNull { a.optString(it).trim().takeIf { s -> s.isNotEmpty() } }.distinct() } ?: d.hiddenApps,
             )
         }
