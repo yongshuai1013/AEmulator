@@ -167,7 +167,7 @@ class GuestRunner(
         // the phone's, which qemu would otherwise pass straight through
         e["AEMU_PROC_VERSION"] = KernelBanner.effectiveBanner(img)
         e["AEMU_PROC_CMDLINE"] = GuestProcInfo.cmdline(img, paths.root)
-        e["AEMU_CPUINFO"] = GuestProcInfo.cpuinfo(img, paths.root)
+        e["AEMU_CPUINFO"] = GuestProcInfo.effectiveCpuinfo(img, paths.root)
         e["HOME"] = "/data"
         e["TMPDIR"] = "/data/local/tmp"
         e["ASHMEM_SHIM_DIR"] = "/data/local/tmp"
