@@ -8,6 +8,7 @@ import app.aemu.core.PropArea
 import app.aemu.core.VmPaths
 import app.aemu.core.VmSettings
 import app.aemu.core.deriveSerialNo
+import app.aemu.core.SocProfiles
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -128,7 +129,7 @@ class Analyzer(
             sdcardPath = sdcard,
             volumes = voldVols,
             // the kernel banner extracted from boot.img pre-fills the (user-editable) setting
-            settings = settings.copy(kernelBanner = kernelBanner, bootloaderName = bootloaderName, serialNo = deriveSerialNo(id)),
+            settings = settings.copy(kernelBanner = kernelBanner, bootloaderName = bootloaderName, serialNo = deriveSerialNo(id), soc = deriveSocId(all)),
             createdAt = System.currentTimeMillis(),
             sourceName = sourceName,
             runtime = if (api >= 21) "art" else "dalvik",
@@ -176,6 +177,22 @@ class Analyzer(
             app.aemu.core.ImageStore.save(ctx, out)
             return out
         }
+    }
+
+    /**
+     * The SoC preset a firmware names for itself: its ro.board.platform (then ro.product.board,
+     * then ro.hardware) looked up in the preset table by platform or row id. Pre-fills the image's
+     * soc setting at import, the way the kernel banner (from boot.img) and the baseband (from the
+     * radio file name) are pre-filled; the user can change it in the settings afterwards. No
+     * matching row: blank, and the image keeps the default identity — never a guessed chip.
+     */
+    private fun deriveSocId(props: Map<String, String>): String {
+        for (k in listOf("ro.board.platform", "ro.product.board", "ro.hardware")) {
+            val p = props[k]?.trim()?.lowercase().orEmpty()
+            if (p.isEmpty()) continue
+            SocProfiles.presets.firstOrNull { it.platform.lowercase() == p || it.id.lowercase() == p }?.let { return it.id }
+        }
+        return ""
     }
 
     /** Minimal build.prop for trees that came without one; version is inferred from framework/lib layout. */
