@@ -219,6 +219,7 @@ class VmActivity : ComponentActivity() {
         if (direct) { surfaceView.holder.setFixedSize(gw, gh); guest.direct = { app.aemu.core.GlHost.presented() } }
         surfaceView.visibility = if (useBridge || direct) View.VISIBLE else View.GONE
         guest.passthrough = useBridge
+        guest.bridgeMode = useBridge
         box.addView(surfaceView, FrameLayout.LayoutParams(-1, -1))
         box.addView(guest, FrameLayout.LayoutParams(-1, -1))
         root.addView(frameView, FrameLayout.LayoutParams(-1, -1))
@@ -827,7 +828,16 @@ class VmActivity : ComponentActivity() {
         val running = state == GuestVm.State.RUNNING && !vm.recoveryMode
         var seconds by remember { mutableStateOf(0L) }
         var frames by remember { mutableStateOf(0L) }
-        LaunchedEffect(Unit) { while (true) { if (vm.recoveryMode) guest.format = vm.recoveryFormat else if (vm.engine == app.aemu.core.Engine.N64) guest.format = 1; seconds = vm.bootSeconds(); frames = if (vm.glInApp) dev.lk.m7sense.GlBridge.frames() else guest.rings; delay(500) } }
+        LaunchedEffect(Unit) { while (true) { if (vm.recoveryMode) guest.format = vm.recoveryFormat else if (vm.engine == app.aemu.core.Engine.N64) guest.format = 1; seconds = vm.bootSeconds(); frames = if (vm.glInApp) dev.lk.m7sense.GlBridge.frames() else guest.rings
+                // Added for AEmulator Plus (2026-11-19): the screen starts out transparent for the in-app GPU bridge, but when that
+                // bridge is not what serves the guest (the standalone glserverd, or the open bridge whose frames land in fb0)
+                // nothing draws into the SurfaceView: the screen stayed empty. Follow whether the in-app bridge is really
+                // running; otherwise show fb0 like the software path.
+                if (guest.bridgeMode) {
+                    val live = vm.glInApp
+                    if (guest.passthrough != live) { guest.passthrough = live; guest.poke() }
+                }
+                delay(500) } }
         // как только гость начал рисовать — карточку убираем, остаётся маленький индикатор
         val drawing = frames > 30
         androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxSize()) {
