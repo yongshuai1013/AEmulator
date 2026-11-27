@@ -2865,7 +2865,7 @@ static int rl_trap_begin(void) {                  // yi': >=0 = run this trap ou
     if (i < 0 || g_rl_depth[i] <= 0) return -1;   // not in a relay: nothing changes
     if (g_rl_onstk[i]) return -1;                 // already out there: a nested trap rides the same big stack
     if (__atomic_exchange_n(&g_fm_said, 1, __ATOMIC_ACQ_REL) == 0)
-        say("aemu-137r: mode bigstack+faultmap+fdlen2 (yi' restored; fd-side fstat length via /proc/<pid>/fd)\n");
+        say("aemu-137r: mode bigstack+faultmap+fdlen3+fix1 (yi' restored; fdlen by fd-number fstat sweep; ashmem mmap size gates)\n");
     if (!g_rl_stk[i]) g_rl_stk[i] = rl_mmap_stack();
     if (!g_rl_stk[i]) return -1;                  // no stack to give: the pre-fix behaviour
     g_rl_onstk[i] = 1;
@@ -3217,6 +3217,19 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
                         if (m[i] == key[k][0] && seq(m + i, key[k])) { if ((m[i - 92] == '1' || m[i - 92] == '2') && !m[i - 91]) m[i - 92] = '0'; break; }
                 S3(NR_mprotect, r, a[1], 1);
                 return r;
+            }
+        }
+        if (a[4] >= 0 && is_ashmem_fd((int)a[4])) {
+            // fix1: the real ashmem driver's two mmap gates, which this layer never had. A region
+            // whose size was never set (its memfd is still 0 long), or a mapping longer than the
+            // region, fails here with EINVAL — as it does on a real device — instead of passing
+            // silently and faulting at first touch. The size is the file's own length, read as it
+            // stands (GET_SIZE's way); only the length is judged, not the offset, as in the
+            // driver's own test. An fstat that fails judges nothing and passes through.
+            struct kstat st;
+            if (S2(NR_fstat, a[4], &st) == 0) {
+                if (st.st_size == 0) return -EINVAL;
+                if ((u64)a[1] > (((u64)st.st_size + 4095) & ~(u64)4095)) return -EINVAL;
             }
         }
         return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
@@ -3673,13 +3686,14 @@ static void ssc_probe(int sig, void *uc) {
 // The maps read is this process's own (this image runs inside the guest process it
 // names); the row's path is statted as printed first and through xl() if that fails,
 // and the form that answered is the one printed. The account also reads the length
-// from the fd side (fdlen): the fd table is scanned for an fd whose fstat names
-// the row's inode, so a deleted memfd's length — unreadable by path — is read there,
-// or reported as none with its reason and, where one exists, its errno. The table
-// is named by number — /proc/<pid>/fd, pid = S0(NR_getpid), the same pid the maps
-// read's "self" resolves to — because the /proc/self/fd doorway would not open as
-// a directory in the 15:42 field (fdlen v1 came back none(dir-fail), the scan
-// never ran). A fault in no row prints no-map with
+// from the fd side (fdlen): this process's fd numbers are swept and each is
+// fstat'd for one naming the row's inode, so a deleted memfd's length —
+// unreadable by path — is read there, or reported as none(no-fd) when no live
+// fd names it. The sweep replaced two tries at opening the fd table as a
+// directory (v1 /proc/self/fd, v2 /proc/<pid>/fd): both came back dir-fail in
+// the field, the second carrying EINVAL, and the desk verdict put that EINVAL
+// in the host kernel's answer to the directory open itself — so v3 opens
+// nothing and asks the numbers directly. A fault in no row prints no-map with
 // the two neighbour rows, the nearer file row carrying the account; an anonymous row
 // prints as anon; a maps read that fails prints its error. Observation only: nothing
 // here changes what the relay does with the delivery.
@@ -3707,40 +3721,16 @@ static void fm_signed(i64 v) {                     // a length distance, sign an
     else say(utoa((u64)v, t + sizeof t));
 }
 
-static long fm_fdlen(u64 ino, u64 *len, long *err) {   // the fd-side length of one inode: scan the
-    static char buf[8192];                              // fd table for an fd whose fstat names this
-    char path[48]; u64 o = 0;                           // inode. The table is named by number —
-    tun_cat(path, &o, "/proc/");                        // /proc/<pid>/fd with pid = S0(NR_getpid),
-    tun_catn(path, &o, (u64)S0(NR_getpid));             // the pid the maps read's "/proc/self/maps"
-    tun_cat(path, &o, "/fd");                           // resolves to — not through the self
-    long dfd = S4(NR_openat, AT_FDCWD, path, 0x10000 /* O_DIRECTORY */, 0);   // doorway, which would
-    if (dfd < 0) { *err = -dfd; return -2; }            // not open (v1); a failure's errno rides *err
-    long any = -1; u64 anylen = 0;
-    int done = 0, scanned = 0, readany = 0;
-    while (!done) {
-        long n = S3(NR_getdents64, dfd, buf, sizeof buf);
-        if (n < 0 && !readany) { *err = -n; S1(NR_close, dfd); return -2; }   // opened, but not one entry read
-        if (n <= 0) break;
-        readany = 1;
-        long b = 0;
-        while (b < n) {
-            u16 rl = *(u16 *)(buf + b + 16);
-            const char *nm = buf + b + 19;
-            if (!rl) { done = 1; break; }
-            b += rl;
-            if (nm[0] < '0' || nm[0] > '9') continue;
-            if (++scanned > 4096) { done = 1; break; }   // a table past this many entries is not walked further
-            long fdn = (long)atou(nm);
-            if (fdn == dfd) continue;               // the walk's own fd names the table, not a file
-            struct kstat st;
-            if (S2(NR_fstat, fdn, &st) != 0 || st.st_ino != ino) continue;
-            if ((st.st_mode & 0170000) == 0100000) { *len = (u64)st.st_size; S1(NR_close, dfd); return fdn; }
-            if (any < 0) { any = fdn; anylen = (u64)st.st_size; }   // a non-regular namesake: kept, not preferred
-        }
+static long fm_fdlen(u64 ino, u64 *len) {   // the fd-side length of one inode: sweep this process's
+    long any = -1; u64 anylen = 0;          // fd numbers, fstat each, keep the one naming this inode.
+    for (long fdn = 0; fdn <= 4096; fdn++) {   // no directory is opened and no /proc path is built:
+        struct kstat st;                    // the number sweep is the whole walk (v3)
+        if (S2(NR_fstat, fdn, &st) != 0 || st.st_ino != ino) continue;
+        if ((st.st_mode & 0170000) == 0100000) { *len = (u64)st.st_size; return fdn; }
+        if (any < 0) { any = fdn; anylen = (u64)st.st_size; }   // a non-regular namesake: kept, not preferred
     }
-    S1(NR_close, dfd);
     if (any >= 0) { *len = anylen; return any; }
-    return -1;                                      // the whole table walked: no fd names this inode
+    return -1;                              // the sweep ran to its end: no live fd names this inode
 }
 
 static void fm_acct(const char *rel, struct fmrow *r, u64 fault) {   // the length account of one file row
@@ -3771,10 +3761,9 @@ static void fm_acct(const char *rel, struct fmrow *r, u64 fault) {   // the leng
     if (deleted) say(" deleted=1");
     if (!r->ino) say(" fdlen=none(no-ino)");
     else {
-        u64 fl = 0; long fe = 0; long fdn = fm_fdlen(r->ino, &fl, &fe);
+        u64 fl = 0; long fdn = fm_fdlen(r->ino, &fl);
         if (fdn >= 0) { say(" fdlen="); say(utoa(fl, t + sizeof t)); say(" fd="); say(utoa((u64)fdn, t + sizeof t)); }
-        else if (fdn == -2) { say(" fdlen=none(dir-fail,e="); say(utoa((u64)fe, t + sizeof t)); say(")"); }
-        else say(" fdlen=none(no-fd,e=0)");   // the walk ran to its end: no errno exists, e=0 by convention
+        else say(" fdlen=none(no-fd)");   // the sweep ran to its end: no live fd names this inode
     }
     say("\n");
 }
