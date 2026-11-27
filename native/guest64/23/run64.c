@@ -253,6 +253,13 @@ static void fake_owner(struct kstat *st) {
 // ---------------------------------------------------------------------------------------------------- ashmem
 
 #define ASHMEM_MAGIC 0x77
+// m2 (measure2-spec.md): the ashmem size biography — one print at the SET_SIZE funnel in
+// ashmem_ioctl and one at the mmap gate, keyed by inode (fd numbers are per-process, the inode
+// travels with the region). A per-process fuse keeps a pathological consumer from flooding the
+// log; past it the prints stop, silently. Defined after the tun_cat helpers; declared here.
+static int g_m2_left = 1024;
+static void m2_setsize(int fd, u64 arg, long ret);
+static void m2_mmap(int fd, u64 ino, i64 size, u64 len, u64 off, u64 prot, const char *dec);
 // an ashmem region is a memfd of ours; it may have come from another process, so it is recognised by its name
 static int is_ashmem_fd(int fd) {
     char p[40], t[32], d[24];
@@ -268,7 +275,7 @@ static long ashmem_ioctl(int fd, u32 cmd, u64 arg) {
     switch (cmd & 0xff) {
     case 1: return 0;                                               // SET_NAME
     case 2: if (arg) *(char *)arg = 0; return 0;                    // GET_NAME
-    case 3: return S2(NR_ftruncate, fd, arg);                       // SET_SIZE
+    case 3: { long r = S2(NR_ftruncate, fd, arg); m2_setsize(fd, arg, r); return r; }   // SET_SIZE (the funnel: every detour size change passes here)
     case 4: { struct kstat st; long r = S2(NR_fstat, fd, &st); return r < 0 ? r : st.st_size; } // GET_SIZE
     // The protection mask is kept on the region itself, as a seal, so that it travels with the descriptor: Chromium
     // makes a region read-only and checks that it reads back so (Chrome's GPU process aborts otherwise)
@@ -563,6 +570,37 @@ static void r137_ip4(char *t, u64 *o, u32 a) {   // wire order: first octet in t
 static void r137_num(char *t, u64 *o, long v) {
     if (v < 0) { tun_cat(t, o, "-"); tun_catn(t, o, (u64)(-v)); }
     else tun_catn(t, o, (u64)v);
+}
+
+static int m2_room(void) { if (g_m2_left <= 0) return 0; g_m2_left--; return 1; }
+
+static void m2_setsize(int fd, u64 arg, long ret) {
+    if (!m2_room()) return;
+    struct kstat st; u64 ino = 0;
+    if (S2(NR_fstat, fd, &st) == 0) ino = st.st_ino;
+    char t[160]; u64 o = 0; t[0] = 0;
+    tun_cat(t, &o, "aemu-m2: setsize pid="); tun_catn(t, &o, (u64)S0(NR_getpid));
+    tun_cat(t, &o, " fd="); tun_catn(t, &o, (u64)fd);
+    tun_cat(t, &o, " ino="); tun_catn(t, &o, ino);
+    tun_cat(t, &o, " size="); tun_catn(t, &o, arg);
+    tun_cat(t, &o, " -> "); r137_num(t, &o, ret);
+    tun_cat(t, &o, "\n");
+    say(t);
+}
+
+static void m2_mmap(int fd, u64 ino, i64 size, u64 len, u64 off, u64 prot, const char *dec) {
+    if (!m2_room()) return;
+    char t[224]; u64 o = 0; t[0] = 0;
+    tun_cat(t, &o, "aemu-m2: mmap pid="); tun_catn(t, &o, (u64)S0(NR_getpid));
+    tun_cat(t, &o, " fd="); tun_catn(t, &o, (u64)fd);
+    tun_cat(t, &o, " ino="); tun_catn(t, &o, ino);
+    tun_cat(t, &o, " size="); r137_num(t, &o, (long)size);
+    tun_cat(t, &o, " len="); tun_catn(t, &o, len);
+    tun_cat(t, &o, " off="); tun_catn(t, &o, off);
+    tun_cat(t, &o, " prot="); tun_catn(t, &o, prot);
+    tun_cat(t, &o, " -> "); tun_cat(t, &o, dec);
+    tun_cat(t, &o, "\n");
+    say(t);
 }
 
 static void r137_tag_into(char *t, u64 *o, int cur, int pending) {
@@ -2865,7 +2903,7 @@ static int rl_trap_begin(void) {                  // yi': >=0 = run this trap ou
     if (i < 0 || g_rl_depth[i] <= 0) return -1;   // not in a relay: nothing changes
     if (g_rl_onstk[i]) return -1;                 // already out there: a nested trap rides the same big stack
     if (__atomic_exchange_n(&g_fm_said, 1, __ATOMIC_ACQ_REL) == 0)
-        say("aemu-137r: mode bigstack+faultmap+fdlen3+fix1 (yi' restored; fdlen by fd-number fstat sweep; ashmem mmap size gates)\n");
+        say("aemu-137r: mode bigstack+faultmap+fdlen3+fix1r+m2 (yi' restored; fdlen by fd-number fstat sweep; ashmem mmap size gates, fd-routed; m2 setsize/mmap size prints)\n");
     if (!g_rl_stk[i]) g_rl_stk[i] = rl_mmap_stack();
     if (!g_rl_stk[i]) return -1;                  // no stack to give: the pre-fix behaviour
     g_rl_onstk[i] = 1;
@@ -3226,11 +3264,14 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             // silently and faulting at first touch. The size is the file's own length, read as it
             // stands (GET_SIZE's way); only the length is judged, not the offset, as in the
             // driver's own test. An fstat that fails judges nothing and passes through.
+            // fix1r+m2: every decision here leaves an aemu-m2 line (size=-1 when the fstat
+            // itself failed), so a field log reads the region's biography end to end.
             struct kstat st;
             if (S2(NR_fstat, a[4], &st) == 0) {
-                if (st.st_size == 0) return -EINVAL;
-                if ((u64)a[1] > (((u64)st.st_size + 4095) & ~(u64)4095)) return -EINVAL;
-            }
+                if (st.st_size == 0) { m2_mmap((int)a[4], st.st_ino, st.st_size, (u64)a[1], (u64)a[5], (u64)a[2], "einval-size0"); return -EINVAL; }
+                if ((u64)a[1] > (((u64)st.st_size + 4095) & ~(u64)4095)) { m2_mmap((int)a[4], st.st_ino, st.st_size, (u64)a[1], (u64)a[5], (u64)a[2], "einval-toolong"); return -EINVAL; }
+                m2_mmap((int)a[4], st.st_ino, st.st_size, (u64)a[1], (u64)a[5], (u64)a[2], "pass");
+            } else m2_mmap((int)a[4], 0, -1, (u64)a[1], (u64)a[5], (u64)a[2], "pass-fstatfail");
         }
         return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
     case NR_mount: case NR_umount2: case NR_chroot: case NR_capset: case NR_setgroups: case NR_unshare: case 268 /* setns */: return 0;
@@ -4050,9 +4091,8 @@ static void install_filter(void) {
     f[n++] = LD(16); f[n++] = JEQ(1, L_ALLOW, 0);
     f[n++] = LD(24); f[n++] = JEQ(0, 0, L_TRAP);
     f[n++] = LD(28); f[n++] = JEQ(0, L_ALLOW, L_TRAP);
-    AT(L_MMAP);                                                 // read-only file mappings: the binder buffer is one
-    f[n++] = LD(32); f[n++] = JEQ(1, 0, L_ALLOW);
-    f[n++] = LD(48); f[n++] = JEQ(0xffffffffu, L_ALLOW, L_TRAP);
+    AT(L_MMAP);                                                 // fix1r: any file mapping comes in, whatever its prot (routing
+    f[n++] = LD(48); f[n++] = JEQ(0xffffffffu, L_ALLOW, L_TRAP); // only PROT_READ starved the ashmem gate); anonymous ones pass
     AT(L_TRAP); f[n++] = RET(TRAP);
     AT(L_ALLOW); f[n++] = RET(ALLOW);
 #undef AT
