@@ -49,7 +49,7 @@ object PartitionSeat {
     private fun present(root: File): List<String> = PARTITIONS.filter { File(root, it).isDirectory }
 
     /**
-     * /dev/block/bootdevice/by-name/* inside [root]: boot (and recovery, when a raw image
+     * The by-name device nodes inside [root]: boot (and recovery, when a raw image
      * was kept) point at the real image files — a script dd-ing the boot partition patches
      * the very file the next seat boot unpacks — the rest at their partition directories.
      */
