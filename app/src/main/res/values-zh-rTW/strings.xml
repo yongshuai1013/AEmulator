@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="m_save_logs">將日誌儲存到「下載」</string>
+    <string name="m_save_logs_start">正在儲存日誌…</string>
+    <string name="m_save_logs_ok">日誌已儲存：%1$s</string>
+    <string name="m_save_logs_fail">無法儲存日誌：%1$s</string>
+</resources>
