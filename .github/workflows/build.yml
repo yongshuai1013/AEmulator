@@ -35,6 +35,15 @@ jobs:
           sh app/guest-wifi/build.sh
           ls -l app/src/main/assets/engines/kk/aemu-wifi.jar
           sha256sum app/src/main/assets/engines/kk/aemu-wifi.jar
+      - name: Assert guest Wi-Fi jar kept the Gingerbread gate
+        run: |
+          unzip -p app/src/main/assets/engines/kk/aemu-wifi.jar classes.dex > /tmp/aemu-wifi-classes.dex
+          if grep -a -q "left to the framework" /tmp/aemu-wifi-classes.dex; then
+            echo "OK: Gingerbread leaveName gate string present in the aemu-wifi dex"
+          else
+            echo "ERROR: Gingerbread leaveName gate string MISSING from the aemu-wifi dex - D8 min-api pruning ate the SDK_INT < 14 branch again" >&2
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: aemu-wifi-jar
