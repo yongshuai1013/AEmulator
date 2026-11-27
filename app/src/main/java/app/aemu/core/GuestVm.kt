@@ -545,6 +545,14 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         overrides["ro.serialno"] = s.serialNo.ifBlank { deriveSerialNo(img.id) }
         // storage technology the guest sees (AEmulator Plus): the boot-device properties follow the setting
         StorageSpoof.props(StorageType.parse(s.storageType)).forEach { (k, v) -> overrides[k] = v }
+        // the SoC the guest reports (AEmulator Plus .17): a chosen preset's properties join the
+        // overrides — ro.board.platform, ro.hardware.chipname and, from Android 12, ro.soc.model /
+        // ro.soc.manufacturer, from the same record as /proc/cpuinfo and /sys/devices/soc0 (TreeFixer).
+        // With the soc setting blank there is no preset and nothing here changes.
+        fixer.socPreset?.let { r ->
+            r.props.forEach { (k, v) -> overrides[k] = v }
+            log("props: SoC ${r.label}" + r.props.entries.joinToString("") { ", ${it.key}=${it.value}" })
+        }
         overrides["ro.sf.lcd_density"] = s.density.toString()
         overrides["qemu.sf.lcd_density"] = s.density.toString()
         // MIUI 10 forces the density of the phone's own panel from this one (440 on a 540-pixel screen)
