@@ -85,6 +85,8 @@ public final class VpnTestService extends VpnService {
         long lastAckProgress = System.currentTimeMillis();
         volatile long upBytes = 0;            // payload toward the server (written to the socket)
         volatile long downBytes = 0;          // payload toward the guest (written into the tunnel)
+        volatile boolean upSeen = false;      // gate2 egress series: first payload written to the socket
+        final long bornMs = System.currentTimeMillis();   // egress afterMs reference
 
         FwdConn(int no, String key, int clientIp, int clientPort, int serverIp, int serverPort) {
             this.no = no;
@@ -288,9 +290,14 @@ public final class VpnTestService extends VpnService {
                     (byte) (c.serverIp >>> 8), (byte) c.serverIp };
             s.connect(new InetSocketAddress(InetAddress.getByAddress(ipb), c.serverPort), 15000);
             Log.i(TAG, "conn " + c.no + " connected to " + c.dstText);
+            Log.i(TAG, "aemu-egress: conn " + c.no + " connect dst=" + c.dstText
+                    + " result=ok ms=" + (System.currentTimeMillis() - c.bornMs));
         } catch (Throwable e) {
             // Refused or unreachable: the hub's optimistic connect gets its answer as a RST.
             Log.w(TAG, "conn " + c.no + " connect to " + c.dstText + " failed: " + e);
+            Log.w(TAG, "aemu-egress: conn " + c.no + " connect dst=" + c.dstText
+                    + " result=fail ex=" + e.getClass().getSimpleName()
+                    + " msg=" + e.getMessage());
             writeRaw(buildPacket(c, 0, c.rcvNxt, FLAG_RST | FLAG_ACK, null, 0, 0));
             closeConn(c, "connect-failed");
             return;
@@ -316,6 +323,7 @@ public final class VpnTestService extends VpnService {
         pump.start();
 
         boolean sockDone = false;
+        boolean downSeen = false;   // gate2 egress series: first byte read back from the server
         byte[] rb = new byte[16384];
         try { s.setSoTimeout(250); } catch (Throwable ignored) { }
         while (!c.closed) {
@@ -340,6 +348,11 @@ public final class VpnTestService extends VpnService {
                 return;
             }
             if (r > 0) {
+                if (!downSeen) {
+                    downSeen = true;
+                    Log.i(TAG, "aemu-egress: conn " + c.no + " first-down bytes=" + r
+                            + " afterMs=" + (System.currentTimeMillis() - c.bornMs));
+                }
                 if (!sendToHub(c, rb, r)) return;   // the guest side is gone
             } else if (r < 0) {
                 // The server is done sending: our FIN goes out behind everything before it.
@@ -403,6 +416,11 @@ public final class VpnTestService extends VpnService {
                 try {
                     c.sockOut.write(chunk);
                     c.sockOut.flush();
+                    if (!c.upSeen) {
+                        c.upSeen = true;
+                        Log.i(TAG, "aemu-egress: conn " + c.no + " first-up bytes=" + chunk.length
+                                + " afterMs=" + (System.currentTimeMillis() - c.bornMs));
+                    }
                 } catch (IOException e) {
                     writeRaw(buildPacket(c, c.sndNxt, c.rcvNxt, FLAG_RST | FLAG_ACK, null, 0, 0));
                     closeConn(c, "socket-error");
@@ -509,6 +527,8 @@ public final class VpnTestService extends VpnService {
         }
         Log.i(TAG, "conn " + c.no + " closed: " + reason
                 + " (up=" + c.upBytes + " down=" + c.downBytes + ")");
+        Log.i(TAG, "aemu-egress: conn " + c.no + " closed reason=" + reason
+                + " up=" + c.upBytes + " down=" + c.downBytes);
         VpnTestState.flowClosed(c.no, reason);
         c.lock.notifyAll();
     }
