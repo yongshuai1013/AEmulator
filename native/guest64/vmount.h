@@ -292,6 +292,11 @@ static int vm_canon(const char *in, char *out, u64 cap) {
 // Where a mount may be made. Everything else is accepted and ignored, as it always was (see the header).
 static int vm_under(const char *c, const char *pfx) { u64 l = slen(pfx); return pre(c, pfx) && (c[l] == '/' || !c[l]); }
 static int vm_allowed(const char *c) {
+#ifdef VM_PARTROOTS
+    // Partition seat (only the generation that defines VM_PARTROOTS): the partition roots
+    // themselves are mount points — the host seeds them at vm_init (vm_part_seed below).
+    if (seq(c, "/system") || seq(c, "/data") || seq(c, "/cache") || seq(c, "/vendor")) return 1;
+#endif
     static const char *const ok[] = { "/system", "/system_ext", "/product", "/vendor", "/odm", "/oem", "/vendor_dlkm", "/odm_dlkm",
                                       "/system_dlkm", "/debug_ramdisk", "/sbin", "/data/adb", "/data/local", "/data/misc", 0 };
     for (int i = 0; ok[i]; i++) if (vm_under(c, ok[i]) && !seq(c, ok[i])) return 1;      // never the root of one of them
@@ -414,15 +419,56 @@ static int vm_is_magisk(void) {
     return pre(b, "magisk");
 }
 
+#ifdef VM_PARTROOTS
+static int vm_part_root(const char *c) {
+    return seq(c, "/system") || seq(c, "/data") || seq(c, "/cache") || seq(c, "/vendor");
+}
+
+// Seat a partition root: an identity record (its tree is its body), carrying the mounted
+// state for /proc/mounts and umount. Scan and insert under one write lock (vm_add would
+// not dedup, and every guest process runs the seeding at vm_init).
+static long vm_part_seat(const char *tc) {
+    long r = 0;
+    vm_wlock();
+    for (int i = 0; i < VM_MAXREC; i++)
+        if (g_vmt->r[i].used && !g_vmt->r[i].alias && seq(g_vmt->r[i].key, tc)) { vm_wunlock(); return 0; }
+    int slot = -1;
+    for (int i = 0; i < VM_MAXREC; i++) if (!g_vmt->r[i].used) { slot = i; break; }
+    if (slot < 0) r = -VMF_ENOSPC;
+    else {
+        struct vm_rec *rec = &g_vmt->r[slot];
+        rec->ord = g_vmt->nextord++; rec->id = g_vmt->nextid++; rec->dev = 0; rec->kind = VM_BIND; rec->alias = 0;
+        rec->keylen = (u16)slen(tc);
+        memcpy(rec->key, tc, slen(tc) + 1); memcpy(rec->src, tc, slen(tc) + 1); memcpy(rec->disp, tc, slen(tc) + 1);
+        __atomic_store_n(&rec->used, 1, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&g_vmt->live, 1, __ATOMIC_RELAXED);
+    }
+    vm_wunlock();
+    return r;
+}
+#endif
+
 static long vm_sys_mount(long *a, char **pbp) {
     const char *src = (const char *)a[0], *tgt = (const char *)a[1], *fst = (const char *)a[2], *data = (const char *)a[4];
     u64 fl = (u64)a[3];
+#ifdef VM_PARTROOTS
+    // Partition seat: no host overlay does Magisk's mounts instead of it here, so its own count too.
+    if (!tgt || !g_vmt) return 0;
+#else
     if (!tgt || !g_vmt || vm_is_magisk()) return 0;
+#endif
     // remounts and propagation changes: nothing to change (one table, a writable tree)
     if (fl & (VMF_MS_REMOUNT | VMF_MS_SHARED | VMF_MS_PRIVATE | VMF_MS_SLAVE | VMF_MS_UNBINDABLE)) return 0;
     char t[1104], tc[1104];
     if (vm_abs(tgt, t, sizeof t) < 0 || vm_canon(t, tc, sizeof tc) < 0) return 0;
     if (!vm_allowed(tc)) return 0;                           // (see vm_allowed: what the firmware mounts itself)
+#ifdef VM_PARTROOTS
+    if (vm_part_root(tc)) {                                  // a partition root: bind or file-system mount seats it, tmpfs is real
+        if (fl & VMF_MS_MOVE) return -VMF_EINVAL;
+        if (fst && (seq(fst, "tmpfs") || seq(fst, "ramfs"))) return vm_do_tmpfs(t, tc, data, pbp);
+        return vm_part_seat(tc);
+    }
+#endif
     if (fl & VMF_MS_MOVE) return vm_do_move(src, t, tc, pbp);
     if (fl & VMF_MS_BIND) return vm_do_bind(src, t, tc, (fl & VMF_MS_REC) != 0, pbp);
     if (fst && (seq(fst, "tmpfs") || seq(fst, "ramfs"))) return vm_do_tmpfs(t, tc, data, pbp);
@@ -431,7 +477,11 @@ static long vm_sys_mount(long *a, char **pbp) {
 
 static long vm_sys_umount(long *a) {
     const char *tgt = (const char *)a[0];
+#ifdef VM_PARTROOTS
+    if (!tgt || !g_vmt) return 0;
+#else
     if (!tgt || !g_vmt || vm_is_magisk()) return 0;
+#endif
     char t[1104], tc[1104], tid[1104];
     struct vm_wr w;
     if (vm_abs(tgt, t, sizeof t) < 0 || vm_canon(t, tc, sizeof tc) < 0) return 0;
@@ -1034,6 +1084,32 @@ static long vm_peersec(long fd, char *buf, u32 *len) {
     return 0;
 }
 
+#ifdef VM_PARTROOTS
+// Partition seat: the host lists the partitions in <root>/dev/.aemu-partitions (one guest
+// path per line); each starts out mounted, as its identity record, so /proc/mounts lists
+// it, umount can take it down and a later mount seats it again.
+static void vm_part_seed(void) {
+    char p[512];
+    if (g_rootlen > 440) return;
+    memcpy(p, g_root, g_rootlen); memcpy(p + g_rootlen, "/dev/.aemu-partitions", 22);
+    long fd = S4(NR_openat, AT_FDCWD, p, 02000000, 0);
+    if (fd < 0) return;
+    char buf[1024];
+    long n = S3(NR_read, fd, buf, sizeof buf - 1);
+    S1(NR_close, fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+    char *l = buf;
+    while (*l) {
+        char *e = l; while (*e && *e != '\n') e++;
+        char c = *e; *e = 0;
+        if (l[0] == '/' && vm_part_root(l)) vm_part_seat(l);
+        if (!c) break;
+        l = e + 1;
+    }
+}
+#endif
+
 static void vm_init(void) {
     char p[512];
     if (g_rootlen > 440) return;
@@ -1048,6 +1124,9 @@ static void vm_init(void) {
     long m = S6(NR_mmap, 0, VM_FILE, 3 /* PROT_READ|PROT_WRITE */, 1 /* MAP_SHARED */, fd, 0);
     S1(NR_close, fd);
     if ((u64)m < (u64)-4096) g_vmt = (struct vm_tab *)m;
+#ifdef VM_PARTROOTS
+    if (g_vmt) vm_part_seed();
+#endif
 }
 
 #endif
