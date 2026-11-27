@@ -3459,8 +3459,10 @@ static void cc_mod(u64 addr, char *out, u64 cap) {
 // this process's supervisor currently carries (the aemu-137r tag of the session now up, so a death
 // can be read next to the session it died in). g_cc_done keeps it to one line per process,
 // whichever path gets here first. The entry variant of the same line (cc_emit_entry below)
-// is not gated by g_cc_done and appends entry=1 plus the full register set.
-static void cc_emit_ctx_e(int sig, u64 fault, struct sigctx *c, long tid, int entry) {
+// is not gated by g_cc_done and appends entry=1 plus the full register set; its nested
+// variant (cc_emit_entry_nested) appends nested=1 on top, for a delivery the relay is
+// about to rethrow unhandled.
+static void cc_emit_ctx_e(int sig, u64 fault, struct sigctx *c, long tid, int entry, int nested) {
     if (!entry && __atomic_exchange_n(&g_cc_done, 1, __ATOMIC_ACQUIRE)) return;
     int ownfd = -1;
     if (g_sayfd < 0) {                                          // land in <root>/dev/aemu_crash.log too, as on_crash does
@@ -3485,6 +3487,7 @@ static void cc_emit_ctx_e(int sig, u64 fault, struct sigctx *c, long tid, int en
     { char stag[16]; u64 so = 0; stag[0] = 0; r137_tag_into(stag, &so, g_137r_cur, r137_pending()); say(" sess="); say(stag); }
     if (entry) {
         say(" entry=1");
+        if (nested) say(" nested=1");
         for (int i = 0; i < 31; i++) { say(" x"); say(utoa((u64)i, t + sizeof t)); say("="); hex(c->regs[i]); }
     }
     say("\n");
@@ -3492,7 +3495,7 @@ static void cc_emit_ctx_e(int sig, u64 fault, struct sigctx *c, long tid, int en
 }
 
 static void cc_emit_ctx(int sig, u64 fault, struct sigctx *c, long tid) {
-    cc_emit_ctx_e(sig, fault, c, tid, 0);
+    cc_emit_ctx_e(sig, fault, c, tid, 0, 0);
 }
 
 static void cc_emit(int sig, void *info, void *uc) {
@@ -3613,7 +3616,15 @@ static void ssc_probe(int sig, void *uc) {
 // naming point in fatal_relay is untouched.
 static void cc_emit_entry(int sig, void *info, void *uc) {
     struct sigctx *c = (struct sigctx *)((char *)uc + 176);
-    cc_emit_ctx_e(sig, *(u64 *)((char *)info + 16), c, S0(NR_gettid), 1);   // siginfo's si_addr, as in cc_emit
+    cc_emit_ctx_e(sig, *(u64 *)((char *)info + 16), c, S0(NR_gettid), 1, 0);   // siginfo's si_addr, as in cc_emit
+}
+
+// Nested variant of the entry snapshot, for the relay-nested rethrow in fatal_relay (137
+// measurement): the same line, entry path (so the g_cc_done gate cannot silence it), plus
+// nested=1, so a nested delivery's site survives the rethrow that follows it.
+static void cc_emit_entry_nested(int sig, void *info, void *uc) {
+    struct sigctx *c = (struct sigctx *)((char *)uc + 176);
+    cc_emit_ctx_e(sig, *(u64 *)((char *)info + 16), c, S0(NR_gettid), 1, 1);   // siginfo's si_addr, as in cc_emit
 }
 
 static void on_crash(int sig, void *info, void *uc) {
@@ -3692,9 +3703,15 @@ static void on_crash(int sig, void *info, void *uc) {
 // debuggerd hook) runs from it with the flags and mask it asked for. Only when the guest has nothing left
 // (SIG_DFL) the crash is reported here, on the program's stderr, with the mappings of pc and the callers.
 static void fatal_relay(int sig, void *info, void *uc) {
-    if (rl_enter() > 0) {                                       // 137 fix (yi): a nested delivery is never handled — this thread is
-        char line[128]; u64 o = 0;                              // already inside the relay below, so a second handler run can only
-        tun_cat(line, &o, "aemu-137r: relay-nested sig=");      // die deeper in the same machinery. One marker line, the disposition
+    int rld = rl_enter();
+    if (rld > 0) {                                              // 137 fix (yi): a nested delivery is never handled — this thread is
+        if (rld == 1) cc_emit_entry_nested(sig, info, uc);      // already inside the relay below, so a second handler run can only
+        char line[128]; u64 o = 0;                              // die deeper in the same machinery. Before the rethrow, the first
+        tun_cat(line, &o, "aemu-137r: relay-nested sig=");      // nested level leaves its entry snapshot (nested=1) — the only
+                                                                // record of the fault that is about to kill this thread; a fault
+                                                                // inside that snapshot lands here at depth 2+ and skips
+                                                                // straight to the marker, so the marker cannot be crowded
+                                                                // out. One marker line, the disposition
         tun_catn(line, &o, (u64)sig);                           // reset to SIG_DFL, the signal rethrown at this thread: the process
         tun_cat(line, &o, " tid=");                             // dies by the signal itself, at the fault's own site.
         tun_catn(line, &o, (u64)S0(NR_gettid));
