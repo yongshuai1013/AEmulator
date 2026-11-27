@@ -53,7 +53,7 @@ object PartitionSeat {
      * was kept) point at the real image files — a script dd-ing the boot partition patches
      * the very file the next seat boot unpacks — the rest at their partition directories.
      */
-    fun plantByName(root: File, paths: VmPaths, log: (String) -> Unit) {
+    fun plantByName(root: File, paths: VmPaths, log: (String) -> Unit = {}) {
         val dir = File(root, "dev/block/bootdevice/by-name")
         runCatching {
             dir.mkdirs()
@@ -73,7 +73,7 @@ object PartitionSeat {
      * Switch the supervisor's mount table on for this root and seed it with the partitions
      * themselves. The stale table file is deleted first: mounts never outlive a boot.
      */
-    fun arm(root: File, log: (String) -> Unit) {
+    fun arm(root: File, log: (String) -> Unit = {}) {
         runCatching {
             val dev = File(root, "dev").apply { mkdirs() }
             File(dev, ".aemu-mounts").delete()
