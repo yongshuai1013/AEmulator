@@ -2803,7 +2803,6 @@ static volatile int g_rl_depth[NRELAY];
 static volatile int g_rl_skip[NRELAY];
 static char *g_rl_stk[NRELAY];                    // yi': the slot's big-stack top (0 = none yet); owner thread only
 static int g_rl_big[NRELAY];                      // yi': traps this relay has run out on the big stack
-static int g_rl_ao[NRELAY];                       // bisect-jia: relay-context traps run alloc-only (stack ensured, body left where it stands)
 static int g_rl_onstk[NRELAY];                    // yi': this thread is out on the big stack right now
 
 long rl_call_on_stack(void *top, void *fn, long a0, long a1, long a2);   // start.S
@@ -2833,27 +2832,24 @@ static int rl_enter(void) {                       // the depth in place BEFORE t
     return __atomic_fetch_add(&g_rl_depth[i], 1, __ATOMIC_ACQ_REL);
 }
 
-static int rl_leave(int *bigp, int *aop) {        // the finished outermost relay's skip count; -1 when not outermost/unmarked
+static int rl_leave(int *bigp) {                  // the finished outermost relay's skip count; -1 when not outermost/unmarked
     long tid = S0(NR_gettid);
     int i = rl_find(tid);
     if (i < 0) return -1;
     if (__atomic_fetch_sub(&g_rl_depth[i], 1, __ATOMIC_ACQ_REL) != 1) return -1;
     int sk = g_rl_skip[i];
     if (bigp) *bigp = g_rl_big[i];                // yi': the big-stack trap count rides out beside the skip count
-    if (aop) *aop = g_rl_ao[i];                   // bisect-jia: the alloc-only count rides out beside it
     g_rl_skip[i] = 0;
     g_rl_big[i] = 0;
-    g_rl_ao[i] = 0;
     g_rl_onstk[i] = 0;
     __atomic_store_n(&g_rl_tid[i], 0L, __ATOMIC_RELEASE);
     return sk;
 }
 
-static void rl_counts(int *sk, int *big, int *ao) {   // this thread's in-flight relay counts, for the nested marker line
+static void rl_counts(int *sk, int *big) {        // this thread's in-flight relay counts, for the nested marker line
     int i = rl_find(S0(NR_gettid));
     *sk = i >= 0 ? g_rl_skip[i] : 0;
     *big = i >= 0 ? g_rl_big[i] : 0;
-    *ao = i >= 0 ? g_rl_ao[i] : 0;
 }
 
 static int rl_mark_skip(void) {                   // trap header, in relay context: count one skipped pass
@@ -2875,27 +2871,6 @@ static int rl_trap_begin(void) {                  // yi': >=0 = run this trap ou
 }
 
 static void rl_trap_end(int i) { if (i >= 0) g_rl_onstk[i] = 0; }
-
-// Bisection (libart-bus-desk.md S8, the alloc-only move): on the yi' build the libart cell went
-// 0/8 -> 2/2, and the suspects are (a) the big stacks' mmap footprint — the only new address-space
-// furniture yi' added — and (b) running the trap body out on that stack. This build keeps (a)
-// exactly: the same rl_mmap_stack(), lazily on the same first relay trap of the slot, kept for the
-// process's life. It removes (b): the trap body runs where it stands and rl_call_on_stack is never
-// called. The counter is this build's bigtrap=: relay-context traps that received the treatment
-// (stack ensured, body on the guest's own stack), printed beside a bigtrap= that stays a truthful
-// 0 here. If the fault still fires on this build, (b) is out and the footprint stands accused; if
-// the framework sails through the window where it died twice, the switch itself was the provocation.
-static volatile int g_ao_said;
-static int rl_trap_alloc_only(void) {             // >=0 = in a relay and the stack is ensured; -1 = not in a relay / no stack to give
-    int i = rl_find(S0(NR_gettid));
-    if (i < 0 || g_rl_depth[i] <= 0) return -1;   // not in a relay: nothing changes
-    if (__atomic_exchange_n(&g_ao_said, 1, __ATOMIC_ACQ_REL) == 0)
-        say("aemu-137r: mode alloc-only (bisect: big stack allocated, stack switch bypassed)\n");
-    if (!g_rl_stk[i]) g_rl_stk[i] = rl_mmap_stack();   // yi's lazy allocation, unchanged: same size, same guard page, same first-trap timing
-    if (!g_rl_stk[i]) return -1;                  // no stack: this build is indistinguishable here, and the counter must not claim otherwise
-    g_rl_ao[i]++;
-    return i;
-}
 
 static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     int err = 0;
@@ -3793,13 +3768,11 @@ static void fatal_relay(int sig, void *info, void *uc) {
         tun_catn(line, &o, (u64)sig);                           // reset to SIG_DFL, the signal rethrown at this thread: the process
         tun_cat(line, &o, " tid=");                             // dies by the signal itself, at the fault's own site.
         tun_catn(line, &o, (u64)S0(NR_gettid));
-        int nsk = 0, nbig = 0, nao = 0; rl_counts(&nsk, &nbig, &nao);   // the counts of the relay this marker ends: its exit
+        int nsk = 0, nbig = 0; rl_counts(&nsk, &nbig);          // the counts of the relay this marker ends: its exit
         tun_cat(line, &o, " hk-skipped=");                      // line never prints when the process dies inside the
         tun_catn(line, &o, (u64)nsk);                           // relay, so both counts ride the marker instead
         tun_cat(line, &o, " bigtrap=");                         // (137 measurement: the 12:21 field's hk-skipped=0
         tun_catn(line, &o, (u64)nbig);                          // was exactly that blind spot)
-        tun_cat(line, &o, " aotrap=");
-        tun_catn(line, &o, (u64)nao);
         tun_cat(line, &o, " -> SIG_DFL rethrow\n");
         say(line);
         struct { void *h; u64 flags; void *restorer; u64 mask; } df = { 0, 0, 0, 0 };
@@ -3811,7 +3784,7 @@ static void fatal_relay(int sig, void *info, void *uc) {
     if (is_fatal(sig) && sig != 8 && ssc_is_ss()) cc_emit_entry(sig, info, uc);   // entry snapshot: print this delivery at the door
     if (sig == 11 || sig == 6) cc_note(sig, info, uc);          // crash capture: stash (and name a repeat fault)
     if (g_crash) {
-        rl_leave(0, 0);                                         // on_crash does not return; the mark dies with the process either way
+        rl_leave(0);                                            // on_crash does not return; the mark dies with the process either way
         on_crash(sig, info, uc);
         return;
     }
@@ -3832,11 +3805,11 @@ static void fatal_relay(int sig, void *info, void *uc) {
         h(sig, info, uc);
         if (ssc && ((struct sigctx *)((char *)uc + 176))->pc == saved.pc)
             cc_emit_ctx(sig, sfault, &saved, stid);
-    } else { rl_leave(0, 0); on_crash(sig, info, uc); }          // on_crash does not return
+    } else { rl_leave(0); on_crash(sig, info, uc); }             // on_crash does not return
     if (g_is32) *(u64 *)((char *)uc + 40) &= ~SYSBIT;
-    int bigt = 0, aot = 0;
-    int hksk = rl_leave(&bigt, &aot);                           // 137 fix (jia): unmark; report the passes this relay deferred
-    if (hksk > 0 || bigt > 0 || aot > 0) {                      // and (yi') the traps it ran out on the big stack
+    int bigt = 0;
+    int hksk = rl_leave(&bigt);                                 // 137 fix (jia): unmark; report the passes this relay deferred
+    if (hksk > 0 || bigt > 0) {                                 // and (yi') the traps it ran out on the big stack
         char line[128]; u64 o = 0;
         tun_cat(line, &o, "aemu-137r: relay-exit sig=");
         tun_catn(line, &o, (u64)sig);
@@ -3846,8 +3819,6 @@ static void fatal_relay(int sig, void *info, void *uc) {
         tun_catn(line, &o, (u64)hksk);
         tun_cat(line, &o, " bigtrap=");
         tun_catn(line, &o, (u64)bigt);
-        tun_cat(line, &o, " aotrap=");
-        tun_catn(line, &o, (u64)aot);
         tun_cat(line, &o, "\n");
         say(line);
     }
@@ -3858,10 +3829,13 @@ static void on_sigsys(int sig, void *info, void *uc) {
     (void)sig; (void)info;
     mask_mediate((u64 *)((char *)uc + 40));                     // mask mediation: the restored mask never blocks the capture-critical set
     if (g_crash) *(u64 *)((char *)uc + 40) &= ~(1UL << 7);      // AEMU64_CRASH also keeps SIGFPE deliverable
-    rl_trap_alloc_only();                                       // bisect-jia: in a relay, ensure the slot's big stack exists (yi's
-                                                                // allocation, footprint unchanged) but run the trap body where it
-                                                                // stands — rl_call_on_stack is never called in this build
-    c->regs[0] = (u64)trap((long)c->regs[8], (long *)c->regs, uc);
+    int rs = rl_trap_begin();                                   // 137 fix (yi'): in a relay, the trap body runs on this image's own stack
+    if (rs >= 0) {
+        c->regs[0] = (u64)rl_call_on_stack(g_rl_stk[rs], (void *)trap, (long)c->regs[8], (long)c->regs, (long)uc);
+        rl_trap_end(rs);
+    } else {
+        c->regs[0] = (u64)trap((long)c->regs[8], (long *)c->regs, uc);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------- filter
