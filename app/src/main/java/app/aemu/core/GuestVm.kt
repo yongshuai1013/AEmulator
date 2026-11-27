@@ -308,21 +308,45 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         synchronized(procs) { procs["recovery"] = p }
         setState(State.RUNNING)
         log("recovery started (${w}x$h)")
-        // Pixel format the recovery draws in, from its own log ("Pixel format: BGRA_8888", TWRP).
+        // Pixel format the recovery draws in, from its own log: older minui prints
+        // "Pixel format: BGRA_8888"; TWRP 3.7 never prints it — it reports the formats it
+        // sets instead ("setting DRM_FORMAT_RGBX8888 and GGL_PIXEL_FORMAT_RGBX_8888", then
+        // "setting GGL_PIXEL_FORMAT_RGBA_8888" on the fbdev path) plus the fb0 varinfo dump.
         // Watch until the recovery exits, not just the first seconds: the line can land in the
         // log long after the welcome screen is up, and a missed guess leaves the view decoding
         // 32bpp output with the wrong format (striped, ghosted picture that never heals).
         // The startup capture (recovery.out) is scraped too — whichever shows the line first wins.
         Thread {
-            val fmtRe = Regex("Pixel format: (BGRA_8888|RGBX_8888|RGBA_8888|RGB_565)")
+            val namedRe = Regex("Pixel format: (BGRA_8888|RGBX_8888|RGBA_8888|RGB_565)" +
+                "|GGL_PIXEL_FORMAT_(BGRA_8888|RGBX_8888|RGBA_8888|RGB_565)" +
+                "|DRM_FORMAT_(BGRA8888|RGBX8888|RGBA8888|RGB565)")
             val sources = listOf(File(r, "tmp/recovery.log"), File(paths.bin, "recovery.out"))
             var detected: String? = null
             while (detected == null && p.isAlive && !stopping) {
                 for (f in sources) {
                     val t = runCatching { f.readText() }.getOrDefault("")
-                    val line = t.lineSequence().filter { it.contains("Pixel format:") }.lastOrNull() ?: continue
-                    val fmt = fmtRe.find(line)?.groupValues?.get(1) ?: continue
-                    log("recovery log | ${line.trim()}")
+                    if (t.isEmpty()) continue
+                    var fmt: String? = null
+                    var hitLine: String? = null
+                    for (line in t.lineSequence()) {
+                        val m = namedRe.find(line) ?: continue
+                        val g = m.groupValues.drop(1).firstOrNull { it.isNotEmpty() } ?: continue
+                        fmt = when (g) {
+                            "BGRA8888" -> "BGRA_8888"; "RGBX8888" -> "RGBX_8888"; "RGBA8888" -> "RGBA_8888"; "RGB565" -> "RGB_565"
+                            else -> g
+                        }
+                        hitLine = line
+                    }
+                    // the fb0 varinfo report alone also fixes the format: 32 bpp with red at
+                    // offset 0 draws RGBA, red at offset 16 draws BGRA
+                    if (fmt == null && Regex("vi\\.bits_per_pixel\\s*=\\s*32").containsMatchIn(t)) {
+                        val red = Regex("vi\\.red\\.offset\\s*=\\s*(\\d+)").find(t)?.groupValues?.get(1)
+                        val blue = Regex("vi\\.blue\\.offset\\s*=\\s*(\\d+)").find(t)?.groupValues?.get(1)
+                        fmt = when { red == "0" && blue == "16" -> "RGBA_8888"; red == "16" && blue == "0" -> "BGRA_8888"; else -> null }
+                        if (fmt != null) hitLine = t.lineSequence().firstOrNull { it.contains("vi.bits_per_pixel") }
+                    }
+                    if (fmt == null) continue
+                    hitLine?.let { log("recovery log | ${it.trim()}") }
                     recoveryFormat = when (fmt) { "BGRA_8888" -> 2; "RGB_565" -> 0; else -> 1 }
                     log("recovery draws $fmt")
                     detected = fmt
