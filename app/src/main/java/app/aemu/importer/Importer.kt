@@ -91,6 +91,7 @@ class Importer(
             if (!File(root, "system/framework").isDirectory && !File(root, "system/build.prop").isFile)
                 throw IOException("no Android system partition found in file")
             finishTree()
+            persistBootImage()
             if (recovery == null) runCatching { rebuildRecoveryFromBoot() }.onFailure { log("recovery: rebuild from boot failed (${it.message}), skipped") }
             recovery?.let { runCatching { RecoveryImage.install(paths, it, log) } }
             onProgress("Analyzing firmware", 0.97f)
@@ -1435,6 +1436,42 @@ class Importer(
         if (rd.isNullOrEmpty()) { log("boot: ramdisk not recognized"); return }
         ramdisk = rd
         log("boot: ramdisk, ${rd.size} files")
+    }
+
+    /**
+     * Partition seat, layer 1: keep the boot image itself next to the tree (the layout
+     * VmArchive already expects) and its ramdisk unpacked untouched into bootrd/. Until now
+     * the bytes lived only in memory for the import's duration and the ramdisk was merged
+     * into the tree with /init itself dropped — so nothing on disk could serve as the boot
+     * partition (a recovery script patching it, the seat boot running its /init).
+     */
+    private fun persistBootImage() {
+        val bytes = bootBytes ?: return
+        runCatching {
+            File(paths.dir, "boot.img").writeBytes(bytes)
+            val rd = ramdisk
+            if (rd.isNullOrEmpty()) { log("boot: image kept (${bytes.size} bytes), no ramdisk"); return }
+            val out = File(paths.dir, "bootrd")
+            ImageStore.wipe(out)
+            out.mkdirs()
+            val base = out.canonicalPath
+            for (e in rd) {
+                val n = e.name.trimStart('/')
+                if (n.isEmpty() || n == ".") continue
+                val f = File(out, n)
+                if (!f.canonicalPath.startsWith(base)) continue
+                when (e.mode and 0xF000) {
+                    0x4000 -> f.mkdirs()
+                    0xA000 -> { f.parentFile?.mkdirs(); runCatching { Os.symlink(String(e.data), f.path) } }
+                    0x8000 -> {
+                        f.parentFile?.mkdirs(); f.writeBytes(e.data)
+                        if (e.mode and 0x49 != 0) f.setExecutable(true, false)
+                        f.setReadable(true, false)
+                    }
+                }
+            }
+            log("boot: image kept (${bytes.size} bytes), ramdisk unpacked to bootrd/ (${rd.size} files)")
+        }.onFailure { log("boot: keeping the boot image failed (${it.message}), skipped") }
     }
 
     /**
