@@ -106,6 +106,9 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         @Volatile var addr = 0
         @Volatile var up = false
         @Volatile var alive = true
+        /** The supervisor connection that delivered this session's tun channel (lch1,
+         * lifecycle-hardening-spec section 4): the session's life is bound to it. */
+        @Volatile var owner: Conn? = null
         var peerFd: FileDescriptor? = null
         var tunIn: InputStream? = null
         var tunOut: OutputStream? = null
@@ -162,6 +165,19 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
         } finally {
             synchronized(lock) { conns.remove(conn) }
             runCatching { c.close() }
+            // lch1 (lifecycle-hardening-spec section 4): a session is owned by the
+            // supervisor connection that delivered its tun channel, and that connection
+            // closing is the one death signal that fires in every variant — the owning
+            // process died and its socket died with it, whatever else survived (the agent
+            // that would have written SESSION_END, the framework duplicate that keeps the
+            // channel from running dry). Declare the session dead through the ordinary
+            // teardown instead of going on advertising it as up and feeding it new flows.
+            val orphaned = synchronized(lock) { session?.takeIf { it.owner === conn } }
+            if (orphaned != null) {
+                log("aemu-vpn: the supervisor connection owning session ${orphaned.name} closed; declaring the session dead")
+                step(orphaned, "owner-connection-lost (session declared dead)")
+                sessionDown(orphaned)
+            }
         }
     }
 
@@ -193,6 +209,7 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
                 synchronized(lock) {
                     session?.let { it.alive = false; closeFd(it.peerFd) }
                     s.seq = ++sessionSeq
+                    s.owner = conn
                     session = s
                 }
                 step(s, "tun-channel-acquired" + if (stale != null) " replaces S${stale.seq} (stale session torn down first)" else "")
@@ -227,27 +244,39 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
             }
             T_FLOW_NEW -> {
                 if (pl.size < 12) return false
-                val s = session
-                if (s == null || !s.up) {
-                    step(s, "flow-rejected uid=${le32(pl, 0)} dst=${ip(le32(pl, 4))}:${le16(pl, 8)} reason=no-live-session")
+                // lch1 (lifecycle-hardening-spec section 2): the live-session decision and
+                // the registration are one lock block — the same lock sessionDown clears
+                // under. Decided outside it, a flow could register into the maps an instant
+                // after the teardown emptied them: an orphan of a dead session that no
+                // later teardown would ever see, cleared only by the timer's aging.
+                var fNew: Flow? = null
+                var sLive: Session? = null
+                var fcount = 0
+                synchronized(lock) {
+                    val live = session
+                    if (live != null && live.up && live.alive) {
+                        sLive = live
+                        val id = nextFlow++
+                        // Source ports come from the hub's own cursor and are never reused
+                        // across sessions (design section 2): a guest that bound its own port
+                        // keeps it, everyone else gets 40000 + flow id — and flow ids never
+                        // repeat in the hub's lifetime, so neither does the port.
+                        val rawPort = le16(pl, 10)
+                        val effPort = if (rawPort != 0) rawPort else 40000 + id
+                        val nf = Flow(id, le32(pl, 0), le32(pl, 4), le16(pl, 8), effPort, live,
+                            tupleKey(le32(pl, 4), le16(pl, 8), effPort))
+                        flows[nf.id] = nf
+                        flowsByTuple[nf.tupleKey] = nf
+                        fNew = nf
+                        fcount = flows.size
+                    }
+                }
+                val f = fNew
+                if (f == null) {
+                    step(session, "flow-rejected uid=${le32(pl, 0)} dst=${ip(le32(pl, 4))}:${le16(pl, 8)} reason=no-live-session")
                     conn.send(T_FLOW_NO, ByteArray(0)); return false
                 }
-                val f: Flow
-                val fcount: Int
-                synchronized(lock) {
-                    val id = nextFlow++
-                    // Source ports come from the hub's own cursor and are never reused
-                    // across sessions (design section 2): a guest that bound its own port
-                    // keeps it, everyone else gets 40000 + flow id — and flow ids never
-                    // repeat in the hub's lifetime, so neither does the port.
-                    val rawPort = le16(pl, 10)
-                    val effPort = if (rawPort != 0) rawPort else 40000 + id
-                    f = Flow(id, le32(pl, 0), le32(pl, 4), le16(pl, 8), effPort, s,
-                        tupleKey(le32(pl, 4), le16(pl, 8), effPort))
-                    flows[f.id] = f
-                    flowsByTuple[f.tupleKey] = f
-                    fcount = flows.size
-                }
+                val s = sLive
                 step(s, "flow-new id=${f.id} uid=${f.uid} dst=${ip(f.dstIp)}:${f.dstPort} srcport=${f.srcPort} flows=$fcount")
                 val id = ByteArray(4); putLe32(id, 0, f.id)
                 conn.send(T_FLOW_OK, id)
