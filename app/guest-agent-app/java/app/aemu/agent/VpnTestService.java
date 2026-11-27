@@ -10,6 +10,8 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -27,8 +29,12 @@ import java.util.concurrent.atomic.AtomicInteger;
  * (session address -> real server), each new flow becomes a real socket to that server,
  * and whatever the server answers is segmented back into the tunnel. The hub terminates
  * the guest side of every connection (VpnTcp.kt host-side); this service is the far end
- * of the tunnel it talks to. UDP is not forwarded — it never reaches the tunnel in the
- * first place (the page says so) — and DNS stays on the host-side proxy.
+ * of the tunnel it talks to. UDP is not forwarded, with one exception: DNS. The Builder
+ * registers real DNS servers, so guest resolvers address their UDP/53 queries into this
+ * tunnel, and the relay below carries them out on a native datagram socket — this uid's
+ * exempt road, the same one the translator's TCP sockets take — and packages the answers
+ * back in. Without the registration the framework gives this network no resolver at all;
+ * without the relay the registered server would be a name nobody answers.
  */
 public final class VpnTestService extends VpnService {
     static final String ACTION_STOP = "app.aemu.agent.VPN_TEST_STOP";
@@ -129,6 +135,13 @@ public final class VpnTestService extends VpnService {
             b.addAddress("10.99.0.2", 32);
             b.addRoute("0.0.0.0", 0);
             b.setMtu(1500);
+            // The same DNS servers the guest's underlying network declares (net.dns1 /
+            // net.dns2 in the host's property overrides), so a name resolves the same
+            // with the VPN up as without it. Registration is only half of this: the
+            // queries it provokes arrive in the tunnel as UDP/53 packets, and the DNS
+            // relay in the reader loop is what answers them.
+            b.addDnsServer("8.8.8.8");
+            b.addDnsServer("1.1.1.1");
             ParcelFileDescriptor p = b.establish();
             if (p == null) {
                 VpnTestState.set("establish() 回傳 null——框架拒絕（同意未給、或已有其他 VPN 在席）");
@@ -137,7 +150,7 @@ public final class VpnTestService extends VpnService {
             }
             tunnel = p;
             VpnTestState.onEstablished();
-            Log.i(TAG, "establish() ok: session 10.99.0.2/32, route 0.0.0.0/0, mtu 1500");
+            Log.i(TAG, "establish() ok: session 10.99.0.2/32, route 0.0.0.0/0, mtu 1500, dns 8.8.8.8/1.1.1.1");
             tunOut = new FileOutputStream(p.getFileDescriptor());
             running = true;
             // Register this app's uid with the hub, through the tunnel itself: the hub exempts
@@ -199,8 +212,13 @@ public final class VpnTestService extends VpnService {
                         Log.i(TAG, "first tun packet: " + n + " bytes");
                     }
                     VpnTestState.addPacket(buf, n);
-                    if (running && n >= 20 && (buf[0] >> 4) == 4 && (buf[9] & 0xff) == 6) {
-                        forwardPacket(buf, n);
+                    if (running && n >= 20 && (buf[0] >> 4) == 4) {
+                        int proto = buf[9] & 0xff;
+                        if (proto == 6) {
+                            forwardPacket(buf, n);
+                        } else if (proto == 17) {
+                            handleDnsPacket(buf, n);
+                        }
                     }
                 } else if (n < 0) {
                     Log.i(TAG, "reader exiting: tun read EOF");
@@ -292,6 +310,13 @@ public final class VpnTestService extends VpnService {
             Log.i(TAG, "conn " + c.no + " connected to " + c.dstText);
             Log.i(TAG, "aemu-egress: conn " + c.no + " connect dst=" + c.dstText
                     + " result=ok ms=" + (System.currentTimeMillis() - c.bornMs));
+            // Egress instrument: where this socket actually landed — the local address
+            // names the road out the exemption gave it, SO_ERROR is the error still
+            // pending on it (0 on a clean connect). Read once, here, so a connection
+            // that later starves can be told from one that was never really placed.
+            Log.i(TAG, "aemu-egress: conn " + c.no + " sockname local=" + s.getLocalSocketAddress()
+                    + " remote=" + s.getRemoteSocketAddress()
+                    + " soError=" + soErrorText(s));
         } catch (Throwable e) {
             // Refused or unreachable: the hub's optimistic connect gets its answer as a RST.
             Log.w(TAG, "conn " + c.no + " connect to " + c.dstText + " failed: " + e);
@@ -324,6 +349,8 @@ public final class VpnTestService extends VpnService {
 
         boolean sockDone = false;
         boolean downSeen = false;   // gate2 egress series: first byte read back from the server
+        long lastDownMs = System.currentTimeMillis();   // egress watchdog: last downstream byte (the connect, until the first)
+        boolean wdFired = false;                        // egress watchdog: fires once per conn
         byte[] rb = new byte[16384];
         try { s.setSoTimeout(250); } catch (Throwable ignored) { }
         while (!c.closed) {
@@ -339,6 +366,11 @@ public final class VpnTestService extends VpnService {
                 r = sin.read(rb);
             } catch (SocketTimeoutException te) {
                 tickRetransmit(c);
+                if (!wdFired && System.currentTimeMillis() - lastDownMs >= 3000) {
+                    wdFired = true;
+                    Log.w(TAG, "aemu-egress: conn " + c.no + " watchdog no-down-3s dst=" + c.dstText
+                            + " up=" + c.upBytes + " down=" + c.downBytes);
+                }
                 continue;
             } catch (IOException e) {
                 if (!c.closed) {
@@ -348,6 +380,7 @@ public final class VpnTestService extends VpnService {
                 return;
             }
             if (r > 0) {
+                lastDownMs = System.currentTimeMillis();
                 if (!downSeen) {
                     downSeen = true;
                     Log.i(TAG, "aemu-egress: conn " + c.no + " first-down bytes=" + r
@@ -533,6 +566,98 @@ public final class VpnTestService extends VpnService {
         c.lock.notifyAll();
     }
 
+    // ---- the DNS relay: the one UDP flow this service forwards
+
+    private final AtomicInteger dnsQueries = new AtomicInteger();
+    private final AtomicInteger dnsReplies = new AtomicInteger();
+
+    /** A UDP packet out of the tunnel. Only destination port 53 is relayed; every other
+     * UDP packet keeps the old fate (dropped — nothing here forwards it). The query bytes
+     * are copied before returning: the reader reuses its buffer for the next packet. */
+    private void handleDnsPacket(byte[] b, int n) {
+        int ihl = (b[0] & 0xf) * 4;
+        if (ihl < 20 || n < ihl + 8) return;
+        int total = be16(b, 2);
+        if (total >= ihl + 8 && total < n) n = total;
+        int srcIp = be32(b, 12), dstIp = be32(b, 16);
+        int srcPort = be16(b, ihl), dstPort = be16(b, ihl + 2);
+        if (dstPort != 53) return;
+        int udpLen = be16(b, ihl + 4);
+        int pOff = ihl + 8;
+        int pLen = Math.min(udpLen - 8, n - pOff);
+        if (pLen <= 0) return;
+        final byte[] query = Arrays.copyOfRange(b, pOff, pOff + pLen);
+        final int qSrcIp = srcIp, qSrcPort = srcPort, qServerIp = dstIp;
+        int qn = dnsQueries.incrementAndGet();
+        if (qn == 1) {
+            Log.i(TAG, "aemu-dns: relay first query src=" + ipText(qSrcIp) + ":" + qSrcPort
+                    + " server=" + ipText(qServerIp) + ":53 bytes=" + query.length);
+        }
+        Thread th = new Thread(new Runnable() {
+            @Override public void run() { dnsRelayRun(qSrcIp, qSrcPort, qServerIp, query); }
+        }, "aemu-dns-relay");
+        th.setDaemon(true);
+        th.start();
+    }
+
+    /** One query, one native datagram socket, on the query's own thread so a slow server
+     * never stalls the tunnel reader: send the query to the server the guest addressed,
+     * package the answer back into the tunnel as a packet from that server to the guest
+     * address/port that asked. The mapping is the thread's captured tuple itself — no
+     * table to keep, and the socket is gone when the answer (or the timeout) lands. */
+    private void dnsRelayRun(int srcIp, int srcPort, int serverIp, byte[] query) {
+        DatagramSocket ds = null;
+        try {
+            ds = new DatagramSocket();
+            ds.setSoTimeout(5000);
+            byte[] sip = new byte[] { (byte) (serverIp >>> 24), (byte) (serverIp >>> 16),
+                    (byte) (serverIp >>> 8), (byte) serverIp };
+            ds.send(new DatagramPacket(query, query.length, InetAddress.getByAddress(sip), 53));
+            byte[] rb = new byte[4096];
+            DatagramPacket rp = new DatagramPacket(rb, rb.length);
+            ds.receive(rp);
+            byte[] answer = Arrays.copyOfRange(rp.getData(), rp.getOffset(),
+                    rp.getOffset() + rp.getLength());
+            writeRaw(buildUdpPacket(serverIp, 53, srcIp, srcPort, answer));
+            int rn = dnsReplies.incrementAndGet();
+            if (rn == 1) {
+                Log.i(TAG, "aemu-dns: relay first reply server=" + ipText(serverIp)
+                        + " bytes=" + answer.length
+                        + " queries=" + dnsQueries.get() + " replies=" + rn);
+            }
+        } catch (Throwable e) {
+            int qn = dnsQueries.get();
+            if (qn <= 3 || qn % 50 == 0) {
+                Log.w(TAG, "aemu-dns: relay to " + ipText(serverIp) + " failed: " + e
+                        + " (queries=" + qn + " replies=" + dnsReplies.get() + ")");
+            }
+        } finally {
+            if (ds != null) try { ds.close(); } catch (Throwable ignored) { }
+        }
+    }
+
+    /** A UDP packet back into the tunnel: from the DNS server the guest asked, to the
+     * guest address/port that asked it. The IPv4 UDP checksum is 0 (legal: none). */
+    private byte[] buildUdpPacket(int srcIp, int srcPort, int dstIp, int dstPort, byte[] payload) {
+        int total = 20 + 8 + payload.length;
+        byte[] p = new byte[total];
+        p[0] = 0x45;
+        putBe16(p, 2, total);
+        putBe16(p, 4, (++ipIdCounter) & 0xffff);
+        putBe16(p, 6, 0x4000);
+        p[8] = 64;
+        p[9] = 17;
+        putBe32(p, 12, srcIp);
+        putBe32(p, 16, dstIp);
+        putBe16(p, 20, srcPort);
+        putBe16(p, 22, dstPort);
+        putBe16(p, 24, 8 + payload.length);
+        putBe16(p, 26, 0);
+        System.arraycopy(payload, 0, p, 28, payload.length);
+        putBe16(p, 10, cksumDone(cksumAdd(p, 0, 20, 0)));
+        return p;
+    }
+
     // ---- packet plumbing (this side of the tunnel: from the server, to the hub)
 
     private byte[] buildPacket(FwdConn c, long seq, long ack, int flags,
@@ -611,6 +736,25 @@ public final class VpnTestService extends VpnService {
     private static void putBe32(byte[] b, int off, int v) {
         b[off] = (byte) (v >>> 24); b[off + 1] = (byte) (v >>> 16);
         b[off + 2] = (byte) (v >>> 8); b[off + 3] = (byte) v;
+    }
+
+    /** SO_ERROR of a connected socket, read reflectively: android.system.Os exists on
+     * the guest's API level but not in the android-19 jar this app compiles against.
+     * Instrumentation only — any failure reads as "n/a", never throws. */
+    private static String soErrorText(Socket s) {
+        try {
+            java.lang.reflect.Field f = Socket.class.getDeclaredField("impl");
+            f.setAccessible(true);
+            Object impl = f.get(s);
+            java.io.FileDescriptor fd = (java.io.FileDescriptor)
+                    impl.getClass().getMethod("getFileDescriptor").invoke(impl);
+            Object v = Class.forName("android.system.Os")
+                    .getMethod("getsockoptInt", java.io.FileDescriptor.class, int.class, int.class)
+                    .invoke(null, fd, 1 /* SOL_SOCKET */, 4 /* SO_ERROR */);
+            return String.valueOf(v);
+        } catch (Throwable t) {
+            return "n/a";
+        }
     }
 
     private static String ipText(int v) {
