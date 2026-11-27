@@ -1442,13 +1442,38 @@ class TreeFixer(
 
     /** Направляет загрузчик EGL прошивки на GL-мост (или на программный растеризатор). */
     private fun eglConfig(gpu: Boolean) {
+        // Ported from Plus .17 (2026-11-25): Android 1.0 - 1.6 have no egl.cfg; their libEGL loads libagl.so, which the open bridge replaces
+        if (img.api < OpenGl.EGL_CFG_API && img.abi.startsWith("arm")) {
+            val agl = File(root, OpenGl.driverPath(img.api))
+            val kept = File(agl.parentFile, OpenGl.AGL_KEPT)
+            if (gpu && OpenGl.arm(ctx, img, paths.dir)) {
+                runCatching {
+                    if (!kept.isFile && agl.isFile) agl.renameTo(kept)       // (the guest's own software renderer, back when the bridge is off)
+                    installAsset(OpenGl.ARM32, agl)
+                    log("GL: open bridge installed as libagl.so for the 1.x guest (host renderer)")
+                }.onFailure { log("GL: open bridge failed to install: ${it.message}") }
+                return
+            }
+            if (kept.isFile) { agl.delete(); kept.renameTo(agl); log("GL: libagl.so restored") }
+        }
         val dir = File(root, "system/lib/egl").apply { mkdirs() }
         val cfg = File(dir, "egl.cfg")
         val cfgRom = File(dir, "egl.cfg.rom")
         if (!cfgRom.isFile && cfg.isFile) cfg.copyTo(cfgRom, overwrite = true)
         when (engine) {
             Engine.N64 -> {}
-            Engine.GB -> cfg.writeText(if (gpu) "0 0 dhd\n" else "0 0 android\n")
+            Engine.GB -> {
+                // Ported from Plus .17 (2026-11-25): the open bridge is the 2.x guest's whole EGL (libGLES_dhd.so stays unused in its directory)
+                val bridgeFile = File(dir, "libGLES_aemu.so")
+                if (gpu && OpenGl.arm(ctx, img, paths.dir)) {
+                    runCatching { installAsset(OpenGl.ARM32, bridgeFile) }.onFailure { log("GL: open bridge failed to install: ${it.message}") }
+                    cfg.writeText(OpenGl.eglCfg(img.api))
+                    log("GL: open bridge installed for the 2.x guest (host renderer)")
+                } else {
+                    bridgeFile.delete()
+                    cfg.writeText(if (gpu) "0 0 dhd\n" else "0 0 android\n")
+                }
+            }
             Engine.KK -> {
                 // сам мост лежит как libGLES_bridge.so; все имена, которые ищут загрузчики EGL (libGLES.so у 4.4,
                 // libGLES_<тег>.so по egl.cfg, раздельные libEGL_/libGLESv*_), занимает переходник libGLES_split:
@@ -1457,6 +1482,28 @@ class TreeFixer(
                 val sw = File(dir, "libGLES_android.so")
                 val swOff = File(dir, "libGLES_android.so.sw")
                 val names = listOf("libGLES.so", "libGLES_aemu.so", "libGLES_android.so", "libEGL_aemu.so", "libGLESv1_CM_aemu.so", "libGLESv2_aemu.so")
+                // Ported from Plus .17 (2026-11-25): an ARM guest (2.0+) gets the open bridge, in its armv7 build (see OpenGl):
+                // the bridge is the whole EGL ("solo" mode) under every name libEGL looks for, the engine's bridge body and
+                // the split shim go; a "glclosed" file in the image's directory keeps the closed path below
+                if (OpenGl.arm(ctx, img, paths.dir)) {
+                    val openNames = names.filter { it != "libGLES_android.so" } + (if (img.api >= 24) listOf("libGLES_emulation.so") else emptyList())
+                    // (a run on the engine's driver put its shim over the firmware's software renderer and set that aside: give it back)
+                    if (swOff.isFile) { sw.delete(); swOff.renameTo(sw) }
+                    if (gpu) {
+                        runCatching {
+                            for (n in openNames) installAsset(OpenGl.ARM32, File(dir, n))
+                            File(dir, "libGLES_bridge.so").delete(); File(dir, "libGLES_split.so").delete()
+                        }.onFailure { log("GL: open bridge failed to install: ${it.message}") }
+                        cfg.writeText(OpenGl.eglCfg(img.api))
+                        log("GL: open bridge installed for the ARM guest (host renderer)")
+                    } else {
+                        // software rendering: none of our names may stay, libEGL would find the bridge by scanning egl/
+                        for (n in openNames) File(dir, n).delete()
+                        File(dir, "libGLES_bridge.so").delete(); File(dir, "libGLES_split.so").delete()
+                        cfg.writeText("0 0 android\n")
+                    }
+                    return
+                }
                 if (gpu && bridge.isFile) {
                     if (!swOff.isFile && sw.isFile && sw.length() != splitSize() && sw.length() != assetSize(OPEN_GL)) sw.renameTo(swOff)
                     // test switch: a file "glopen" in the image's directory puts the open bridge (native/glbridge,
