@@ -56,8 +56,11 @@ import app.aemu.core.CarrierPresets
 import app.aemu.core.CpuInfo
 import app.aemu.core.Engine
 import app.aemu.core.GuestImage
+import app.aemu.core.GuestProcInfo
 import app.aemu.core.HostWifi
 import app.aemu.core.NetworkType
+import app.aemu.core.SocProfiles
+import app.aemu.core.SocSpec
 import app.aemu.core.StorageSpoof
 import app.aemu.core.StorageType
 import app.aemu.core.VmSettings
@@ -198,6 +201,7 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
                 supportingText = { Text(stringResource(R.string.vs_baseband_sub, effBaseband)) },
                 singleLine = true, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
             HardwarePicker(s.hardware) { s = s.copy(hardware = it) }
+            SocPicker(img, s.soc, s.socCustom) { s = s.copy(soc = it) }
 
             Spacer(Modifier.height(8.dp))
             RecoverySection(img)
@@ -293,6 +297,51 @@ private fun HardwarePicker(value: String, set: (String) -> Unit) {
             }
         }
     }
+}
+
+/**
+ * The SoC the guest reports (AEmulator Plus .17): a preset chip, the host phone's own chip, or —
+ * blank — the image's own identity, exactly as before the setting existed. The importer pre-fills
+ * the preset a firmware names for itself; the choice takes effect at the next boot (cpuinfo,
+ * /sys/devices/soc0, the cpu nodes and the SoC properties all follow the one record). A "custom"
+ * value set by other means is listed and kept, not silently dropped.
+ */
+@Composable
+private fun SocPicker(img: GuestImage, value: String, custom: SocSpec?, set: (String) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    val ctx = LocalContext.current
+    val isa = SocProfiles.isaOf(img.abi)
+    // the chip the blank setting reports: the image's own, named by its platform
+    val ownPlatform = remember(img.id) { GuestProcInfo.platform(img, app.aemu.core.VmPaths(ctx, img.id).root) }
+    val defaultLabel = stringResource(R.string.vs_soc_default, ownPlatform.ifBlank { img.model })
+    val current = when {
+        value.isBlank() -> defaultLabel
+        value == SocProfiles.HOST -> stringResource(R.string.vs_soc_host)
+        value == SocProfiles.CUSTOM -> custom?.label ?: stringResource(R.string.vs_soc_custom)
+        else -> SocProfiles.label(value, custom)
+    }
+    ListItem(
+        headlineContent = { Text(stringResource(R.string.vs_soc)) },
+        supportingContent = { Text(stringResource(R.string.vs_soc_sub)) },
+        trailingContent = {
+            Box {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(current)
+                    TextButton(onClick = { open = true }) { Text(stringResource(R.string.vs_soc_pick)) }
+                }
+                DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                    DropdownMenuItem(text = { Text(defaultLabel) }, onClick = { open = false; set("") })
+                    DropdownMenuItem(text = { Text(stringResource(R.string.vs_soc_host)) }, onClick = { open = false; set(SocProfiles.HOST) })
+                    if (value == SocProfiles.CUSTOM) DropdownMenuItem(text = { Text(custom?.label ?: stringResource(R.string.vs_soc_custom)) }, onClick = { open = false })
+                    SocProfiles.presetsFor(isa).forEach { spec ->
+                        DropdownMenuItem(text = { Text(spec.label) }, onClick = { open = false; set(spec.id) })
+                    }
+                }
+            }
+        },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        modifier = Modifier.fillMaxWidth(),
+    )
 }
 
 /** Radio technology the fake modem reports (2G … LTE); only the values the firmware's API level knows are offered. */
