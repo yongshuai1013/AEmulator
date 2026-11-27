@@ -545,7 +545,7 @@ class RilStub(
  * Сама карта — каталог на хосте, qemu подменяет гостевой путь (DHD_SDCARD).
  */
 class VoldStub(
-    paths: VmPaths,
+    private val paths: VmPaths,
     private val mountPoint: String,
     private val log: (String) -> Unit,
     sockName: String = "vold",
@@ -620,8 +620,7 @@ class VoldStub(
             head == "share" && sub == "status" -> listOf("210 ${args.getOrElse(2) { "ums" }} unavailable")
             head == "share" || head == "unshare" -> listOf("200 Share operation succeeded.")
             head == "storage" && sub == "users" -> listOf("200 Storage user list.")
-            head == "asec" && sub == "list" -> listOf("200 Asec listed.")
-            head == "asec" && sub == "path" -> listOf("211 /mnt/asec/${args.getOrElse(2) { "" }}")
+            head == "asec" -> asec(sub, args.drop(2))
             head == "obb" && sub == "list" -> listOf("200 Obb listed.")
             // the answer is one number that MountService parses whole (Samsung's moveDumpstates dies in system_server
             // on anything else); cryptocomplete: 1 = not encrypted
@@ -630,6 +629,46 @@ class VoldStub(
         }
         send(out, reply.map { withSeq(it, seq) })
         after?.invoke()
+    }
+
+    /**
+     * Secure containers (ASEC, Android 2.2 - 7.x). The real vold keeps each one in an encrypted image on a loop device; there
+     * is no block device here, so a container is a plain directory /mnt/asec/<id> of the guest tree. That is all the package
+     * manager and the DefaultContainerService need: they copy pkg.apk into it and read it from there. Without it the install
+     * of an app that prefers the card (or any install while the location is "auto") failed with "Failed to copy ... to
+     * /mnt/asec/<id>/pkg.apk". The ids come from the guest, so only plain names are accepted.
+     */
+    private val asecDir: File get() = File(paths.root, "mnt/asec")
+
+    private fun asecOf(id: String?): File? =
+        if (id != null && Regex("[A-Za-z0-9][A-Za-z0-9._-]*").matches(id)) File(asecDir, id) else null
+
+    private fun asec(sub: String, a: List<String>): List<String> {
+        val ok = listOf("200 asec operation succeeded")
+        val dir = asecOf(a.getOrNull(0))
+        return when (sub) {
+            "list" -> (asecDir.listFiles { f -> f.isDirectory }?.map { it.name }?.sorted() ?: emptyList())
+                .map { "111 $it" } + ok
+            // create <id> <sizeMb> <fstype> <key> <ownerUid>: an existing one is a leftover of an install that died, start clean
+            "create" -> {
+                if (dir == null) return listOf("500 Invalid container id")
+                dir.deleteRecursively()
+                if (!dir.mkdirs() && !dir.isDirectory) { log("vold: asec create ${dir.name}: cannot make the directory"); return listOf("400 Cannot create the container") }
+                dir.setReadable(true, false); dir.setWritable(true, false); dir.setExecutable(true, false)
+                ok
+            }
+            "path" -> if (dir != null && dir.isDirectory) listOf("211 /mnt/asec/${dir.name}") else listOf("406 Container not found")
+            "mountstatus" -> if (dir != null && dir.isDirectory) listOf("211 1") else listOf("406 Container not found")
+            // mounted for as long as it exists: nothing to mount, unmount or finalize
+            "mount", "unmount", "finalize", "fixperms" -> if (dir != null && dir.isDirectory) ok else listOf("406 Container not found")
+            "destroy" -> { dir?.deleteRecursively(); ok }
+            "rename" -> {
+                val to = asecOf(a.getOrNull(1))
+                if (dir == null || to == null || !dir.isDirectory) listOf("406 Container not found")
+                else { to.deleteRecursively(); if (dir.renameTo(to)) ok else listOf("400 Cannot rename the container") }
+            }
+            else -> ok
+        }
     }
 
     private fun withSeq(line: String, seq: Int?): String {
