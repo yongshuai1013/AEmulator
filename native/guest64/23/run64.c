@@ -36,6 +36,7 @@ enum {
     NR_lseek = 62, NR_read = 63, NR_write = 64, NR_writev = 66, NR_pread64 = 67, NR_pwrite64 = 68, NR_readlinkat = 78, NR_newfstatat = 79, NR_fstat = 80,
     NR_timerfd_create = 85, NR_utimensat = 88, NR_capget = 90, NR_capset = 91, NR_exit_group = 94, NR_unshare = 97,
     NR_ptrace = 117, NR_sched_yield = 124, NR_rt_sigaction = 134, NR_rt_sigprocmask = 135, NR_reboot = 142,
+    NR_getdents64 = 61, NR_waitid = 95, NR_clock_gettime = 113, NR_kill = 129, NR_tkill = 130, NR_tgkill = 131, NR_getpgid = 155, NR_wait4 = 260,
     NR_setregid = 143, NR_setgid = 144, NR_setreuid = 145, NR_setuid = 146, NR_setresuid = 147, NR_getresuid = 148,
     NR_setresgid = 149, NR_getresgid = 150, NR_setfsuid = 151, NR_setfsgid = 152, NR_getgroups = 158, NR_setgroups = 159,
     NR_uname = 160, NR_prctl = 167, NR_getpid = 172, NR_getuid = 174, NR_geteuid = 175, NR_getgid = 176, NR_getegid = 177, NR_gettid = 178,
@@ -2040,6 +2041,278 @@ static long trap(long nr, long *a, void *uc) {
 
 #define PB(i) ((*pbp ? *pbp : (*pbp = pb_get())) + (i) * PATH_MAX)
 
+// ---------------------------------------------------------------------------------------------------- system-server death watch
+//
+// The relay-side capture (crash capture, below) came back from the 20:24 field with no line at
+// all: system_server's death never reaches the fatal-signal relay, so it is not a guest fault
+// the relay forwards. What stays visible from the host side is the bookkeeping around the
+// death: what is sent to the process, and what its parent reaps. Neither was observable —
+// kill/tgkill/tkill and wait4/waitid were not in the filter, so those guest calls went
+// straight to the phone's kernel. They are trapped now and forwarded unchanged (the real
+// call, same arguments, same result); the watch only writes, through say() under the
+// aemu-137r: head, so GuestVm mirrors the lines into the host log with the rest of the 137
+// measurement, each stamped with this process's session tag and a monotonic t= (ms) that
+// orders lines across processes. Two records:
+//   ss-kill — a kill/tgkill/tkill whose target is system_server. The sender is the line's own
+//     pid/comm (the calling thread), so a watchdog suicide, whose kill is issued from inside
+//     system_server itself, names its sender like any other. Group and broadcast kills are
+//     resolved against /proc: system_server rides in its parent's process group, so a group
+//     kill lands on it too. This image issues no kill of its own (there is no kill call site
+//     in it), so every ss-kill line is a guest call; a host-side kill (the app destroying the
+//     VM) never enters a guest syscall and leaves GuestVm's own lines instead.
+//   ss-exit — the wait that reaps system_server, decoded where it lands, in the parent
+//     (zygote): signaled and by which signal, or exited and with what code. The child is
+//     named before the wait is forwarded, while the zombie still stands in /proc: the
+//     parent's children are enumerated through /proc/self/task/*/children and matched by
+//     the name the guest set, the identity test of ssc_is_ss. Once named, the pid is latched
+//     and the enumeration stops; a latched pid is re-validated on every wait, so a forked
+//     child that inherited the latch (or a recycled pid) cannot produce a false line.
+// zygote's own exit is not on this path: its parent is the app, which already logs it
+// ("zygote exited, code 137"). Translator processes (g_is32) forward without
+// observing: system_server is a native 64-bit process, and a translator's waits and kills
+// are its emulation's bookkeeping, not the guest's.
+
+static int ssc_is_ss(void);                 // the crash capture's identity test, defined below
+
+static long ssw_now_ms(void) {
+    struct { long s, ns; } ts;
+    S2(NR_clock_gettime, 1 /* CLOCK_MONOTONIC */, &ts);
+    return ts.s * 1000 + ts.ns / 1000000;
+}
+
+static long ssw_comm_of(long pid, char *out, u64 cap) {   // /proc/<pid>/comm, newline stripped
+    char path[48]; u64 o = 0;
+    tun_cat(path, &o, "/proc/"); tun_catn(path, &o, (u64)pid); tun_cat(path, &o, "/comm");
+    long fd = S4(NR_openat, AT_FDCWD, path, 0, 0);
+    if (fd < 0) return -1;
+    long n = S3(NR_read, fd, out, (long)cap - 1);
+    S1(NR_close, fd);
+    if (n < 0) return -1;
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == 0)) n--;
+    out[n] = 0;
+    return n;
+}
+
+static int ssw_pid_is_ss(long pid) {
+    char c[24];
+    return ssw_comm_of(pid, c, sizeof c) == 13 && seq(c, "system_server");
+}
+
+// a field of /proc/<pid>/stat after the comm: idx 1 = ppid, 2 = pgrp (-1 when unreadable)
+static long ssw_stat_field(long pid, int idx) {
+    char path[48]; u64 o = 0;
+    tun_cat(path, &o, "/proc/"); tun_catn(path, &o, (u64)pid); tun_cat(path, &o, "/stat");
+    char buf[320];
+    long fd = S4(NR_openat, AT_FDCWD, path, 0, 0);
+    if (fd < 0) return -1;
+    long n = S3(NR_read, fd, buf, (long)sizeof buf - 1);
+    S1(NR_close, fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    char *p = buf + n;
+    while (p > buf && p[-1] != ')') p--;                    // just past the last ')'
+    for (int f = 0; f <= idx; f++) {
+        while (*p == ' ') p++;
+        if (!*p) return -1;
+        if (f == 0) { while (*p && *p != ' ') p++; continue; }   // the state letter
+        long v = 0; int neg = 0;
+        if (*p == '-') { neg = 1; p++; }
+        while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+        if (f == idx) return neg ? -v : v;
+    }
+    return -1;
+}
+
+static long ssw_tgid_of(long tid) {         // the process a thread belongs to, from /proc/<tid>/status
+    char path[48]; u64 o = 0;
+    tun_cat(path, &o, "/proc/"); tun_catn(path, &o, (u64)tid); tun_cat(path, &o, "/status");
+    static char buf[2048];
+    long fd = S4(NR_openat, AT_FDCWD, path, 0, 0);
+    if (fd < 0) return -1;
+    long n = S3(NR_read, fd, buf, (long)sizeof buf - 1);
+    S1(NR_close, fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    for (char *p = buf; *p; p++) {
+        if ((p == buf || p[-1] == '\n') && pre(p, "Tgid:")) {
+            p += 5;
+            while (*p == ' ' || *p == '\t') p++;
+            return (long)atou(p);
+        }
+    }
+    return -1;
+}
+
+// the system_server process, wherever it is (group and broadcast kills only — a full scan)
+static long ssw_find_ss(long *pgrp) {
+    long dfd = S4(NR_openat, AT_FDCWD, "/proc", 0x10000 /* O_DIRECTORY */, 0);
+    if (dfd < 0) return 0;
+    static char buf[8192];
+    long found = 0;
+    int done = 0;
+    while (!done) {
+        long n = S3(NR_getdents64, dfd, buf, sizeof buf);
+        if (n <= 0) break;
+        long b = 0;
+        while (b < n) {
+            u16 rl = *(u16 *)(buf + b + 16);
+            const char *nm = buf + b + 19;
+            if (!rl) { done = 1; break; }
+            b += rl;
+            if (nm[0] < '1' || nm[0] > '9') continue;
+            long pid = (long)atou(nm);
+            if (pid > 0 && ssw_pid_is_ss(pid)) { found = pid; if (pgrp) *pgrp = ssw_stat_field(pid, 2); done = 1; break; }
+        }
+    }
+    S1(NR_close, dfd);
+    return found;
+}
+
+static int g_ssw_kills;
+static void ssw_kill_emit(const char *via, const char *target, long tid, long sig) {
+    if (g_ssw_kills >= 256) return;
+    g_ssw_kills++;
+    char line[512]; u64 o = 0;
+    r137_head(line, &o, r137_pending());
+    tun_cat(line, &o, "ss-kill via="); tun_cat(line, &o, via);
+    tun_cat(line, &o, " target="); tun_cat(line, &o, target);
+    if (tid >= 0) { tun_cat(line, &o, " tid="); tun_catn(line, &o, (u64)tid); }
+    tun_cat(line, &o, " sig="); tun_catn(line, &o, (u64)sig);
+    tun_cat(line, &o, " t="); tun_catn(line, &o, (u64)ssw_now_ms());
+    tun_cat(line, &o, "\n");
+    say(line);
+}
+
+// kill/tgkill/tkill: name the call when its target is system_server, then forward it unchanged.
+// The line is written before the forward, so a self-kill still leaves it.
+static long ssw_kill(long nr, long *a) {
+    if (!g_is32) {
+        char tb[48];
+        if (nr == NR_kill) {
+            long pid = a[0], sig = a[1];
+            if (pid > 0) {
+                if (ssw_pid_is_ss(pid)) { u64 o = 0; tun_catn(tb, &o, (u64)pid); ssw_kill_emit("kill", tb, -1, sig); }
+            } else if (pid == 0 || pid == -1 || pid < -1) {
+                long pg = -1;
+                long ssp = ssw_find_ss(&pg);
+                if (ssp) {
+                    long mine = S2(NR_getpgid, 0, 0);
+                    u64 o = 0;
+                    if (pid == -1) { tun_cat(tb, &o, "all:"); tun_catn(tb, &o, (u64)ssp); ssw_kill_emit("kill", tb, -1, sig); }
+                    else if ((pid == 0 && pg == mine) || (pid < -1 && pg == -pid)) {
+                        tun_cat(tb, &o, "group:"); tun_catn(tb, &o, (u64)(pid == 0 ? mine : -pid));
+                        ssw_kill_emit("kill", tb, -1, sig);
+                    }
+                }
+            }
+        } else if (nr == NR_tgkill) {
+            if (a[0] > 0 && ssw_pid_is_ss(a[0])) { u64 o = 0; tun_catn(tb, &o, (u64)a[0]); ssw_kill_emit("tgkill", tb, a[1], a[2]); }
+        } else {                            // tkill: the argument is a thread; resolve its process
+            long tg = ssw_tgid_of(a[0]);
+            if (tg > 0 && ssw_pid_is_ss(tg)) { u64 o = 0; tun_catn(tb, &o, (u64)tg); ssw_kill_emit("tkill", tb, a[0], a[1]); }
+        }
+    }
+    return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
+}
+
+static long g_ssw_child;                    // this process's system_server child, once named
+static int g_ssw_done;                      // its exit is on record; the watch stops here
+static int g_ssw_scans;
+static long g_ssw_scan_ms;
+
+// name this process's system_server child out of /proc/self/task/*/children, if it has one
+static void ssw_scan_children(void) {
+    long dfd = S4(NR_openat, AT_FDCWD, "/proc/self/task", 0x10000 /* O_DIRECTORY */, 0);
+    if (dfd < 0) return;
+    static char buf[8192];
+    int done = 0;
+    while (!done) {
+        long n = S3(NR_getdents64, dfd, buf, sizeof buf);
+        if (n <= 0) break;
+        long b = 0;
+        while (b < n && !done) {
+            u16 rl = *(u16 *)(buf + b + 16);
+            const char *nm = buf + b + 19;
+            if (!rl) { done = 1; break; }
+            b += rl;
+            if (nm[0] < '1' || nm[0] > '9') continue;
+            char path[80]; u64 o = 0;
+            tun_cat(path, &o, "/proc/self/task/"); tun_cat(path, &o, nm); tun_cat(path, &o, "/children");
+            long fd = S4(NR_openat, AT_FDCWD, path, 0, 0);
+            if (fd < 0) continue;
+            static char cb[2048];
+            long cn = S3(NR_read, fd, cb, (long)sizeof cb - 1);
+            S1(NR_close, fd);
+            if (cn <= 0) continue;
+            cb[cn] = 0;
+            char *p = cb;
+            while (*p && !done) {
+                while (*p == ' ') p++;
+                if (*p < '0' || *p > '9') break;
+                long pid = (long)atou(p);
+                while (*p >= '0' && *p <= '9') p++;
+                if (pid > 0 && ssw_pid_is_ss(pid)) { g_ssw_child = pid; done = 1; }
+            }
+        }
+    }
+    S1(NR_close, dfd);
+}
+
+// kind: 0 = signaled (val is the signal), 1 = exited (val is the code), 2 = no status was taken
+static void ssw_exit_emit(long child, int kind, long val, int core) {
+    char line[512]; u64 o = 0;
+    r137_head(line, &o, r137_pending());
+    tun_cat(line, &o, "ss-exit child="); tun_catn(line, &o, (u64)child);
+    if (kind == 0) { tun_cat(line, &o, " status=signaled sig="); tun_catn(line, &o, (u64)val); if (core) tun_cat(line, &o, " core=1"); }
+    else if (kind == 1) { tun_cat(line, &o, " status=exit code="); tun_catn(line, &o, (u64)val); }
+    else tun_cat(line, &o, " status=unknown");
+    tun_cat(line, &o, " t="); tun_catn(line, &o, (u64)ssw_now_ms());
+    tun_cat(line, &o, "\n");
+    say(line);
+}
+
+// wait4/waitid: name the child before forwarding, decode the status when the wait lands on it.
+static long ssw_wait(long nr, long *a) {
+    if (!g_is32 && !g_ssw_done) {
+        if (g_ssw_child) {                  // re-validate the latch: still system_server, still ours
+            if (!ssw_pid_is_ss(g_ssw_child) || ssw_stat_field(g_ssw_child, 1) != S0(NR_getpid)) g_ssw_child = 0;
+        }
+        if (!g_ssw_child) {
+            long want = nr == NR_wait4 ? a[0] : (a[0] == 1 /* P_PID */ ? a[1] : -1);
+            if (want > 0) { if (ssw_pid_is_ss(want)) g_ssw_child = want; }
+            else if (g_ssw_scans < 16) {
+                long now = ssw_now_ms();
+                if (now - g_ssw_scan_ms >= 200) { g_ssw_scan_ms = now; g_ssw_scans++; ssw_scan_children(); }
+            }
+        }
+    }
+    long r = S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
+    if (!g_is32 && !g_ssw_done && g_ssw_child) {
+        if (nr == NR_wait4 && r == g_ssw_child) {
+            if (a[1]) {
+                int st = *(int *)a[1];
+                int sig = st & 0x7f;
+                if (sig == 0) ssw_exit_emit(r, 1, (st >> 8) & 0xff, 0);
+                else if (sig != 0x7f) ssw_exit_emit(r, 0, sig, (st & 0x80) != 0);
+                else ssw_exit_emit(r, 2, 0, 0);
+            } else ssw_exit_emit(r, 2, 0, 0);
+            g_ssw_done = 1;
+        } else if (nr == NR_waitid && r == 0 && a[2]) {
+            int pid = *(int *)((char *)a[2] + 16);          // siginfo's si_pid
+            if (pid == (int)g_ssw_child) {
+                int code = *(int *)((char *)a[2] + 8);      // si_code: CLD_EXITED 1, CLD_KILLED 2, CLD_DUMPED 3
+                int status = *(int *)((char *)a[2] + 24);   // si_status
+                if (code == 1) ssw_exit_emit(pid, 1, status, 0);
+                else if (code == 2) ssw_exit_emit(pid, 0, status, 0);
+                else if (code == 3) ssw_exit_emit(pid, 0, status, 1);
+                else ssw_exit_emit(pid, 2, 0, 0);
+                if (!(a[3] & 0x01000000)) g_ssw_done = 1;   // WNOWAIT only looked; the consuming wait reports again and ends it
+            }
+        }
+    }
+    return r;
+}
+
 #include "../vmount.h"
 
 // ---------------------------------------------------------------------------------------------------- isolation observation
@@ -3021,6 +3294,8 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         }
         return S4(nr, a[0], &t, a[2], a[3]);
     }
+    case NR_kill: case NR_tkill: case NR_tgkill: return ssw_kill(nr, a);   // the death watch: named when aimed at system_server, forwarded unchanged
+    case NR_wait4: case NR_waitid: return ssw_wait(nr, a);                  // the death watch: system_server's exit, decoded in its parent
     }
     return -ENOSYS;
 }
@@ -3335,6 +3610,7 @@ static const u8 trapped[] = {
     NR_setresgid, NR_getresgid, NR_setfsuid, NR_setfsgid, NR_getgroups, NR_setgroups, NR_getuid, NR_geteuid,
     NR_getgid, NR_getegid, NR_bind, NR_connect, NR_execve, NR_setsockopt, NR_unshare, NR_timerfd_create,
     NR_close, NR_getsockopt, NR_sendto, NR_sendmsg, NR_recvmsg, NR_getsockname, NR_socket, NR_dup3, NR_ptrace,
+    NR_kill, NR_tkill, NR_tgkill, NR_waitid,
 };
 
 enum { L_TRAP = 240, L_ALLOW, L_SIG, L_MMAP, L_NR, L_PRCTL, L_N };
@@ -3354,6 +3630,7 @@ static void install_filter(void) {
     if (g_vm) f[n++] = JEQ(268 /* setns */, L_TRAP, 0);
     // Added for AEmulator Plus (2026-11-21): directory reads, to show a device node (a whiteout) as one (vmount.h)
     if (g_vm) f[n++] = JEQ(61 /* getdents64 */, L_TRAP, 0);
+    f[n++] = JEQ(NR_wait4, L_TRAP, 0);          // 260 does not fit the u8 table above (the death watch, below)
     f[n++] = JEQ(NR_rt_sigprocmask, L_SIG, 0);
     f[n++] = JEQ(NR_prctl, L_PRCTL, 0);
     f[n++] = JEQ(NR_mmap, L_MMAP, L_ALLOW);
