@@ -244,12 +244,16 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             // a tap rarely arrives whole on any one device. Give each aux node its
             // own FIFO instead, held open by the host and never written: the nodes
             // stay present and adoptable, but the stream reaches minui only via event0.
+            // A dynamic recovery (64-bit) opens every event node it finds, so it gets
+            // the single node only: the aux nodes are removed (leftovers of earlier
+            // sessions included) and not recreated; static (32-bit) recoveries keep
+            // the aux fifos they have always had.
             auxInputFds.forEach { runCatching { android.system.Os.close(it) } }
             auxInputFds.clear()
             for (alt in listOf("event1", "event2", "event3")) {
                 val f = File(RecoveryImage.dir(paths), "dev/input/$alt")
                 f.delete()
-                runCatching {
+                if (!is64) runCatching {
                     android.system.Os.mkfifo(f.path, "666".toInt(8))
                     auxInputFds += android.system.Os.open(f.path, android.system.OsConstants.O_RDWR, 0)
                 }
