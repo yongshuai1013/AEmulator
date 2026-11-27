@@ -2804,6 +2804,7 @@ static volatile int g_rl_skip[NRELAY];
 static char *g_rl_stk[NRELAY];                    // yi': the slot's big-stack top (0 = none yet); owner thread only
 static int g_rl_big[NRELAY];                      // yi': traps this relay has run out on the big stack
 static int g_rl_onstk[NRELAY];                    // yi': this thread is out on the big stack right now
+static volatile int g_fm_said;                    // faultmap build: the mode line below has been printed (once per process)
 
 long rl_call_on_stack(void *top, void *fn, long a0, long a1, long a2);   // start.S
 
@@ -2863,6 +2864,8 @@ static int rl_trap_begin(void) {                  // yi': >=0 = run this trap ou
     int i = rl_find(S0(NR_gettid));
     if (i < 0 || g_rl_depth[i] <= 0) return -1;   // not in a relay: nothing changes
     if (g_rl_onstk[i]) return -1;                 // already out there: a nested trap rides the same big stack
+    if (__atomic_exchange_n(&g_fm_said, 1, __ATOMIC_ACQ_REL) == 0)
+        say("aemu-137r: mode bigstack+faultmap (yi' restored; fault-page map dump at the entry snapshot)\n");
     if (!g_rl_stk[i]) g_rl_stk[i] = rl_mmap_stack();
     if (!g_rl_stk[i]) return -1;                  // no stack to give: the pre-fix behaviour
     g_rl_onstk[i] = 1;
@@ -3662,6 +3665,123 @@ static void ssc_probe(int sig, void *uc) {
     say(line);
 }
 
+// faultmap (137 measurement, supply side): at the entry snapshot, name the mapping the
+// fault address sits in — the whole maps row as the kernel prints it — and, for a
+// file-backed row, the length account behind it: the file's real length on the host
+// against the row's length and the fault's place in both, so a short mapping can be
+// read as arithmetic (the fault's file offset against EOF) instead of as a smell.
+// The maps read is this process's own (this image runs inside the guest process it
+// names); the row's path is statted as printed first and through xl() if that fails,
+// and the form that answered is the one printed. A fault in no row prints no-map with
+// the two neighbour rows, the nearer file row carrying the account; an anonymous row
+// prints as anon; a maps read that fails prints its error. Observation only: nothing
+// here changes what the relay does with the delivery.
+struct fmrow { u64 lo, hi, off, ino; char perms[8]; char *path; };
+
+static void fm_parse(char *l, struct fmrow *r) {   // one maps row, split in place; path may be ""
+    char *q = l;
+    r->lo = 0; while (*q && *q != '-') { r->lo = r->lo * 16 + cc_hv(*q); q++; }
+    if (*q) q++;
+    r->hi = 0; while (*q && *q != ' ') { r->hi = r->hi * 16 + cc_hv(*q); q++; }
+    while (*q == ' ') q++;
+    int i = 0; while (*q && *q != ' ' && i < 7) r->perms[i++] = *q++; r->perms[i] = 0;
+    while (*q == ' ') q++;
+    r->off = 0; while (*q && *q != ' ') { r->off = r->off * 16 + cc_hv(*q); q++; }
+    while (*q == ' ') q++; while (*q && *q != ' ') q++;          // dev
+    while (*q == ' ') q++;
+    r->ino = 0; while (*q && *q >= '0' && *q <= '9') { r->ino = r->ino * 10 + (u64)(*q - '0'); q++; }
+    while (*q == ' ') q++;
+    r->path = q;
+}
+
+static void fm_signed(i64 v) {                     // a length distance, sign and all
+    char t[24];
+    if (v < 0) { say("-"); say(utoa((u64)(-v), t + sizeof t)); }
+    else say(utoa((u64)v, t + sizeof t));
+}
+
+static void fm_acct(const char *rel, struct fmrow *r, u64 fault) {   // the length account of one file row
+    static char pbuf[PATH_MAX + 64], xbuf[3 * PATH_MAX];
+    char t[24];
+    u64 pl = slen(r->path);
+    int deleted = pl > 10 && seq(r->path + pl - 10, " (deleted)");
+    if (deleted) pl -= 10;
+    if (pl + 1 > sizeof pbuf) pl = sizeof pbuf - 1;
+    memcpy(pbuf, r->path, pl); pbuf[pl] = 0;
+    struct kstat st; const char *used = 0, *how = "";
+    if (S4(NR_newfstatat, AT_FDCWD, pbuf, &st, 0) == 0) { used = pbuf; how = "asis"; }
+    else {
+        int err = 0; const char *xp = xl(pbuf, xbuf, &err);
+        if (xp && xp != pbuf && S4(NR_newfstatat, AT_FDCWD, xp, &st, 0) == 0) { used = xp; how = "xl"; }
+    }
+    say("aemu-137r: faultmap: acct rel="); say(rel);
+    say(" perms="); say(r->perms);
+    say(" inode="); say(utoa(r->ino, t + sizeof t));
+    say(" maplen="); say(utoa(r->hi - r->lo, t + sizeof t));
+    say(" fileoff="); say(utoa(r->off + (fault - r->lo), t + sizeof t));
+    say(" to-tail="); fm_signed((i64)r->hi - (i64)fault);
+    if (used) {
+        say(" filelen="); say(utoa((u64)st.st_size, t + sizeof t));
+        say(" to-eof="); fm_signed((i64)st.st_size - (i64)(r->off + (fault - r->lo)));
+        say(" stat="); say(how); say(" host="); say(used);
+    } else { say(" stat=fail host="); say(pbuf); }
+    if (deleted) say(" deleted=1");
+    say("\n");
+}
+
+static void fm_copy(char *dst, const char *src) {  // one maps row into its keep, bounded
+    u64 i = 0;
+    while (src[i] && i + 1 < 4608) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+
+static void cc_faultmap(u64 fault) {
+    static char buf[1 << 16];
+    static char raw[4608], prev[4608], next[4608];
+    char t[24];
+    raw[0] = prev[0] = next[0] = 0;
+    long fd = S4(NR_openat, AT_FDCWD, "/proc/self/maps", 0, 0);
+    long rerr = fd < 0 ? fd : 0;
+    int have = 0, lines = 0, done = 0;
+    u64 keep = 0; long n = 0;
+    while (!done && fd >= 0 && lines < 8192 && (n = S3(NR_read, fd, buf + keep, sizeof buf - 1 - keep)) > 0) {
+        u64 len = keep + (u64)n; buf[len] = 0;
+        char *l = buf;
+        for (;;) {
+            char *e = l; while (*e && *e != '\n') e++;
+            if (!*e) break;
+            *e = 0; lines++;
+            u64 lo = 0, hi = 0; char *q = l;
+            for (; *q && *q != '-'; q++) lo = lo * 16 + cc_hv(*q);
+            if (*q) for (q++; *q && *q != ' '; q++) hi = hi * 16 + cc_hv(*q);
+            if (fault >= lo && fault < hi) { fm_copy(raw, l); have = 1; done = 1; }
+            else if (hi <= fault) fm_copy(prev, l);              // nearest row below, so far
+            else if (!next[0]) { fm_copy(next, l); done = 1; }   // first row above: the walk is over
+            if (done) break;
+            l = e + 1;
+        }
+        keep = slen(l); memmove(buf, l, keep);
+    }
+    if (fd >= 0) S1(NR_close, fd);
+    if (!have && !prev[0] && !next[0] && n < 0) rerr = n;        // the read itself failed before any row
+    say("aemu-137r: faultmap: fault="); hex(fault);
+    if (rerr) {
+        say(" kind=maps-fail err="); say(utoa((u64)(-rerr), t + sizeof t)); say("\n");
+        return;
+    }
+    if (have) {
+        struct fmrow r; fm_parse(raw, &r);
+        say(r.path[0] ? " kind=file\n" : " kind=anon\n");
+        say("aemu-137r: faultmap: map: "); say(raw); say("\n");
+        if (r.path[0]) fm_acct("cover", &r, fault);
+    } else {
+        say(" kind=no-map\n");
+        say("aemu-137r: faultmap: prev: "); say(prev[0] ? prev : "none"); say("\n");
+        say("aemu-137r: faultmap: next: "); say(next[0] ? next : "none"); say("\n");
+        if (prev[0]) { struct fmrow r; fm_parse(prev, &r); if (r.path[0]) fm_acct("prev", &r, fault); }
+    }
+}
+
 // Entry snapshot: the same structured line, printed at the relay's door — after the
 // probe, before cc_note and before the guest handler runs — for the one process whose
 // death the after-handler naming can never reach (see the capture note above).
@@ -3670,6 +3790,7 @@ static void ssc_probe(int sig, void *uc) {
 static void cc_emit_entry(int sig, void *info, void *uc) {
     struct sigctx *c = (struct sigctx *)((char *)uc + 176);
     cc_emit_ctx_e(sig, *(u64 *)((char *)info + 16), c, S0(NR_gettid), 1, 0);   // siginfo's si_addr, as in cc_emit
+    cc_faultmap(*(u64 *)((char *)info + 16));                                  // faultmap: the fault page's row and length account, once at this door
 }
 
 // Nested variant of the entry snapshot, for the relay-nested rethrow in fatal_relay (137
