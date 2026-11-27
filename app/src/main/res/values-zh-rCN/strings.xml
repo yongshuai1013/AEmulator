@@ -214,4 +214,5 @@
     <string name="m_vnc">启动 VNC 服务器</string>
     <string name="m_vnc_stop">停止 VNC 服务器</string>
     <string name="m_vnc_started">VNC：%1$s，密码 %2$s</string>
+    <string name="bluetooth_permission_denied">蓝牙权限被拒绝:客户机将在没有主机蓝牙的情况下启动。</string>
 </resources>
