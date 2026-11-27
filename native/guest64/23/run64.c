@@ -2057,8 +2057,9 @@ static long trap(long nr, long *a, void *uc) {
 //     pid/comm (the calling thread), so a watchdog suicide, whose kill is issued from inside
 //     system_server itself, names its sender like any other. Group and broadcast kills are
 //     resolved against /proc: system_server rides in its parent's process group, so a group
-//     kill lands on it too. This image issues no kill of its own (there is no kill call site
-//     in it), so every ss-kill line is a guest call; a host-side kill (the app destroying the
+//     kill lands on it too. This image issues exactly one kill of its own — the relay-nested
+//     SIG_DFL rethrow (137 fix, yi, in fatal_relay) — and like every call made from this image
+//     it passes the filter untrapped, so every ss-kill line is still a guest call; a host-side kill (the app destroying the
 //     VM) never enters a guest syscall and leaves GuestVm's own lines instead.
 //   ss-exit — the wait that reaps system_server, decoded where it lands, in the parent
 //     (zygote): signaled and by which signal, or exited and with what code. The child is
@@ -3691,7 +3692,19 @@ static void on_crash(int sig, void *info, void *uc) {
 // debuggerd hook) runs from it with the flags and mask it asked for. Only when the guest has nothing left
 // (SIG_DFL) the crash is reported here, on the program's stderr, with the mappings of pc and the callers.
 static void fatal_relay(int sig, void *info, void *uc) {
-    rl_enter();                                                 // 137 fix (jia): mark this thread in-relay until the leave below
+    if (rl_enter() > 0) {                                       // 137 fix (yi): a nested delivery is never handled — this thread is
+        char line[128]; u64 o = 0;                              // already inside the relay below, so a second handler run can only
+        tun_cat(line, &o, "aemu-137r: relay-nested sig=");      // die deeper in the same machinery. One marker line, the disposition
+        tun_catn(line, &o, (u64)sig);                           // reset to SIG_DFL, the signal rethrown at this thread: the process
+        tun_cat(line, &o, " tid=");                             // dies by the signal itself, at the fault's own site.
+        tun_catn(line, &o, (u64)S0(NR_gettid));
+        tun_cat(line, &o, " -> SIG_DFL rethrow\n");
+        say(line);
+        struct { void *h; u64 flags; void *restorer; u64 mask; } df = { 0, 0, 0, 0 };
+        S4(NR_rt_sigaction, sig, &df, 0, 8);
+        S2(NR_tkill, S0(NR_gettid), sig);
+        S1(NR_exit_group, 128 + sig);                           // the rethrow did not land: die by the same number anyway
+    }
     ssc_probe(sig, uc);                                         // 137 measurement: name this delivery before anything touches it
     if (is_fatal(sig) && sig != 8 && ssc_is_ss()) cc_emit_entry(sig, info, uc);   // entry snapshot: print this delivery at the door
     if (sig == 11 || sig == 6) cc_note(sig, info, uc);          // crash capture: stash (and name a repeat fault)
