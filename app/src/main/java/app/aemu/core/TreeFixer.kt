@@ -1559,6 +1559,15 @@ class TreeFixer(
     }.onFailure { log("MediaTek DRVB: failed: ${it.message}") }
 
     /**
+     * The SoC preset in force for this image (see [GuestProcInfo.socResolved] for the source
+     * priority): null while the soc setting is blank, in which case every identity surface below
+     * keeps its previous answer, byte for byte.
+     */
+    internal val socPreset: SocResolved? by lazy {
+        GuestProcInfo.socResolved(img, root)?.also { log("soc: reporting ${it.label} (${it.cpuCount} cores)") }
+    }
+
+    /**
      * /proc/cmdline and /proc/cpuinfo of the image (GuestProcInfo): written into the tree for every
      * engine. The native engine serves the image's own /proc files first, so these are the answers
      * there; without them the guest fell through to the phone's own /proc — the phone's kernel command
@@ -1572,7 +1581,7 @@ class TreeFixer(
         val ct = GuestProcInfo.cmdline(img, root) + "\n"
         if (!cmd.isFile || cmd.readText() != ct) cmd.writeText(ct)
         val cpu = File(root, "proc/cpuinfo")
-        val ut = GuestProcInfo.cpuinfo(img, root)
+        val ut = GuestProcInfo.effectiveCpuinfo(img, root)
         if (!cpu.isFile || cpu.readText() != ut) cpu.writeText(ut)
     }
 
@@ -2007,20 +2016,94 @@ class TreeFixer(
         return false
     }
 
-    private fun makeSysNodes() {
-        val freq = File(root, "sys/devices/system/cpu/cpu0/cpufreq/stats/time_in_state")
-        if (!freq.isFile) {
-            freq.parentFile?.mkdirs()
-            freq.writeText(listOf(384000, 594000, 810000, 1026000, 1242000, 1512000).joinToString("\n") { "$it 0" } + "\n")
-        }
-        val cpus = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
+    /**
+     * The cpu and cpufreq nodes of the chip the VM reports (AEmulator Plus .17, from [SocResolved]):
+     * one cpufreq directory per core with the chip's own frequency steps. Samsung's
+     * com.samsung.bootsetting writes the CPU governor and reads it back; with no scaling_governor
+     * node the open fails and the receiver dies with an NPE at every boot, so the governor file is
+     * real and writable, and only a missing one is made (the value is the guest's to change).
+     */
+    private fun socCpuNodes(soc: SocResolved) {
+        val cpus = soc.cpuCount
         val cpu = File(root, "sys/devices/system/cpu").apply { mkdirs() }
+        runCatching {
+            for (n in 0 until cpus) {
+                val (minK, maxK) = soc.cpuFreqs.getOrNull(n) ?: (SocProfiles.FALLBACK_MIN_KHZ to SocProfiles.FALLBACK_MAX_KHZ)
+                val steps = SocProfiles.freqSteps(minK, maxK)
+                val cf = File(cpu, "cpu$n/cpufreq").apply { mkdirs() }
+                run { var d: File? = cf; while (d != null && d != root && d.path.startsWith(root.path)) { d.setReadable(true, false); d.setExecutable(true, false); d = d.parentFile } }
+                for ((name, v) in listOf(
+                    "scaling_governor" to "ondemand",
+                    "scaling_available_governors" to "ondemand performance powersave userspace",
+                    "scaling_available_frequencies" to steps.joinToString(" "),
+                    "scaling_min_freq" to steps.first().toString(), "scaling_max_freq" to steps.last().toString(), "scaling_cur_freq" to steps.last().toString(),
+                    "cpuinfo_min_freq" to steps.first().toString(), "cpuinfo_max_freq" to steps.last().toString(), "cpuinfo_cur_freq" to steps.last().toString(),
+                )) {
+                    File(cf, name).let { f ->
+                        if (!f.isFile || (name != "scaling_governor" && f.readText().trim() != v) || f.length() == 0L) f.writeText(v + "\n")
+                        f.setReadable(true, false); f.setWritable(true, false)
+                    }
+                }
+                val tis = File(cf, "stats/time_in_state")
+                val table = steps.joinToString("\n") { "$it 0" } + "\n"
+                if (!tis.isFile || tis.readText() != table) { tis.parentFile?.mkdirs(); tis.writeText(table) }
+                tis.setReadable(true, false)
+                // one directory per core, online: apps size their thread pools by counting cpuN here
+                File(cpu, "cpu$n/online").let { if (!it.isFile) it.writeText("1\n") }
+            }
+        }.onFailure { log("sysfs: cannot create cpufreq nodes: ${it.message}") }
+        // cores of an earlier, larger chip choice
+        for (n in cpus until SocProfiles.MAX_CORES) File(cpu, "cpu$n").takeIf { it.exists() }?.let { wipe(it) }
         for ((n, v) in listOf("present" to "0-${cpus - 1}", "possible" to "0-${cpus - 1}", "online" to "0-${cpus - 1}", "offline" to "")) {
-            File(cpu, n).let { if (!it.isFile) it.writeText(v + "\n") }
+            File(cpu, n).let { if (!it.isFile || it.readText().trim() != v) it.writeText(v + "\n") }
         }
-        // one directory per core: apps size their thread pools by counting cpuN here (MIUI File Manager of 13 saw one
-        // core, and its only pool thread waited for the tasks it had queued behind itself)
-        for (n in 0 until cpus) File(cpu, "cpu$n/online").let { if (!it.isFile) { it.parentFile?.mkdirs(); it.writeText("1\n") } }
+    }
+
+    /**
+     * /sys/devices/soc0 of the chip the VM reports (AEmulator Plus .17): family, machine, soc_id,
+     * revision and serial_number, the attributes a kernel's soc_device gives. Files an earlier
+     * choice made and this one does not set are removed. The phone's own serial_number is never
+     * copied (SocProfiles keeps it out of the host record). Real regular files, like every other
+     * node the guest reads here.
+     */
+    private fun socNodes(soc: SocResolved) = runCatching {
+        val dir = File(root, "sys/devices/soc0")
+        val files = soc.soc0
+        for (n in listOf("family", "machine", "soc_id", "revision", "serial_number")) if (n !in files) File(dir, n).takeIf { it.exists() || isLink(it) }?.let { wipe(it) }
+        if (files.isEmpty()) { dir.delete(); return@runCatching }
+        dir.mkdirs()
+        run { var d: File? = dir; while (d != null && d != root && d.path.startsWith(root.path)) { d.setReadable(true, false); d.setExecutable(true, false); d = d.parentFile } }
+        for ((n, v) in files) runCatching {
+            val f = File(dir, n)
+            if (isLink(f) || f.isDirectory) wipe(f)
+            if (!f.isFile || f.readText() != v + "\n") f.writeText(v + "\n")
+            Os.chmod(f.path, 0b110_100_100)
+        }.onFailure { log("sysfs: cannot create /sys/devices/soc0/$n: ${it.message}") }
+        log("soc: /sys/devices/soc0 has ${files.keys.joinToString(",")}")
+    }.onFailure { log("soc: cannot write /sys/devices/soc0: ${it.message}") }
+
+    private fun makeSysNodes() {
+        val soc = socPreset
+        if (soc != null) {
+            // a SoC preset is in force: the core count, the cpufreq tables and /sys/devices/soc0 all
+            // come from the one resolved record (AEmulator Plus .17), not from the phone + fixed table
+            socCpuNodes(soc)
+            socNodes(soc)
+        } else {
+            val freq = File(root, "sys/devices/system/cpu/cpu0/cpufreq/stats/time_in_state")
+            if (!freq.isFile) {
+                freq.parentFile?.mkdirs()
+                freq.writeText(listOf(384000, 594000, 810000, 1026000, 1242000, 1512000).joinToString("\n") { "$it 0" } + "\n")
+            }
+            val cpus = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
+            val cpu = File(root, "sys/devices/system/cpu").apply { mkdirs() }
+            for ((n, v) in listOf("present" to "0-${cpus - 1}", "possible" to "0-${cpus - 1}", "online" to "0-${cpus - 1}", "offline" to "")) {
+                File(cpu, n).let { if (!it.isFile) it.writeText(v + "\n") }
+            }
+            // one directory per core: apps size their thread pools by counting cpuN here (MIUI File Manager of 13 saw one
+            // core, and its only pool thread waited for the tasks it had queued behind itself)
+            for (n in 0 until cpus) File(cpu, "cpu$n/online").let { if (!it.isFile) { it.parentFile?.mkdirs(); it.writeText("1\n") } }
+        }
         File(root, "sys/class/net/lo").mkdirs()
         if (engine == Engine.N64 && kernel.cgroup2Root) {
             File(root, "sys/fs/cgroup").mkdirs()
