@@ -5,6 +5,9 @@
  *    TWRP checks "is it mounted" by comparing st_dev of <mount point>/. and <mount point>/../. —
  *    equal, so it mounts recursively. For mount points in AEMU_MOUNTS ("/sdcard:/data:…")
  *    stat(), stat64(), lstat(), lstat64(), fstatat() report another device ID via XOR 0x5a5a.
+ *    The flip is stateful: umount() records the point as unmounted (in /tmp/aemu_unmounted,
+ *    shared with the child processes a recovery forks) and the flip stops for it, mount()
+ *    restores it — a checker that umounts and re-stats must see the point as unmounted.
  * 2. /proc/mounts and /proc/self/mounts are redirected to /tmp/aemu_mounts where the host
  *    sets up mounted entries for /system, /data, /cache, /sdcard.
  * 3. Linux evdev ioctl support: minui, TWRP and OrangeFox query input devices (/dev/input/event0)
@@ -30,6 +33,7 @@ __attribute__((naked, noinline)) static long sys4(long n, long a, long b, long c
     __asm__ volatile("mov x8, x0; mov x0, x1; mov x1, x2; mov x2, x3; mov x3, x4; svc #0; ret");
 }
 #define SYS_write 64
+#define SYS_read 63
 #define SYS_close 57
 #define SYS_ioctl 29
 static long k_stat(const char *p, void *st) { return sys4(79 /* fstatat */, -100, (long)p, (long)st, 0); }
@@ -55,6 +59,7 @@ __attribute__((naked, noinline)) static long sys4(long n, long a, long b, long c
     );
 }
 #define SYS_write 4
+#define SYS_read 3
 #define SYS_close 6
 #define SYS_ioctl 54
 static long k_stat(const char *p, void *st) { return sys3(195 /* stat64 */, (long)p, (long)st, 0); }
@@ -86,14 +91,12 @@ static int get_env_int(const char *key, int def) {
     return val > 0 ? val : def;
 }
 
-/* p is exactly "<mount point>/." for one of the AEMU_MOUNTS entries */
-static int mount_dot(const char *p) {
+static int strlen_(const char *p) { int n = 0; while (p[n]) n++; return n; }
+
+/* the first len bytes of p equal one of the AEMU_MOUNTS entries */
+static int list_has(const char *p, int len) {
     const char *list = env("AEMU_MOUNTS");
-    if (!list || !p) return 0;
-    int n = 0;
-    while (p[n]) n++;
-    if (n < 3 || p[n - 1] != '.' || p[n - 2] != '/') return 0;
-    int len = n - 2;
+    if (!list) return 0;
     const char *s = list;
     while (*s) {
         const char *e = s;
@@ -108,10 +111,122 @@ static int mount_dot(const char *p) {
     return 0;
 }
 
+/* p is exactly "<mount point>/." for one of the AEMU_MOUNTS entries */
+static int mount_dot(const char *p) {
+    if (!p) return 0;
+    int n = strlen_(p);
+    if (n < 3 || p[n - 1] != '.' || p[n - 2] != '/') return 0;
+    return list_has(p, n - 2);
+}
+
+/* length of p as a mount point: trailing '/' stripped (but "/" itself stays) */
+static int point_len(const char *p) {
+    int n = strlen_(p);
+    while (n > 1 && p[n - 1] == '/') n--;
+    return n;
+}
+
+/* p's first len bytes are exactly one of the AEMU_MOUNTS entries */
+static int is_mount_point(const char *p, int len) { return list_has(p, len); }
+
+/*
+ * The "unmounted" set behind the stateful st_dev flip. umount() of a listed mount
+ * point adds it here and the flip stops for it; mount() removes it and the flip
+ * resumes. The set is carried by a file in the recovery's /tmp so the child
+ * processes a recovery forks (the zip's update-binary above all) read the same
+ * state; the in-process copy below mirrors it and is the fallback when the file
+ * cannot be written. Initially the set is empty: every listed point flips, as
+ * before — a recovery still boots into "all partitions mounted".
+ */
+#define AEMU_UNMOUNTED_FILE "/tmp/aemu_unmounted"
+#define AEMU_SET_MAX 16
+#define AEMU_MP_MAX 64
+static char unmounted_set[AEMU_SET_MAX][AEMU_MP_MAX];
+static int unmounted_n = -1;   /* -1: not loaded yet */
+
+static void unmounted_load(void) {
+    if (unmounted_n >= 0) return;
+    unmounted_n = 0;
+    long fd = k_open(AEMU_UNMOUNTED_FILE, 0 /* O_RDONLY */, 0);
+    if (fd < 0) return;
+    char buf[1024];
+    long n = sys3(SYS_read, fd, (long)buf, sizeof(buf) - 1);
+    sys3(SYS_close, fd, 0, 0);
+    if (n <= 0) return;
+    int i = 0;
+    while (i < n && unmounted_n < AEMU_SET_MAX) {
+        int j = i;
+        while (j < n && buf[j] != '\n') j++;
+        int len = (int)(j - i);
+        if (len > 0 && len < AEMU_MP_MAX) {
+            int k = 0;
+            while (k < len) { unmounted_set[unmounted_n][k] = buf[i + k]; k++; }
+            unmounted_set[unmounted_n][len] = 0;
+            unmounted_n++;
+        }
+        i = j + 1;
+    }
+}
+
+static void unmounted_save(void) {
+    char buf[1024]; int n = 0;
+    for (int i = 0; i < unmounted_n; i++) {
+        const char *mp = unmounted_set[i];
+        while (*mp && n < (int)sizeof(buf) - 2) buf[n++] = *mp++;
+        buf[n++] = '\n';
+    }
+    long fd = k_open(AEMU_UNMOUNTED_FILE, 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0666);
+    if (fd < 0) return;   /* the in-process set still carries this process */
+    sys3(SYS_write, fd, (long)buf, n);
+    sys3(SYS_close, fd, 0, 0);
+}
+
+static int unmounted_has(const char *mp, int len) {
+    unmounted_load();
+    for (int i = 0; i < unmounted_n; i++) {
+        const char *s = unmounted_set[i];
+        int j = 0;
+        while (j < len && s[j] && s[j] == mp[j]) j++;
+        if (j == len && s[j] == 0) return 1;
+    }
+    return 0;
+}
+
+static void unmounted_add(const char *mp, int len) {
+    if (len <= 0 || len >= AEMU_MP_MAX || unmounted_has(mp, len)) return;
+    if (unmounted_n >= AEMU_SET_MAX) return;
+    int k = 0;
+    while (k < len) { unmounted_set[unmounted_n][k] = mp[k]; k++; }
+    unmounted_set[unmounted_n][len] = 0;
+    unmounted_n++;
+    unmounted_save();
+}
+
+static void unmounted_remove(const char *mp, int len) {
+    unmounted_load();
+    for (int i = 0; i < unmounted_n; i++) {
+        const char *s = unmounted_set[i];
+        int j = 0;
+        while (j < len && s[j] && s[j] == mp[j]) j++;
+        if (j == len && s[j] == 0) {
+            unmounted_n--;
+            for (int k = 0; k < AEMU_MP_MAX; k++) unmounted_set[i][k] = unmounted_set[unmounted_n][k];
+            unmounted_save();
+            return;
+        }
+    }
+}
+
+/* stat() of "<mount point>/." flips st_dev — unless the point was unmounted */
+static int flip_dev(const char *path) {
+    if (!mount_dot(path)) return 0;
+    return !unmounted_has(path, strlen_(path) - 2);
+}
+
 EXPORT int stat(const char *path, void *st) {
     long r = k_stat(path, st);
     if (r < 0) return fail(r);
-    if (mount_dot(path)) *(unsigned long long *)st ^= 0x5a5aULL;   /* st_dev: "another filesystem" */
+    if (flip_dev(path)) *(unsigned long long *)st ^= 0x5a5aULL;   /* st_dev: "another filesystem" */
     return 0;
 }
 EXPORT int stat64(const char *path, void *st) { return stat(path, st); }
@@ -119,7 +234,7 @@ EXPORT int stat64(const char *path, void *st) { return stat(path, st); }
 EXPORT int lstat(const char *path, void *st) {
     long r = k_lstat(path, st);
     if (r < 0) return fail(r);
-    if (mount_dot(path)) *(unsigned long long *)st ^= 0x5a5aULL;
+    if (flip_dev(path)) *(unsigned long long *)st ^= 0x5a5aULL;
     return 0;
 }
 EXPORT int lstat64(const char *path, void *st) { return lstat(path, st); }
@@ -127,7 +242,7 @@ EXPORT int lstat64(const char *path, void *st) { return lstat(path, st); }
 EXPORT int fstatat(int dirfd, const char *path, void *st, int flags) {
     long r = k_fstatat(dirfd, path, st, flags);
     if (r < 0) return fail(r);
-    if (mount_dot(path)) *(unsigned long long *)st ^= 0x5a5aULL;
+    if (flip_dev(path)) *(unsigned long long *)st ^= 0x5a5aULL;
     return 0;
 }
 EXPORT int fstatat64(int dirfd, const char *path, void *st, int flags) {
@@ -338,11 +453,18 @@ EXPORT int android_reboot(int cmd, int flags, char *arg) {
     return 0;
 }
 
-/* the app sandbox kills the process on umount (seccomp); partitions are the host's folders anyway */
+/* the app sandbox kills the process on umount (seccomp); partitions are the host's folders anyway.
+ * mount/umount still keep the unmounted set above in step, so the st_dev flip a checker
+ * re-stats after umount tells the truth about the point's state. */
 EXPORT int mount(const char *src, const char *target, const char *type, unsigned long flags, const void *data) {
-    (void)src; (void)target; (void)type; (void)flags; (void)data; return 0;
+    (void)src; (void)type; (void)flags; (void)data;
+    if (target && is_mount_point(target, point_len(target))) unmounted_remove(target, point_len(target));
+    return 0;
 }
-EXPORT int umount(const char *target) { (void)target; return 0; }
-EXPORT int umount2(const char *target, int flags) { (void)target; (void)flags; return 0; }
+EXPORT int umount(const char *target) {
+    if (target && is_mount_point(target, point_len(target))) unmounted_add(target, point_len(target));
+    return 0;
+}
+EXPORT int umount2(const char *target, int flags) { (void)flags; return umount(target); }
 EXPORT int swapon(const char *path, int swapflags) { (void)path; (void)swapflags; return 0; }
 EXPORT int swapoff(const char *path) { (void)path; return 0; }
