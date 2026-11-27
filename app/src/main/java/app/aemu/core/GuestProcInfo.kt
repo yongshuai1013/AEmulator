@@ -85,6 +85,34 @@ object GuestProcInfo {
         return parts.joinToString(" ")
     }
 
+    /**
+     * The SoC preset in force for [img] (AEmulator Plus .17 port, see [SocProfiles]): the resolved chip
+     * when the image's soc setting names one (a preset id, "host" or "custom" — the importer also
+     * pre-fills it from the firmware's own platform), or null when the setting is blank.
+     *
+     * Priority of the identity sources, per surface: with a preset in force, /proc/cpuinfo, the
+     * /sys/devices/soc0 files, the cpu/cpufreq nodes and the SoC properties (ro.board.platform,
+     * ro.hardware.chipname, ro.soc.*) all come from the one resolved record, exactly as upstream.
+     * With the setting blank, every one of those keeps this tree's previous answer — cpuinfo derived
+     * from the image's own platform (never the host's), the host-count cpu nodes, no soc0 nodes, no
+     * SoC properties. Upstream's blank-means-host default is deliberately NOT ported: the preset is
+     * an additional, explicitly chosen source, never a silent replacement. The other identity cells
+     * (model/build from build.prop, the kernel banner, the baseband and carrier settings) are not
+     * SocSpec fields and are untouched either way.
+     */
+    fun socResolved(img: GuestImage, root: File): SocResolved? {
+        val s = img.settings
+        if (s.soc.isBlank()) return null
+        return SocProfiles.resolve(
+            s.soc, s.socCustom, SocProfiles.isTangoTree(root, img.model, img.name),
+            guest32 = !img.abi.contains("64"), api = img.api, host = SocHost, isa = SocProfiles.isaOf(img.abi),
+        )
+    }
+
+    /** /proc/cpuinfo in force: the chosen preset's text, else the image's own ([cpuinfo]). */
+    fun effectiveCpuinfo(img: GuestImage, root: File): String =
+        socResolved(img, root)?.cpuinfo ?: cpuinfo(img, root)
+
     /** The SoC platform the image names for itself (ro.board.platform of its build.prop). */
     fun platform(img: GuestImage, root: File): String {
         val p = imageProps(root)
