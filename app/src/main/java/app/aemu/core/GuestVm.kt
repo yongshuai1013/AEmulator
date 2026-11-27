@@ -102,7 +102,16 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     @Volatile var failure: String? = null
         private set
     @Volatile var surface: Surface? = null
-        set(v) { field = v; if (engine == Engine.KK) GlBridge.surface(v) else if (engine == Engine.N64 && kernel.gpuBridge64) GlHost.surface(v) }
+        set(v) {
+            field = v
+            // (the open bridge's host renderer, GlHost, shows the frames: ARM guests of 2.0+ on both 32-bit engines, as on the
+            // native engine; ported from Plus .17)
+            if (openBridge) GlHost.surface(v)
+            else if (engine == Engine.KK) GlBridge.surface(v) else if (engine == Engine.N64 && kernel.gpuBridge64) GlHost.surface(v)
+        }
+
+    /** Ported from Plus .17 (2026-11-25): this guest draws through the open GPU bridge (GlHost) and not through the engine's glserverd, see [OpenGl] */
+    private val openBridge: Boolean get() = OpenGl.any(ctx, img, paths.dir)
 
     private val lines = CopyOnWriteArrayList<String>()
     private val listeners = CopyOnWriteArrayList<(String) -> Unit>()
@@ -486,6 +495,17 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             val r = GlHost.start(paths.socket("aemu_gl").absolutePath)
             log("open GPU bridge (32-bit): $r")
             if (r.startsWith("ok")) overrides["debug.aemu.gl"] = File(paths.dir, "glopen").readText().trim().takeIf { it.isNotEmpty() } ?: "2"
+        }
+        // Ported from Plus .17 (2026-11-20/25): the open bridge (TreeFixer.eglConfig planted the armv7 driver as the guest's whole
+        // EGL, "solo" mode): every context, SurfaceFlinger's too, goes to the host renderer. (Not ported with it: GlHost.identity -
+        // this tree's GlHost has no GPU rename - and the debug.aemu.fbpost override, which belongs to the hwc1fb composer this
+        // tree does not ship.)
+        if (s.gpu && openBridge && File(paths.root, OpenGl.driverPath(img.api)).isFile) {
+            paths.socket("aemu_gl").parentFile?.mkdirs()
+            val r = GlHost.start(paths.socket("aemu_gl").absolutePath)
+            log("GPU bridge (open bridge): $r")
+            glBridge = r.startsWith("ok"); glInfo = r
+            if (!glBridge) log("GPU bridge: the host renderer did not start; the guest will find no GL")
         }
         // 7.0+ libEGL ignores egl.cfg and takes the first libGLES_*.so it finds; without the bridge: the software one
         if (img.api >= 24 && !s.gpu) {
@@ -958,12 +978,25 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 }
             }
             Engine.GB -> {
+                if (openBridge) {
+                    // Ported from Plus .17 (2026-11-25): the host renderer (GlHost) was started in settings preparation; there is no glserverd
+                    // slot and no fb0 writer of its own: frames go into the guest's window buffers and its gralloc posts them to fb0
+                    log("GPU bridge: open bridge, served by the host renderer (no glserverd)")
+                    return
+                }
                 Slot.start(ctx, GlSlot::class.java,
                     listOf("glserverd", "-s", paths.glSock.absolutePath, "-fb", paths.fb.absolutePath, "-w", "$w", "-h", "$h"),
                     emptyMap(), paths.log("glserverd"))
                 waitFor("GL bridge socket", 10_000) { paths.glSock.exists() }
             }
             Engine.KK -> {
+                if (openBridge) {
+                    // Ported from Plus .17: the host renderer (GlHost) was started in settings preparation; it needs the screen surface
+                    // before the first frame (no wait for the screen surface: the setter above hands it to GlHost whenever it arrives)
+                    log("GPU bridge: open bridge, served by the host renderer (no glserverd)")
+                    surface?.let { GlHost.surface(it) }
+                    return
+                }
                 if (surface == null) waitFor("screen surface", 10_000) { surface != null }
                 val sf = surface
                 HostNative.relaxFdsanSafe()
