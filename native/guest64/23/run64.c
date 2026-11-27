@@ -41,7 +41,7 @@ enum {
     NR_setresgid = 149, NR_getresgid = 150, NR_setfsuid = 151, NR_setfsgid = 152, NR_getgroups = 158, NR_setgroups = 159,
     NR_uname = 160, NR_prctl = 167, NR_getpid = 172, NR_getuid = 174, NR_geteuid = 175, NR_getgid = 176, NR_getegid = 177, NR_gettid = 178,
     NR_socket = 198, NR_socketpair = 199, NR_bind = 200, NR_connect = 203, NR_getsockname = 204, NR_sendto = 206, NR_recvfrom = 207, NR_setsockopt = 208, NR_getsockopt = 209,
-    NR_sendmsg = 211, NR_recvmsg = 212, NR_munmap = 215, NR_execve = 221, NR_mmap = 222, NR_mprotect = 226,
+    NR_shutdown = 210, NR_sendmsg = 211, NR_recvmsg = 212, NR_munmap = 215, NR_execve = 221, NR_mmap = 222, NR_mprotect = 226,
     NR_renameat2 = 276, NR_memfd_create = 279, NR_statx = 291,
 };
 
@@ -1223,6 +1223,78 @@ static void hub_put16(u8 *p, u32 v) { p[0] = (u8)v; p[1] = (u8)(v >> 8); }
 
 // ---- hub state keeping
 
+// ---- the detour registry (lch1, lifecycle-hardening-spec section 3): what this process
+// detoured, and its active teardown when the session ends.
+//
+// At flow-ok the guest's descriptor is dup3'ed onto the socketpair whose other end the hub
+// holds, and until now that was the last the supervisor knew of the connection: its teardown
+// was entirely the hub's business. This registry is the supervisor's own copy — the descriptor
+// number, the socket's inode (a descriptor number alone is not an identity: it can be closed
+// and reused while an entry lingers), and the generation of the session that was up when the
+// detour was made (the per-process count of synced up-edges, bumped in hub_handle). When the
+// session's end reaches this process — a SESSION_DOWN frame, a state sync that finds it down,
+// or the hub itself going away (hub_dead: the far ends' registry died with it) — the sweep
+// shuts every registered connection down: the guest reads EOF, writes EPIPE and polls HUP,
+// exactly a torn-down connection, while the descriptor stays the guest's own to close.
+// Entries whose descriptor no longer names the recorded socket (fstat fails, or the inode
+// moved) are dropped silently: a reused number is a stranger's descriptor, never touched.
+#define MAX_DTR 64
+static struct { int fd; u64 ino; u32 gen; } g_dtr[MAX_DTR];
+static u32 g_dtr_gen;                       // sessions this process has synced up, counted at the up-edge
+static volatile int g_dtr_lock;
+static int g_dtr_sweeps;                    // sweep log lines so far (cap 16 per process)
+
+static void dtr_lock(void) { while (__atomic_exchange_n(&g_dtr_lock, 1, __ATOMIC_ACQUIRE)) S0(NR_sched_yield); }
+static void dtr_unlock(void) { __atomic_store_n(&g_dtr_lock, 0, __ATOMIC_RELEASE); }
+
+static void dtr_note(int fd) {
+    struct kstat st;
+    u64 ino = 0;
+    if (S2(NR_fstat, fd, &st) == 0) ino = st.st_ino;
+    dtr_lock();
+    int free_i = -1;
+    for (int i = 0; i < MAX_DTR; i++) {
+        if (g_dtr[i].fd == fd) { g_dtr[i].ino = ino; g_dtr[i].gen = g_dtr_gen; dtr_unlock(); return; }
+        if (!g_dtr[i].fd && free_i < 0) free_i = i;
+    }
+    if (free_i >= 0) { g_dtr[free_i].fd = fd; g_dtr[free_i].ino = ino; g_dtr[free_i].gen = g_dtr_gen; }
+    dtr_unlock();
+}
+
+static void dtr_forget(int fd) {
+    dtr_lock();
+    for (int i = 0; i < MAX_DTR; i++) if (g_dtr[i].fd == fd) g_dtr[i].fd = 0;
+    dtr_unlock();
+}
+
+static void dtr_sweep(const char *why) {
+    int acted = 0;
+    dtr_lock();
+    for (int i = 0; i < MAX_DTR; i++) {
+        int fd = g_dtr[i].fd;
+        if (!fd) continue;
+        u64 ino = g_dtr[i].ino;
+        g_dtr[i].fd = 0;
+        struct kstat st;
+        if (!ino || S2(NR_fstat, fd, &st) < 0 || st.st_ino != ino) continue;   // closed or reused: not ours anymore
+        if (S2(NR_shutdown, fd, 2 /*SHUT_RDWR*/) == 0) acted++;
+    }
+    dtr_unlock();
+    if (g_dtr_sweeps < 16) {
+        g_dtr_sweeps++;
+        char line[256]; u64 o = 0;
+        r137_head(line, &o, 0);
+        tun_cat(line, &o, "detour-sweep why=");
+        tun_cat(line, &o, why);
+        tun_cat(line, &o, " n=");
+        tun_catn(line, &o, (u64)acted);
+        tun_cat(line, &o, " gen=");
+        tun_catn(line, &o, (u64)g_dtr_gen);
+        tun_cat(line, &o, " (this process's detoured connections of dead generations shut down)\n");
+        say(line);
+    }
+}
+
 // A session the hub reports over is over here too: drop the registry entry, so the by-name ioctls
 // stop answering for it. That is what lets the framework's own teardown check (its SIOCGIFFLAGS
 // probe of the interface) read "gone" and finish the disconnect the guest asked for.
@@ -1290,10 +1362,12 @@ static void hub_handle(u8 type, const u8 *pl, u64 len) {
         if (g_hub_sess.up && !was_up) {
             if (g_137r_seq_ok) { g_137r_seq++; g_137r_cur = g_137r_seq; }
             else g_137r_cur = -1;
+            g_dtr_gen++;
             r137_state_edge(1, g_137r_cur);
         } else if (!g_hub_sess.up && was_up) {
             g_137r_cur = 0;
             r137_state_edge(0, was_cur);
+            dtr_sweep("state-down");   // a session that ended while we were away is the same news (lch1)
         }
     } else if (type == HUB_SESSION_DOWN && len >= 16) {
         char name[16];
@@ -1306,6 +1380,7 @@ static void hub_handle(u8 type, const u8 *pl, u64 len) {
           tun_cat(line, &o, "\n");
           say(line); }
         hub_session_gone(name);
+        dtr_sweep("session-down");   // this process's detoured connections die with the session (lch1)
         g_137r_cur = 0;
     }
 }
@@ -1331,6 +1406,7 @@ static void hub_dead(void) {
             hub_log1("hub connection lost; session ", g_tun[s].name);
         }
     }
+    dtr_sweep("hub-lost");   // the far ends' registry died with the hub; the guest ends die here (lch1)
 }
 
 // Drain whatever the hub sent, without ever blocking: called at every trap entry, it is how a
@@ -1622,6 +1698,7 @@ static int hub_maybe_detour(int fd, const u8 *sa, u64 salen, long *out) {
     if (r < 0) { *out = r; return 1; }
     if (!g_hub_logged) { g_hub_logged = 1; hub_log1("detouring guest connections into the tunnel (this process)", ""); }
     r137_detour("flow-ok", sa, (long)flow, g_sock[si].port);
+    dtr_note(fd);   // the supervisor's own copy of the detour, for the sweep at the session's end (lch1)
     *out = 0;
     return 1;
 }
@@ -2903,7 +2980,7 @@ static int rl_trap_begin(void) {                  // yi': >=0 = run this trap ou
     if (i < 0 || g_rl_depth[i] <= 0) return -1;   // not in a relay: nothing changes
     if (g_rl_onstk[i]) return -1;                 // already out there: a nested trap rides the same big stack
     if (__atomic_exchange_n(&g_fm_said, 1, __ATOMIC_ACQ_REL) == 0)
-        say("aemu-137r: mode bigstack+faultmap+fdlen3+fix1r+m2 (yi' restored; fdlen by fd-number fstat sweep; ashmem mmap size gates, fd-routed; m2 setsize/mmap size prints)\n");
+        say("aemu-137r: mode bigstack+faultmap+fdlen3+fix1r+m2+lch1 (yi' restored; fdlen by fd-number fstat sweep; ashmem mmap size gates, fd-routed; m2 setsize/mmap size prints; lifecycle: detour sweep on down/hub-loss)\n");
     if (!g_rl_stk[i]) g_rl_stk[i] = rl_mmap_stack();
     if (!g_rl_stk[i]) return -1;                  // no stack to give: the pre-fix behaviour
     g_rl_onstk[i] = 1;
@@ -3206,7 +3283,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
                 S2(NR_fstat, a[0], &st) == 0 && (st.st_mode & 0170000) == 0020000 && st.st_rdev == 0x103) return a[1];
         }
         { int was_nl = is_nl_fd((int)a[1]); int had_reg = linkreg_has((int)a[1]);
-          long r = S3(nr, a[0], a[1], a[2]); if (r >= 0) { sock_forget((int)a[1]); hub_linkunreg((int)a[1]); if (was_nl && !had_reg) r137_unreg_miss((int)a[1]); } return r; }
+          long r = S3(nr, a[0], a[1], a[2]); if (r >= 0) { sock_forget((int)a[1]); dtr_forget((int)a[1]); hub_linkunreg((int)a[1]); if (was_nl && !had_reg) r137_unreg_miss((int)a[1]); } return r; }
     }
     case NR_ptrace: {
         // observed, never mediated (iso-shadow): the request is performed exactly as made, and
@@ -3222,6 +3299,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         if (was_nl) nl_close((int)a[0]);
         if (is_tun_fd((int)a[0])) { say("aemu-tun: the framework closed its tun descriptor (the session ends when the channel runs dry)"); r137_tun_close((int)a[0]); }
         sock_forget((int)a[0]);
+        dtr_forget((int)a[0]);
         nlreq_drop((int)a[0]);
         int had_reg = linkreg_has((int)a[0]);
         hub_linkunreg((int)a[0]);
