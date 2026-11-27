@@ -107,7 +107,7 @@ class GuestScreen(ctx: Context, private val w: Int, private val h: Int) : View(c
         val pixels = w.toLong() * h * (if (format == 0) 2 else 4)
         if (buf != null) {
             val ino = runCatching { android.system.Os.stat(f.absolutePath).st_ino }.getOrDefault(0L)
-            if (ino != mappedIno || mappedIno == -1L) { runCatching { raf?.close() }; raf = null; buf = null; bmp = null; lastHash = 0 }
+            if (ino != mappedIno || mappedIno == -1L) { runCatching { raf?.close() }; raf = null; buf = null; bmp = null; lastHash = 0; pageHash.fill(0); page = 0 }
         }
         if (buf == null) {
             if (!f.isFile || f.length() < pixels) return
