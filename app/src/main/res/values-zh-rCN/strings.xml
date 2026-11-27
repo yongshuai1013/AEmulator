@@ -125,6 +125,10 @@
     <string name="m_reboot">Reboot</string>
     <string name="m_clip_empty">Clipboard is empty</string>
     <string name="m_screenshot_saved">Saved: %1$s</string>
+    <string name="m_save_logs">将日志保存到“下载”文件夹</string>
+    <string name="m_save_logs_start">正在保存日志…</string>
+    <string name="m_save_logs_ok">日志已保存：%1$s</string>
+    <string name="m_save_logs_fail">无法保存日志：%1$s</string>
     <string name="m_failed">Failed</string>
     <string name="m_sms_sent">SMS delivered to inbox</string>
     <string name="m_sms_from">From</string>
