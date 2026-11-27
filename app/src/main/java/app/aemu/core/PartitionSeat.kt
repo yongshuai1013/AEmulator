@@ -48,24 +48,75 @@ object PartitionSeat {
     /** Partitions whose body exists as a directory of this root. */
     private fun present(root: File): List<String> = PARTITIONS.filter { File(root, it).isDirectory }
 
+    /** by-name references in a fstab text: (by-name directory, partition name), guest-absolute. */
+    private val byNameRef = Regex("""(/dev/\S+?/by-name)/(\S+)""")
+
+    /**
+     * The fstab texts that spell this guest's by-name paths: the system's own fstab in the
+     * tree and in the kept ramdisk, and the recovery's /etc/recovery.fstab. The parent
+     * directory is never hardcoded — firmwares disagree (angler's TWRP looks under
+     * /dev/block/platform/soc.0/<sdhci>/by-name, not bootdevice), so it is read from the
+     * guest's own tables.
+     */
+    private fun fstabTexts(root: File, paths: VmPaths): List<String> {
+        val files = mutableListOf<File>()
+        fun fstabsOf(dir: File) {
+            dir.listFiles()?.filter { it.isFile && it.name.startsWith("fstab.") }?.let { files += it }
+        }
+        fstabsOf(root)
+        fstabsOf(paths.root)
+        fstabsOf(bootRamdiskDir(paths))
+        files += File(root, "etc/recovery.fstab")
+        files += File(paths.dir, "recovery/etc/recovery.fstab")
+        return files.distinctBy { it.path }.mapNotNull { runCatching { it.readText() }.getOrNull() }
+    }
+
+    /** Every by-name directory the guest's tables reference (guest-absolute), parsed ones first. */
+    fun byNameDirs(root: File, paths: VmPaths): List<String> {
+        val parsed = fstabTexts(root, paths)
+            .flatMap { t -> byNameRef.findAll(t).map { it.groupValues[1] }.toList() }
+            .distinct()
+        return parsed + listOf("/dev/block/bootdevice/by-name").filter { it !in parsed }
+    }
+
+    /** The by-name parent the guest's own tables use — presentation elsewhere must agree with it. */
+    fun byNameParent(root: File, paths: VmPaths): String = byNameDirs(root, paths).first()
+
+    /** Partition names the guest's tables reference through by-name paths. */
+    private fun fstabNames(root: File, paths: VmPaths): Set<String> =
+        fstabTexts(root, paths)
+            .flatMap { t -> byNameRef.findAll(t).map { it.groupValues[2] }.toList() }
+            .toSet()
+
     /**
      * The by-name device nodes inside [root]: boot (and recovery, when a raw image
      * was kept) point at the real image files — a script dd-ing the boot partition patches
      * the very file the next seat boot unpacks — the rest at their partition directories.
+     * The same links are planted under every by-name parent the guest's own fstab uses
+     * and under the historical bootdevice parent, because consumers look under the one
+     * their table spells. Names the tables reference that have a body in this root
+     * (misc, metadata, …) are planted too; names without a body are not invented.
      */
     fun plantByName(root: File, paths: VmPaths, log: (String) -> Unit = {}) {
-        val dir = File(root, "dev/block/bootdevice/by-name")
         runCatching {
-            dir.mkdirs()
-            fun link(name: String, target: File) {
-                val f = File(dir, name)
-                f.delete()
-                runCatching { Os.symlink(target.absolutePath, f.path) }
+            val bodies = linkedMapOf<String, File>()
+            if (bootImage(paths).isFile) bodies["boot"] = bootImage(paths)
+            File(paths.dir, "recovery.img").takeIf { it.isFile }?.let { bodies["recovery"] = it }
+            for (p in present(root)) bodies[byName(p)] = File(root, p)
+            for (n in fstabNames(root, paths)) {
+                if (n !in bodies) File(root, n).takeIf { it.isDirectory }?.let { bodies[n] = it }
             }
-            if (bootImage(paths).isFile) link("boot", bootImage(paths))
-            File(paths.dir, "recovery.img").takeIf { it.isFile }?.let { link("recovery", it) }
-            for (p in present(root)) link(byName(p), File(root, p))
-            log("seat: by-name devices planted in ${root.name} (${present(root).joinToString()})")
+            val dirs = byNameDirs(root, paths)
+            for (d in dirs) {
+                val dir = File(root, d.trimStart('/'))
+                dir.mkdirs()
+                for ((name, target) in bodies) {
+                    val f = File(dir, name)
+                    f.delete()
+                    runCatching { Os.symlink(target.absolutePath, f.path) }
+                }
+            }
+            log("seat: by-name devices planted in ${root.name} (${bodies.keys.joinToString()}) under ${dirs.joinToString()}")
         }.onFailure { log("seat: planting by-name devices failed: ${it.message}") }
     }
 
