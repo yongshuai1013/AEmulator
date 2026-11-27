@@ -2030,12 +2030,30 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }
     }
 
+    /** sha256 of a file in this tree, or null when it cannot be read. */
+    private fun sha256Hex(f: File): String? = runCatching {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        f.inputStream().use { ins ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = ins.read(buf)
+                if (n < 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        md.digest().joinToString("") { "%02x".format(it) }
+    }.getOrNull()
+
     /**
      * sys.boot_completed: the agent's inbox app (the AEmuImport list inside the guest). Staged through data/local/tmp, a plain tree directory the installer reads fine —
-     * when it is missing or its versionCode differs from the delivered copy (length alone is not the gate:
-     * two builds can share a length — 1.3 and 1.4 both landed on 24,973 bytes — and a length-only gate
-     * then skips the update forever; length is only the fallback for when a versionCode cannot be read).
-     * A replace install the package
+     * installed when it is missing or its bytes differ from the delivered copy. The gate is the
+     * content hash, not a number: the versionCode gate this replaces slept through a whole agent
+     * rebuild because the manifest number did not move with the code (the gate2 egress prints
+     * shipped in the tree for two field runs and were never installed), and the length gate before
+     * that collided (1.3 and 1.4 both landed on 24,973 bytes). The installed apk is a file in this
+     * same tree — the guest's /data is the tree's data/ — so both hashes are taken host-side with
+     * the same code. versionCode stays as the auxiliary fallback for when a hash cannot be read on
+     * either side, length behind it. A replace install the package
      * manager refuses falls back to an uninstall and a fresh install: the app is signed by a key its build
      * generates on the spot (the keystore is gitignored, so no two builds share one) and pm will not replace
      * across signatures, which would otherwise pin the guest to the first build's copy forever. The app
@@ -2050,18 +2068,29 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             val pkgPath = guestShell("pm path ${AgentSupport.APP_PACKAGE}", 60_000).lines()
                 .firstOrNull { it.startsWith("package:") }?.removePrefix("package:")?.trim()
             if (pkgPath != null) {
-                val installedCode = Regex("""versionCode=(\d+)""")
-                    .find(guestShell("dumpsys package ${AgentSupport.APP_PACKAGE}", 60_000))
-                    ?.groupValues?.get(1)?.toIntOrNull()
-                val stagedCode = runCatching {
-                    ctx.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)?.versionCode
-                }.getOrNull()
-                if (installedCode != null && stagedCode != null) {
-                    if (installedCode == stagedCode) return
-                    log("agent: inbox app versionCode $installedCode, delivered $stagedCode: updating")
+                val stagedHash = sha256Hex(apk)
+                val installedFile = File(paths.root, pkgPath.removePrefix("/"))
+                val installedHash = if (installedFile.isFile) sha256Hex(installedFile) else null
+                if (stagedHash != null && installedHash != null) {
+                    if (stagedHash == installedHash) {
+                        log("agent: inbox app already at the delivered bytes (sha256 ${stagedHash.take(12)}…)")
+                        return
+                    }
+                    log("agent: inbox app bytes differ (installed ${installedHash.take(12)}…, delivered ${stagedHash.take(12)}…): updating")
                 } else {
-                    val guestLen = guestShell("wc -c < $pkgPath", 30_000).trim().toLongOrNull()
-                    if (guestLen == apk.length()) return
+                    val installedCode = Regex("""versionCode=(\d+)""")
+                        .find(guestShell("dumpsys package ${AgentSupport.APP_PACKAGE}", 60_000))
+                        ?.groupValues?.get(1)?.toIntOrNull()
+                    val stagedCode = runCatching {
+                        ctx.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)?.versionCode
+                    }.getOrNull()
+                    if (installedCode != null && stagedCode != null) {
+                        if (installedCode == stagedCode) return
+                        log("agent: inbox app versionCode $installedCode, delivered $stagedCode: updating")
+                    } else {
+                        val guestLen = guestShell("wc -c < $pkgPath", 30_000).trim().toLongOrNull()
+                        if (guestLen == apk.length()) return
+                    }
                 }
             }
             val staged = File(paths.root, "data/local/tmp").apply { mkdirs() }.let { File(it, "aemu-agent.apk") }
