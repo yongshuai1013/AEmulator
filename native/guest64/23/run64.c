@@ -2832,15 +2832,24 @@ static int rl_enter(void) {                       // the depth in place BEFORE t
     return __atomic_fetch_add(&g_rl_depth[i], 1, __ATOMIC_ACQ_REL);
 }
 
-static int rl_leave(void) {                       // the finished outermost relay's skip count; -1 when not outermost/unmarked
+static int rl_leave(int *bigp) {                  // the finished outermost relay's skip count; -1 when not outermost/unmarked
     long tid = S0(NR_gettid);
     int i = rl_find(tid);
     if (i < 0) return -1;
     if (__atomic_fetch_sub(&g_rl_depth[i], 1, __ATOMIC_ACQ_REL) != 1) return -1;
     int sk = g_rl_skip[i];
+    if (bigp) *bigp = g_rl_big[i];                // yi': the big-stack trap count rides out beside the skip count
     g_rl_skip[i] = 0;
+    g_rl_big[i] = 0;
+    g_rl_onstk[i] = 0;
     __atomic_store_n(&g_rl_tid[i], 0L, __ATOMIC_RELEASE);
     return sk;
+}
+
+static void rl_counts(int *sk, int *big) {        // this thread's in-flight relay counts, for the nested marker line
+    int i = rl_find(S0(NR_gettid));
+    *sk = i >= 0 ? g_rl_skip[i] : 0;
+    *big = i >= 0 ? g_rl_big[i] : 0;
 }
 
 static int rl_mark_skip(void) {                   // trap header, in relay context: count one skipped pass
@@ -3759,6 +3768,11 @@ static void fatal_relay(int sig, void *info, void *uc) {
         tun_catn(line, &o, (u64)sig);                           // reset to SIG_DFL, the signal rethrown at this thread: the process
         tun_cat(line, &o, " tid=");                             // dies by the signal itself, at the fault's own site.
         tun_catn(line, &o, (u64)S0(NR_gettid));
+        int nsk = 0, nbig = 0; rl_counts(&nsk, &nbig);          // the counts of the relay this marker ends: its exit
+        tun_cat(line, &o, " hk-skipped=");                      // line never prints when the process dies inside the
+        tun_catn(line, &o, (u64)nsk);                           // relay, so both counts ride the marker instead
+        tun_cat(line, &o, " bigtrap=");                         // (137 measurement: the 12:21 field's hk-skipped=0
+        tun_catn(line, &o, (u64)nbig);                          // was exactly that blind spot)
         tun_cat(line, &o, " -> SIG_DFL rethrow\n");
         say(line);
         struct { void *h; u64 flags; void *restorer; u64 mask; } df = { 0, 0, 0, 0 };
@@ -3770,7 +3784,7 @@ static void fatal_relay(int sig, void *info, void *uc) {
     if (is_fatal(sig) && sig != 8 && ssc_is_ss()) cc_emit_entry(sig, info, uc);   // entry snapshot: print this delivery at the door
     if (sig == 11 || sig == 6) cc_note(sig, info, uc);          // crash capture: stash (and name a repeat fault)
     if (g_crash) {
-        rl_leave();                                             // on_crash does not return; the mark dies with the process either way
+        rl_leave(0);                                            // on_crash does not return; the mark dies with the process either way
         on_crash(sig, info, uc);
         return;
     }
@@ -3791,10 +3805,11 @@ static void fatal_relay(int sig, void *info, void *uc) {
         h(sig, info, uc);
         if (ssc && ((struct sigctx *)((char *)uc + 176))->pc == saved.pc)
             cc_emit_ctx(sig, sfault, &saved, stid);
-    } else { rl_leave(); on_crash(sig, info, uc); }              // on_crash does not return
+    } else { rl_leave(0); on_crash(sig, info, uc); }             // on_crash does not return
     if (g_is32) *(u64 *)((char *)uc + 40) &= ~SYSBIT;
-    int hksk = rl_leave();                                      // 137 fix (jia): unmark; report the passes this relay deferred
-    if (hksk > 0) {
+    int bigt = 0;
+    int hksk = rl_leave(&bigt);                                 // 137 fix (jia): unmark; report the passes this relay deferred
+    if (hksk > 0 || bigt > 0) {                                 // and (yi') the traps it ran out on the big stack
         char line[128]; u64 o = 0;
         tun_cat(line, &o, "aemu-137r: relay-exit sig=");
         tun_catn(line, &o, (u64)sig);
@@ -3802,6 +3817,8 @@ static void fatal_relay(int sig, void *info, void *uc) {
         tun_catn(line, &o, (u64)S0(NR_gettid));
         tun_cat(line, &o, " hk-skipped=");
         tun_catn(line, &o, (u64)hksk);
+        tun_cat(line, &o, " bigtrap=");
+        tun_catn(line, &o, (u64)bigt);
         tun_cat(line, &o, "\n");
         say(line);
     }
