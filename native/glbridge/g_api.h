@@ -2996,6 +2996,9 @@ static void k_glDispatchCompute(GLuint num_groups_x, GLuint num_groups_y, GLuint
 static void k_glDispatchComputeIndirect(GLintptr indirect);
 static void k_glMemoryBarrier(GLbitfield barriers);
 static void k_glMemoryBarrierByRegion(GLbitfield barriers);
+static void k_glActiveTexture(GLenum texture);
+static void k_glBindTexture(GLenum target, GLuint texture);
+static void k_glDeleteTextures(GLsizei n, const GLuint * textures);
 
 static void *const kStubs[N_FUNCS] = {
     (void *)glActiveTexture,
@@ -3981,14 +3984,14 @@ static void *const kStubs[N_FUNCS] = {
     (void *)glClipPlanexIMG,
 };
 
-static void e_glActiveTexture(GLenum texture) { struct ts *T = TS(); begin(T, 0, 4, 4); put32(T, (uint32_t)texture); }
+static void e_glActiveTexture(GLenum texture) { struct ts *T = TS(); k_glActiveTexture(texture); begin(T, 0, 4, 4); put32(T, (uint32_t)texture); }
 static void e_glAttachShader(GLuint program, GLuint shader) { struct ts *T = TS(); begin(T, 1, 8, 8); put32(T, (uint32_t)program); put32(T, (uint32_t)shader); }
 static void e_glBindAttribLocation(GLuint program, GLuint index, const GLchar * name) { struct ts *T = TS(); uint32_t name_n = name ? (uint32_t)strlen(name) + 1 : NIL; begin(T, 2, 12, 12 + BLOB(name_n)); put32(T, (uint32_t)program); put32(T, (uint32_t)index); putblob(T, name, name_n); }
 static void e_glBindBuffer(GLenum target, GLuint buffer);
 static void e0_glBindBuffer(GLenum target, GLuint buffer) { struct ts *T = TS(); begin(T, 3, 8, 8); put32(T, (uint32_t)target); put32(T, (uint32_t)buffer); }
 static void e_glBindFramebuffer(GLenum target, GLuint framebuffer) { struct ts *T = TS(); begin(T, 4, 8, 8); put32(T, (uint32_t)target); put32(T, (uint32_t)framebuffer); }
 static void e_glBindRenderbuffer(GLenum target, GLuint renderbuffer) { struct ts *T = TS(); begin(T, 5, 8, 8); put32(T, (uint32_t)target); put32(T, (uint32_t)renderbuffer); }
-static void e_glBindTexture(GLenum target, GLuint texture) { struct ts *T = TS(); begin(T, 6, 8, 8); put32(T, (uint32_t)target); put32(T, (uint32_t)texture); }
+static void e_glBindTexture(GLenum target, GLuint texture) { struct ts *T = TS(); k_glBindTexture(target, texture); begin(T, 6, 8, 8); put32(T, (uint32_t)target); put32(T, (uint32_t)texture); }
 static void e_glBlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) { struct ts *T = TS(); begin(T, 7, 16, 16); putf(T, red); putf(T, green); putf(T, blue); putf(T, alpha); }
 static void e_glBlendEquation(GLenum mode) { struct ts *T = TS(); begin(T, 8, 4, 4); put32(T, (uint32_t)mode); }
 static void e_glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha) { struct ts *T = TS(); begin(T, 9, 8, 8); put32(T, (uint32_t)modeRGB); put32(T, (uint32_t)modeAlpha); }
@@ -4015,7 +4018,7 @@ static void e_glDeleteFramebuffers(GLsizei n, const GLuint * framebuffers) { str
 static void e_glDeleteProgram(GLuint program) { struct ts *T = TS(); begin(T, 30, 4, 4); put32(T, (uint32_t)program); }
 static void e_glDeleteRenderbuffers(GLsizei n, const GLuint * renderbuffers) { struct ts *T = TS(); uint32_t renderbuffers_n = renderbuffers ? (uint32_t)((n * 4) > 0 ? (n * 4) : 0) : NIL; begin(T, 31, 8, 8 + BLOB(renderbuffers_n)); put32(T, (uint32_t)n); putblob(T, renderbuffers, renderbuffers_n); }
 static void e_glDeleteShader(GLuint shader) { struct ts *T = TS(); begin(T, 32, 4, 4); put32(T, (uint32_t)shader); }
-static void e_glDeleteTextures(GLsizei n, const GLuint * textures) { struct ts *T = TS(); uint32_t textures_n = textures ? (uint32_t)((n * 4) > 0 ? (n * 4) : 0) : NIL; begin(T, 33, 8, 8 + BLOB(textures_n)); put32(T, (uint32_t)n); putblob(T, textures, textures_n); }
+static void e_glDeleteTextures(GLsizei n, const GLuint * textures) { struct ts *T = TS(); k_glDeleteTextures(n, textures); uint32_t textures_n = textures ? (uint32_t)((n * 4) > 0 ? (n * 4) : 0) : NIL; begin(T, 33, 8, 8 + BLOB(textures_n)); put32(T, (uint32_t)n); putblob(T, textures, textures_n); }
 static void e_glDepthFunc(GLenum func) { struct ts *T = TS(); begin(T, 34, 4, 4); put32(T, (uint32_t)func); }
 static void e_glDepthMask(GLboolean flag) { struct ts *T = TS(); begin(T, 35, 4, 4); put32(T, (uint32_t)flag); }
 static void e_glDepthRangef(GLfloat n, GLfloat f) { struct ts *T = TS(); begin(T, 36, 8, 8); putf(T, n); putf(T, f); }
