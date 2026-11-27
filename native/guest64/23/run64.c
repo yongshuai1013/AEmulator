@@ -2980,7 +2980,7 @@ static int rl_trap_begin(void) {                  // yi': >=0 = run this trap ou
     if (i < 0 || g_rl_depth[i] <= 0) return -1;   // not in a relay: nothing changes
     if (g_rl_onstk[i]) return -1;                 // already out there: a nested trap rides the same big stack
     if (__atomic_exchange_n(&g_fm_said, 1, __ATOMIC_ACQ_REL) == 0)
-        say("aemu-137r: mode bigstack+faultmap+fdlen3+fix1r+m2+lch1 (yi' restored; fdlen by fd-number fstat sweep; ashmem mmap size gates, fd-routed; m2 setsize/mmap size prints; lifecycle: detour sweep on down/hub-loss)\n");
+        say("aemu-137r: mode bigstack+faultmap+fdlen3+fix1r+m2+lch1+gate2 (yi' restored; fdlen by fd-number fstat sweep; ashmem mmap size gates, fd-routed; m2 setsize/mmap size prints; lifecycle: detour sweep on down/hub-loss; gate2: size0 ashmem autosized by ftruncate to the mapped span, toolong still EINVAL)\n");
     if (!g_rl_stk[i]) g_rl_stk[i] = rl_mmap_stack();
     if (!g_rl_stk[i]) return -1;                  // no stack to give: the pre-fix behaviour
     g_rl_onstk[i] = 1;
@@ -3336,19 +3336,32 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             }
         }
         if (a[4] >= 0 && is_ashmem_fd((int)a[4])) {
-            // fix1: the real ashmem driver's two mmap gates, which this layer never had. A region
-            // whose size was never set (its memfd is still 0 long), or a mapping longer than the
-            // region, fails here with EINVAL — as it does on a real device — instead of passing
-            // silently and faulting at first touch. The size is the file's own length, read as it
-            // stands (GET_SIZE's way); only the length is judged, not the offset, as in the
-            // driver's own test. An fstat that fails judges nothing and passes through.
+            // fix1: the real ashmem driver's two mmap gates, which this layer never had. The
+            // size is the file's own length, read as it stands (GET_SIZE's way); only the
+            // length is judged, not the offset, as in the driver's own test. An fstat that
+            // fails judges nothing and passes through.
+            // gate2 (the yi-an disposition): a region whose size was never set (its memfd is
+            // still 0 long) is NOT failed here any more. fix1's EINVAL was true to the real
+            // driver, but ART reads any mmap failure as memory exhaustion, and in the 1817
+            // field system_server killed itself over an 8192 region that arrived unsized —
+            // the pre-gate death (fault at first touch) traded for a suicide at the gate.
+            // So the supervisor now sizes the memfd itself, to exactly the mapped span
+            // PAGE_ALIGN(offset + length) and no more, and lets the mapping through; EINVAL
+            // remains only when that ftruncate itself fails. The longer-than-the-region
+            // gate (a size that WAS set) is unchanged: still EINVAL, as on a real device.
             // fix1r+m2: every decision here leaves an aemu-m2 line (size=-1 when the fstat
-            // itself failed), so a field log reads the region's biography end to end.
+            // itself failed), so a field log reads the region's biography end to end; an
+            // autosize line carries the size that was set in its size field.
             struct kstat st;
             if (S2(NR_fstat, a[4], &st) == 0) {
-                if (st.st_size == 0) { m2_mmap((int)a[4], st.st_ino, st.st_size, (u64)a[1], (u64)a[5], (u64)a[2], "einval-size0"); return -EINVAL; }
-                if ((u64)a[1] > (((u64)st.st_size + 4095) & ~(u64)4095)) { m2_mmap((int)a[4], st.st_ino, st.st_size, (u64)a[1], (u64)a[5], (u64)a[2], "einval-toolong"); return -EINVAL; }
-                m2_mmap((int)a[4], st.st_ino, st.st_size, (u64)a[1], (u64)a[5], (u64)a[2], "pass");
+                if (st.st_size == 0) {
+                    u64 want = (((u64)a[5] + (u64)a[1]) + 4095) & ~(u64)4095;
+                    if (S2(NR_ftruncate, a[4], want) == 0)
+                        m2_mmap((int)a[4], st.st_ino, (i64)want, (u64)a[1], (u64)a[5], (u64)a[2], "autosize");
+                    else { m2_mmap((int)a[4], st.st_ino, st.st_size, (u64)a[1], (u64)a[5], (u64)a[2], "einval-size0"); return -EINVAL; }
+                }
+                else if ((u64)a[1] > (((u64)st.st_size + 4095) & ~(u64)4095)) { m2_mmap((int)a[4], st.st_ino, st.st_size, (u64)a[1], (u64)a[5], (u64)a[2], "einval-toolong"); return -EINVAL; }
+                else m2_mmap((int)a[4], st.st_ino, st.st_size, (u64)a[1], (u64)a[5], (u64)a[2], "pass");
             } else m2_mmap((int)a[4], 0, -1, (u64)a[1], (u64)a[5], (u64)a[2], "pass-fstatfail");
         }
         return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
