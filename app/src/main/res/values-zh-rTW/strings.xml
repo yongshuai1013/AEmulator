@@ -11,4 +11,6 @@
     <string name="vs_soc_host">本機（這支手機）</string>
     <string name="vs_soc_custom">自訂</string>
     <string name="vs_soc_pick">選擇晶片</string>
+    <string name="vm_boot_seat_title">開機座位：分割區＋ramdisk 自己的 init</string>
+    <string name="vm_boot_seat_sub">各分割區以裝置形式呈現（by-name 節點、真掛載表），且開機時先執行 boot 映像 ramdisk 裡的 /init 作第一個行程——由它佈置並交棒，跟真機一樣——取代宿主的服務計劃。限以本版匯入的客體（有保留 boot 映像者）。實驗功能，下次完整開機生效。</string>
 </resources>
