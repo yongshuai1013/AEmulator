@@ -210,6 +210,7 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             SubstituteSection(img, s.magiskSub) { s = s.copy(magiskSub = it) }
             ZygiskSpikeSection(img, s.zygiskSpike) { s = s.copy(zygiskSpike = it) }
             QemuZeroSection(img, s.qemuZero) { s = s.copy(qemuZero = it) }
+            BootSeatSection(img, s.bootSeat) { s = s.copy(bootSeat = it) }
             AgentSection(img, s) { s = it }
 
             Spacer(Modifier.height(8.dp))
