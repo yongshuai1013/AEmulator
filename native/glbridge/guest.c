@@ -11,6 +11,12 @@
  * their calls are passed straight through. Which side a context goes to is decided when it is created (policy()).
  * Each thread has a table of entry points: SwiftShader's GLES 2 or GLES 1 library, or the encoders.
  *
+ * Without a SwiftShader (the x86 firmwares: "solo") every context is the host's. The host has GLES 3 contexts only, so a GLES 1
+ * context (the boot animation, old games and wallpapers) gets the fixed-function pipeline from gles1.h, which writes matrices, lighting,
+ * fog, texture environments, glDrawTex* and the rest in GLSL over the same encoders. What the host can do beyond protocol 1 (a frame
+ * converted into the window buffer's layout, window buffers as textures) it announces after OP_HELLO (AEMU_CAP_*); against a host that
+ * does not, the guest does that work itself, as it did before.
+ *
  * Built for every bionic from 5.0 on: libc, libdl and liblog only; libnativewindow is looked up at run time.
  */
 #include <dlfcn.h>
@@ -21,11 +27,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+/* (the libc of 1.x may lack poll, prctl and getprogname. They are not imported, not even weak: the linker of 1.x gives an unresolved weak
+ * import the library's own base address, not 0, so a "if (prctl)" test passed and the call ran the ELF header - SIGILL in SurfaceFlinger.
+ * They are looked up in libc at run time instead: dlsym on a handle answers 0 for a missing name, on every release - see libc_sym.) */
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include "common.h"
 #include "../grallocwrap/note.h"
 
@@ -66,6 +76,9 @@ struct gstate {
     uint8_t host_on[16];
     unsigned host_array, host_elem; int host_elem_ok;
     struct hptr { int ok, size, type, norm, integer, stride; unsigned buf; const void *ptr; } hp[16];
+    /* GL_TEXTURE_2D bound to each unit, and the textures that are an EGLImage of a window buffer (see tex_mirror) */
+    unsigned unit, tex2d[32];
+    struct { unsigned tex; void *img; } timg[16];
 };
 
 /* ---- the stream ---- */
@@ -73,6 +86,7 @@ struct ectx;
 struct esurf;
 struct ts {
     int fd, dead;
+    uint32_t caps;          /* AEMU_CAP_* of the host (asked once after OP_HELLO) */
     uint8_t *buf;
     uint32_t n, cap;
     struct ectx *ctx;
@@ -126,12 +140,14 @@ static void get(struct ts *T, void *p, uint32_t n) {
 static inline uint32_t get32v(struct ts *T) { uint32_t v = 0; rd_all(T, &v, 4); return v; }
 static inline uint64_t get64v(struct ts *T) { uint64_t v = 0; rd_all(T, &v, 8); return v; }
 
+struct g1;                  /* the fixed-function state of a GLES 1 context (gles1.h) */
 struct ectx {
     int bridged, version, current;
     void *ss;               /* SwiftShader's context */
     uint32_t host;          /* the host's context */
     void *dpy, *cfg;
     struct gstate g;
+    struct g1 *g1;          /* GLES 1 contexts only: made when first used */
 };
 static struct gstate *G(void) { return &t_ts->ctx->g; }
 #define aemu_get_count(pname) (G()->count)
@@ -144,7 +160,7 @@ static struct gstate *G(void) { return &t_ts->ctx->g; }
  * particles: a stall per draw, 4 frames a second), so the indices written while a buffer is bound as
  * GL_ELEMENT_ARRAY_BUFFER are kept here as well. A copy is dropped as soon as the buffer may change some other way
  * (a write through a target whose buffer is not known here, copies, transform feedback, compute). */
-struct shadow { uint32_t root; unsigned name; long size; uint8_t *data; };
+struct shadow { uint32_t root; unsigned name; long size; uint8_t *data; long m_off, m_max; int m_count; uint32_t m_isz; };   /* m_*: the last answer of sh_max */
 static struct shadow g_sh[64];
 static pthread_mutex_t g_sh_lock = PTHREAD_MUTEX_INITIALIZER;
 #define SHADOW_MAX (4L << 20)
@@ -185,11 +201,11 @@ static void sh_write(GLenum target, long offset, const void *p, long size, int w
             for (int i = 0; i < 64 && !x; i++) if (!g_sh[i].data) x = &g_sh[i];
             if (!x) { x = &g_sh[(name * 7u) & 63]; free(x->data); }
             x->data = p ? malloc((size_t)size) : calloc(1, (size_t)size);
-            if (x->data) { if (p) memcpy(x->data, p, (size_t)size); x->root = g->root; x->name = name; x->size = size; }
+            if (x->data) { if (p) memcpy(x->data, p, (size_t)size); x->root = g->root; x->name = name; x->size = size; x->m_count = 0; }
             else memset(x, 0, sizeof(*x));
         }
     } else if (x) {
-        if (p && offset >= 0 && size >= 0 && offset + size <= x->size) memcpy(x->data + offset, p, (size_t)size);
+        if (p && offset >= 0 && size >= 0 && offset + size <= x->size) { memcpy(x->data + offset, p, (size_t)size); x->m_count = 0; }
         else { free(x->data); memset(x, 0, sizeof(*x)); }
     }
     pthread_mutex_unlock(&g_sh_lock);
@@ -200,13 +216,17 @@ static long sh_max(struct gstate *g, long offset, int count, uint32_t isz) {
     pthread_mutex_lock(&g_sh_lock);
     struct shadow *x = sh_find(g->root, g->elem);
     if (x && offset >= 0 && offset + (long)count * isz <= x->size) {
-        const uint8_t *ix = x->data + offset;
-        uint32_t max = 0;
-        for (int i = 0; i < count; i++) {
-            uint32_t v = isz == 1 ? ix[i] : isz == 2 ? ((const uint16_t *)ix)[i] : ((const uint32_t *)ix)[i];
-            if (v > max) max = v;
+        if (x->m_count == count && x->m_off == offset && x->m_isz == isz) r = x->m_max;      /* (the same quads again and again: text, Skia) */
+        else {
+            const uint8_t *ix = x->data + offset;
+            uint32_t max = 0;
+            for (int i = 0; i < count; i++) {
+                uint32_t v = isz == 1 ? ix[i] : isz == 2 ? ((const uint16_t *)ix)[i] : ((const uint32_t *)ix)[i];
+                if (v > max) max = v;
+            }
+            r = max;
+            x->m_count = count; x->m_off = offset; x->m_isz = isz; x->m_max = r;
         }
-        r = max;
     }
     pthread_mutex_unlock(&g_sh_lock);
     return r;
@@ -286,6 +306,31 @@ static void k_glDeleteBuffers(GLsizei n, const GLuint *b) {
 static void k_glDeleteVertexArrays(GLsizei n, const GLuint *a) {
     struct gstate *g = G();
     for (int i = 0; a && i < n; i++) if (a[i] && g->vao == a[i]) g->vao = 0;
+}
+
+/* ---- textures that are an image of a buffer ----
+ * A buffer of a gralloc that leaves no note (the engine's 4.4 one) is carried to the host as a snapshot of the guest's memory
+ * when a texture is bound to its image. A program that writes such a texture with the GPU (AssetAtlasService: glTexSubImage2D
+ * into the atlas image, in system_server) wrote the host's copy only, and every other process then bound memory that was never
+ * written: hwui drew all framework nine-patches and icons from an empty atlas. The pixels of such a write go into the buffer's
+ * memory as well. */
+static void k_glActiveTexture(GLenum texture) { struct gstate *g = G(); if (texture >= 0x84C0 && texture < 0x84C0 + 32) g->unit = texture - 0x84C0; }
+static void k_glBindTexture(GLenum target, GLuint tex) { struct gstate *g = G(); if (target == 0x0DE1 && g->unit < 32) g->tex2d[g->unit] = tex; }
+static void timg_set(struct gstate *g, unsigned tex, void *img) {
+    int spare = -1;
+    for (int i = 0; tex && i < 16; i++) {
+        if (g->timg[i].tex == tex) { g->timg[i].img = img; if (!img) g->timg[i].tex = 0; return; }
+        if (!g->timg[i].tex && spare < 0) spare = i;
+    }
+    if (img && spare >= 0) { g->timg[spare].tex = tex; g->timg[spare].img = img; }
+}
+static void k_glDeleteTextures(GLsizei n, const GLuint *t) {
+    struct gstate *g = G();
+    for (int i = 0; t && i < n; i++) {
+        if (!t[i]) continue;
+        timg_set(g, t[i], 0);
+        for (int u = 0; u < 32; u++) if (g->tex2d[u] == t[i]) g->tex2d[u] = 0;
+    }
 }
 static void k_count(GLenum pname) {
     uint32_t name = 0, c = aemu_get_count0(pname, &name);
@@ -371,6 +416,13 @@ static int type_size(int type) {
     }
     return 4;
 }
+/* Hashing an array to find out whether the host still has it costs more than sending it when the guest's CPU is a translator (x86 firmware
+ * runs in one: ~2 emulated instructions a byte against a copy the kernel makes at full speed), so there the arrays always go. */
+#if defined(__i386__) || defined(__x86_64__)
+#define ARRAY_DEDUP 0
+#else
+#define ARRAY_DEDUP 1
+#endif
 static uint64_t sum_of(const void *p, uint32_t n) {
     const uint8_t *c = p;
     uint64_t h = 0x9e3779b97f4a7c15ull ^ n, w;
@@ -429,8 +481,8 @@ static void e_draw(GLenum mode, GLint first, GLsizei count, GLenum type, const v
         len[i] = (uint32_t)((n - 1) * st + esz);
         /* the same bytes as the last time (a mesh drawn again and again): the host still has them */
         const void *from = (const char *)a->ptr + (a->div ? 0 : (long)vfirst * st);
-        sum[i] = sum_of(from, len[i]);
-        same[i] = a->sent == from && a->sent_n == len[i] && a->sent_sum == sum[i];
+        sum[i] = ARRAY_DEDUP ? sum_of(from, len[i]) : 0;
+        same[i] = ARRAY_DEDUP && a->sent == from && a->sent_n == len[i] && a->sent_sum == sum[i];
         a->sent = from; a->sent_n = len[i]; a->sent_sum = sum[i];
         total += 28 + (same[i] ? 0 : BLOB(len[i]));
         nattr++;
@@ -554,11 +606,40 @@ static char *host_string(struct ts *T, GLenum name, uint32_t index) {
     get(T, s, BLOB(n)); s[n] = 0;
     return s;
 }
+/* What a program that asks for the strings before (or without) a working context gets, instead of a NULL it then hands to strncmp:
+ * SPen (S Note, Quick Memo, Flash Annotate) compares GL_RENDERER with a name right after a failed eglCreateContext /
+ * eglMakeCurrent and died in libc. Nothing is made up here: the strings are the ones the host answers (the VM's GPU identity
+ * from the SoC / GPU spoofer when it names one, the phone's own otherwise; the host answers them without a context too), and
+ * the last of those is kept for a host that cannot be asked at the moment. With neither, an empty string, which a comparison
+ * survives. */
+static char *g_seen[5];
+static struct ts *ts_get(void);
+static int str_index(GLenum name) { return name >= 0x1F00 && name <= 0x1F03 ? (int)name - 0x1F00 : name == 0x8B8C ? 4 : -1; }
+static void str_seen(int i, const char *s) {
+    if (i < 0 || i > 4 || !s || g_seen[i]) return;
+    size_t n = strlen(s);
+    char *c = malloc(n + 1);
+    if (!c) return;
+    memcpy(c, s, n + 1);
+    if (!__sync_bool_compare_and_swap(&g_seen[i], (char *)0, c)) free(c);
+}
+static const GLubyte *str_fallback(GLenum name) {
+    int i = str_index(name);
+    if (i < 0) return 0;
+    if (!g_seen[i]) {
+        struct ts *T = ts_get();
+        char *s = T ? host_string(T, name, NIL) : 0;
+        if (s) { str_seen(i, s); free(s); }
+    }
+    return (const GLubyte *)(g_seen[i] ? g_seen[i] : "");
+}
 static const GLubyte *e_glGetString(GLenum name) {
     struct gstate *g = G();
-    int i = name >= 0x1F00 && name <= 0x1F03 ? (int)name - 0x1F00 : name == 0x8B8C ? 4 : -1;
+    int i = str_index(name);
     if (i < 0) return 0;
     if (!g->str[i]) g->str[i] = host_string(TS(), name, NIL);
+    if (!g->str[i]) return str_fallback(name);
+    str_seen(i, g->str[i]);
     return (const GLubyte *)g->str[i];
 }
 static const GLubyte *e_glGetStringi(GLenum name, GLuint index) {
@@ -612,8 +693,10 @@ static void put_pixels(struct ts *T, const void *p, uint32_t n) {
     else if (p) { put32(T, 1); putblob(T, p, n); }
     else put32(T, 0);
 }
+static void tex_mirror(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, const void *pixels);
 static void e_glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLint border, GLenum format, GLenum type, const void *pixels) {
     struct ts *T = TS();
+    if (target == 0x0DE1 && level == 0 && G()->unit < 32) timg_set(G(), G()->tex2d[G()->unit], 0);      /* (re-specified: no longer the image's) */
     uint32_t n = unpack_bytes(w, h, 1, format, type);
     begin(T, IDX_glTexImage2D, 36, 32 + pixels_len(pixels, n));
     put32(T, target); put32(T, (uint32_t)level); put32(T, (uint32_t)ifmt); put32(T, (uint32_t)w); put32(T, (uint32_t)h);
@@ -622,6 +705,7 @@ static void e_glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GL
 }
 static void e_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, const void *pixels) {
     struct ts *T = TS();
+    if (target == 0x0DE1 && level == 0 && pixels && !G()->unpack_buf) tex_mirror(x, y, w, h, format, type, pixels);
     uint32_t n = unpack_bytes(w, h, 1, format, type);
     begin(T, IDX_glTexSubImage2D, 36, 32 + pixels_len(pixels, n));
     put32(T, target); put32(T, (uint32_t)level); put32(T, (uint32_t)x); put32(T, (uint32_t)y); put32(T, (uint32_t)w);
@@ -759,6 +843,9 @@ static void e_glGetnUniformfvKHR(GLuint program, GLint location, GLsizei n, GLfl
 static void e_glGetnUniformivKHR(GLuint program, GLint location, GLsizei n, GLint *params) { (void)n; get_uniform(1, program, location, params); }
 static void e_glGetUniformuiv(GLuint program, GLint location, GLuint *params) { get_uniform(2, program, location, params); }
 
+/* ---- GLES 1 on the host's GLES 3 contexts: the fixed-function pipeline, written over the encoders above ---- */
+#include "gles1.h"
+
 /* ---- the window system's types, as libnativewindow lays them out ---- */
 struct native_base { int magic, version; void *reserved[4]; void (*incRef)(struct native_base *); void (*decRef)(struct native_base *); };
 struct ANativeWindowBuffer {
@@ -786,6 +873,76 @@ struct ANativeWindow {
     int (*queueBuffer)(struct ANativeWindow *, struct ANativeWindowBuffer *, int fence);
     int (*cancelBuffer)(struct ANativeWindow *, struct ANativeWindowBuffer *, int fence);
 };
+/*
+ * The window's call table across releases (AOSP system/core/include/system/window.h, android_natives.h before 2.3):
+ *   2.1 - 2.2:  setSwapInterval, dequeueBuffer(w, &b), lockBuffer(w, b), queueBuffer(w, b), query, perform, reserved_proc[3]
+ *   2.3 - 4.1:  the same, with cancelBuffer(w, b) in the first reserved slot (reserved_proc[2] after it)
+ *   4.2 and later: those six slots stay as *_DEPRECATED (kept for old drivers), and the fence variants dequeueBuffer(w, &b, &fence),
+ *               queueBuffer(w, b, fence), cancelBuffer(w, b, fence) follow cancelBuffer_DEPRECATED.
+ * The first seven slots are the same offsets in every release, so one struct serves all; common.version is sizeof() of the window
+ * the release was built with: the 4.2+ table is one pointer longer than the older ones. Before 4.2 there are no fences, and the
+ * buffer must be locked after it is dequeued (AOSP's libagl, opengl/libagl/egl.cpp of 2.0 - 4.0.4: set usage, dequeue, lock, draw,
+ * queue, dequeue, lock; it never connects the window, so neither does this driver).
+ * Android 1.x - 2.0 hand EGL an egl_native_window_t of a different shape: not carried (the engine keeps those on its own driver).
+ */
+static int sdk_level(void) {
+    static int v = -1;
+    if (v < 0) {
+        char s[92] = "";
+        __system_property_get("ro.build.version.sdk", s);
+        v = 0;
+        for (const char *q = s; *q >= '0' && *q <= '9'; q++) v = v * 10 + (*q - '0');
+        if (!v) v = 99;                /* (unknown: assume a release that has it, as before) */
+    }
+    return v;
+}
+static int win_new_abi(const struct ANativeWindow *w) { return w->common.version >= (int)sizeof(struct ANativeWindow); }
+static int w_dequeue(struct ANativeWindow *w, struct ANativeWindowBuffer **b, int *fence) {
+    *fence = -1;
+    if (win_new_abi(w)) return w->dequeueBuffer(w, b, fence);
+    int r = w->dequeueBuffer_DEPRECATED(w, b);
+    if (r == 0 && *b && w->lockBuffer_DEPRECATED) r = w->lockBuffer_DEPRECATED(w, *b);
+    return r;
+}
+static int w_queue(struct ANativeWindow *w, struct ANativeWindowBuffer *b) {
+    return win_new_abi(w) ? w->queueBuffer(w, b, -1) : w->queueBuffer_DEPRECATED(w, b);
+}
+static void w_cancel(struct ANativeWindow *w, struct ANativeWindowBuffer *b) {
+    if (win_new_abi(w)) w->cancelBuffer(w, b, -1);
+    else if (sdk_level() >= 9 && w->cancelBuffer_DEPRECATED && (uintptr_t)w->cancelBuffer_DEPRECATED > 0xfff) w->cancelBuffer_DEPRECATED(w, b);
+    /* (2.1 / 2.2 have no cancelBuffer: that slot is reserved_proc[0] of a window that is not cleared - a Nexus One 2.1 launcher held
+     * 0x00770064 there and died jumping to it when its RenderScript surface was destroyed) */
+}
+/*
+ * Android 1.0 - 1.6: EGL is not given an ANativeWindow but an egl_native_window_t (opengl/include/EGL/eglnatives.h of 1.6, magic 0x600913,
+ * the first word of both kinds). It is a mapped buffer, not a queue: libEGL (opengl/libs/EGL/egl.cpp of 1.6) has already incRef'ed and
+ * connect()ed it, so width/height/stride/format and base + offset (the pixels of the back page) are set; the driver draws into them
+ * (AOSP's libagl: bindDrawSurface) and calls swapBuffers(window), which posts the page (a Surface: unlockAndPost + lock; the display
+ * window of SurfaceFlinger: the framebuffer pan, hence the two pages of fb0 the 1.0 / 1.1 translator must report) and returns
+ * EGL_NATIVES_FLAG_SIZE_CHANGED when width / height / stride / format / base / offset have changed. The window's stride is in pixels.
+ * Here the frame comes back from the host into base + offset in the window's own format and swapBuffers is called.
+ */
+#define EGL_NATIVE_WINDOW_MAGIC 0x600913
+#define EGL_NATIVES_FLAG_SIZE_CHANGED 1
+struct egl_native_window_t {
+    uint32_t magic, version, ident;
+    int width, height, stride, format;
+    intptr_t offset;
+    uint32_t flags;
+    float xdpi, ydpi, fps;
+    intptr_t base;
+    int fd;
+    uint8_t memory_type, reserved_pad[3];          /* memory_type 2: NATIVE_MEMORY_TYPE_FB */
+    int reserved[8];
+    int vstride;
+    void (*incRef)(struct egl_native_window_t *);
+    void (*decRef)(struct egl_native_window_t *);
+    uint32_t (*swapBuffers)(struct egl_native_window_t *);
+    void (*reserved_proc_0)(void), (*reserved_proc_1)(void), (*reserved_proc_2)(void);
+    void (*connect)(struct egl_native_window_t *);
+    void (*disconnect)(struct egl_native_window_t *);
+};
+_Static_assert(sizeof(void *) != 4 || __builtin_offsetof(struct egl_native_window_t, swapBuffers) == 104, "egl_native_window_t of 1.6");
 static int (*ahb_lock)(void *b, uint64_t usage, int fence, const void *rect, void **va);
 static int (*ahb_unlock)(void *b, int *fence);
 static void *(*anwb_ahb)(struct ANativeWindowBuffer *b);
@@ -803,6 +960,39 @@ struct gr_module {
     int (*unlock)(const struct gr_module *, const void *);
 };
 static const struct gr_module *g_gr;
+/* A handle the gralloc module does not recognise. Nexus One 2.1 (Android ERD79) hands RenderScript windows (the live wallpaper, the
+ * launcher's all-apps surface) buffers whose native_handle is not the engine gralloc's: version 12, 1 fd, 5 ints = the magic 0x5f736768,
+ * size, base (the mapping the buffer already has in THIS process), flags, pid of the allocator. The module answers "invalid gralloc
+ * handle" for each, every frame was dropped and the screen stayed black with the phone's GPU on (software rendering locks the same buffers
+ * through libui). The pixels are already mapped: when the module refuses and the handle has that shape, take base from it, provided the
+ * mapping is really there (mincore) and holds the whole frame. 32-bit guests only (the handle holds 32-bit words). */
+static void *libc_sym(const char *name);
+static int g_foreign_prefer;            /* 1 once a refused handle was served from its own mapping: asked first from then on */
+static __thread int t_foreign;          /* the lock of this thread is of that kind: unlock has nothing to tell the module */
+static int g_foreign_why;               /* why the last foreign_base answered 0 (for the log) */
+static void *foreign_base(struct ANativeWindowBuffer *b) {
+#ifdef __LP64__
+    (void)b; return 0;
+#else
+    g_foreign_why = 0;
+    const int *h = (const int *)b->handle;
+    if (!h || h[0] != 12 || h[1] != 1 || h[2] < 4 || h[2] > 12) { g_foreign_why = 1; return 0; }
+    int bpp = b->format == 1 || b->format == 2 ? 4 : b->format == 3 ? 3 : b->format == 4 ? 2 : 0;
+    if (!bpp || b->width <= 0 || b->height <= 0 || b->stride < b->width) { g_foreign_why = 2; return 0; }
+    uint32_t size = (uint32_t)h[5], base = (uint32_t)h[6];
+    uint32_t need = ((uint32_t)b->stride * (uint32_t)(b->height - 1) + (uint32_t)b->width) * (uint32_t)bpp;
+    if (!base || (base & 0xfff) || (size & 0xfff) || size < need) { g_foreign_why = 3; return 0; }
+    static int (*mc)(void *, size_t, unsigned char *);
+    static int looked;
+    if (!looked) { mc = (int (*)(void *, size_t, unsigned char *))libc_sym("mincore"); looked = 1; }
+    if (!mc) { g_foreign_why = 4; return 0; }
+    static unsigned char vec[2048];
+    size_t pages = need / 4096 + 1;
+    if (pages > sizeof vec) { g_foreign_why = 5; return 0; }
+    if (mc((void *)(uintptr_t)base, need, vec) != 0) { g_foreign_why = 6; return 0; }      /* (not mapped here: the handle is not what it looks like) */
+    return (void *)(uintptr_t)base;
+#endif
+}
 static int buf_api(void) {
     static int state;
     if (!state) {
@@ -823,14 +1013,39 @@ static int buf_api(void) {
 }
 /* (an AHardwareBuffer is the ANativeWindowBuffer part of the same GraphicBuffer) */
 static void *ahb_of(struct ANativeWindowBuffer *b) { return anwb_ahb ? anwb_ahb(b) : (void *)b; }
+/* what the module was given, once: the header of the native_handle (version, numFds, numInts) and its first ints */
+static void gr_refused(struct ANativeWindowBuffer *b, int usage, int served) {
+    static int said;
+    if (said++ >= 2) return;
+    const int *h = (const int *)b->handle;
+    if (!h) { LOG("gralloc refused a window buffer: handle is NULL (buffer %p, usage 0x%x)", (void *)b, usage); return; }
+    LOG("gralloc refused a window buffer %p, usage 0x%x (%s): handle %p = version %d, numFds %d, numInts %d, then %08x %08x %08x %08x %08x %08x %08x",
+        (void *)b, usage, served ? "served from the handle's own mapping" : (g_foreign_why == 1 ? "not usable: handle shape" : g_foreign_why == 2 ? "not usable: format" : g_foreign_why == 3 ? "not usable: size or base" : g_foreign_why == 6 ? "not usable: not mapped" : "not usable either"), (const void *)h, h[0], h[1], h[2],
+        (unsigned)h[3], (unsigned)h[4], (unsigned)h[5], (unsigned)h[6], (unsigned)h[7], (unsigned)h[8], (unsigned)h[9]);
+}
 static void *buf_lock(struct ANativeWindowBuffer *b, int write) {
     void *va = 0;
     if (!buf_api()) return 0;
-    if (g_gr) return g_gr->lock(g_gr, b->handle, write ? 0x30 : 0x3, 0, 0, b->width, b->height, &va) == 0 ? va : 0;
-    if (ahb_lock(ahb_of(b), write ? 0x30 : 0x3, -1, 0, &va) != 0) return 0;
+    int usage = write ? 0x30 : 0x3;
+    t_foreign = 0;
+    if (g_gr) {
+        if (g_foreign_prefer && (va = foreign_base(b))) { b->common.incRef(&b->common); t_foreign = 1; return va; }
+        if (g_gr->lock(g_gr, b->handle, usage, 0, 0, b->width, b->height, &va) == 0 && va) return va;
+        va = foreign_base(b);
+        gr_refused(b, usage, va != 0);
+        if (va) { g_foreign_prefer = 1; t_foreign = 1; b->common.incRef(&b->common); }
+        return va;
+    }
+    if (ahb_lock(ahb_of(b), usage, -1, 0, &va) != 0) return 0;
     return va;
 }
-static void buf_unlock(struct ANativeWindowBuffer *b) { if (g_gr) g_gr->unlock(g_gr, b->handle); else ahb_unlock(ahb_of(b), 0); }
+static void buf_unlock(struct ANativeWindowBuffer *b) {
+    /* (the reference keeps the buffer, and so its mapping, alive while the pixels are written: a window that is resized or torn down
+     * meanwhile - the launcher's all-apps surface going from 480x800 to 480x762 - unmaps the old buffers, which crashed the process) */
+    if (t_foreign) { t_foreign = 0; b->common.decRef(&b->common); }
+    else if (g_gr) g_gr->unlock(g_gr, b->handle);
+    else ahb_unlock(ahb_of(b), 0);
+}
 
 /* ---- SwiftShader behind ---- */
 #ifdef __LP64__
@@ -838,7 +1053,11 @@ static void buf_unlock(struct ANativeWindowBuffer *b) { if (g_gr) g_gr->unlock(g
 #else
 #define LIBDIR "lib"
 #endif
-static struct { void *egl, *v2, *v1; void *t2[N_FUNCS], *t1[N_FUNCS], *enc[N_FUNCS]; volatile int up; } SS;
+static struct { void *egl, *v2, *v1; void *t2[N_FUNCS], *t1[N_FUNCS], *enc[N_FUNCS], *enc1[N_FUNCS]; volatile int up; } SS;
+/* glGetString through the table of "no bridged context is current": the software side answers NULL without a context of its own */
+static const GLubyte *(*ss_gs2)(GLenum), *(*ss_gs1)(GLenum);
+static const GLubyte *ss_glGetString2(GLenum name) { const GLubyte *r = ss_gs2 ? ss_gs2(name) : 0; return r ? r : str_fallback(name); }
+static const GLubyte *ss_glGetString1(GLenum name) { const GLubyte *r = ss_gs1 ? ss_gs1(name) : 0; return r ? r : str_fallback(name); }
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static long nothing(void) { return 0; }
 static long not_carried(void) {
@@ -877,6 +1096,18 @@ static void ss_load(void) {
             SS.t1[i] = f ? f : (void *)nothing;
             SS.enc[i] = kEnc[i] ? kEnc[i] : (void *)not_carried;
         }
+        /* Calls that only inform tools (the guest's libEGL offers GL_EXT_debug_marker itself and programs use it) have no effect on
+         * the picture: taken and dropped, not reported as missing. */
+        static const int kNop[] = { IDX_glInsertEventMarkerEXT, IDX_glPushGroupMarkerEXT, IDX_glPopGroupMarkerEXT, IDX_glLabelObjectEXT,
+                                    IDX_glGetObjectLabelEXT, IDX_glStartTilingQCOM, IDX_glEndTilingQCOM };
+        for (unsigned i = 0; i < sizeof kNop / sizeof kNop[0]; i++) SS.enc[kNop[i]] = (void *)nothing;
+        if (SS.t2[IDX_glGetString] != (void *)nothing) ss_gs2 = (const GLubyte *(*)(GLenum))SS.t2[IDX_glGetString];
+        if (SS.t1[IDX_glGetString] != (void *)nothing) ss_gs1 = (const GLubyte *(*)(GLenum))SS.t1[IDX_glGetString];
+        SS.t2[IDX_glGetString] = (void *)ss_glGetString2;
+        SS.t1[IDX_glGetString] = (void *)ss_glGetString1;
+        /* a GLES 1 context: the same encoders, the fixed-function entries (gles1.h) over them */
+        memcpy(SS.enc1, SS.enc, sizeof(SS.enc1));
+        g1_install(SS.enc1);
         SS.up = 1;
     }
     pthread_mutex_unlock(&g_lock);
@@ -898,8 +1129,169 @@ typedef unsigned int EGLBoolean, EGLenum;
 #define EGL_NONE 0x3038
 static __thread EGLint t_err;
 
+
+/* ---- no software renderer behind (x86 / x86-64 firmware): the driver is the whole EGL ----
+ * SwiftShader exists for the phone's own architecture only. A firmware that is translated (an x86-64 Android 10 SDK image: no
+ * libEGL_swiftshader.so, no libGLES_split.so, nothing in /vendor) used to get an EGL with no display: eglGetDisplay answered 0,
+ * libEGL could not initialize the driver and SurfaceFlinger aborted in RenderEngine ("eglQueryStringImplementationANDROID(
+ * EGL_VERSION) failed"). In this mode the display, the configs and the strings are ours, and every context - the
+ * compositor's too - is made on the host (solo() turns policy() off). Window and pbuffer surfaces, images and sync objects of
+ * bridged contexts were ours already. */
+static int solo(void) { if (!SS.up) ss_load(); return !SS.egl || !SS.v2; }
+static char g_solo_dpy[8];
+struct cfg { uint8_t r, g, b, a, depth, stencil; uint8_t visual; };
+/* (visual: the HAL pixel format of the buffers a window of this config takes: 1 RGBA_8888, 2 RGBX_8888, 4 RGB_565) */
+static const struct cfg kCfg[] = {
+    { 8, 8, 8, 8, 24, 8, 1 }, { 8, 8, 8, 8, 16, 0, 1 }, { 8, 8, 8, 8, 0, 0, 1 },
+    { 8, 8, 8, 0, 24, 8, 2 }, { 8, 8, 8, 0, 16, 0, 2 }, { 8, 8, 8, 0, 0, 0, 2 },
+    { 5, 6, 5, 0, 24, 8, 4 }, { 5, 6, 5, 0, 16, 0, 4 }, { 5, 6, 5, 0, 0, 0, 4 },
+};
+#define N_CFG ((int)(sizeof kCfg / sizeof kCfg[0]))
+static const struct cfg *cfg_of(void *c) {
+    uintptr_t i = (uintptr_t)c;
+    return i >= 1 && i <= (uintptr_t)N_CFG ? &kCfg[i - 1] : 0;
+}
+static EGLBoolean solo_cfg_attrib(const struct cfg *c, uintptr_t id, EGLint a, EGLint *v) {
+    int rgb = c->r + c->g + c->b + c->a;
+    switch (a) {
+    case 0x3020: *v = rgb; break;                   /* EGL_BUFFER_SIZE */
+    case 0x3021: *v = c->a; break;                  /* EGL_ALPHA_SIZE */
+    case 0x3022: *v = c->b; break;
+    case 0x3023: *v = c->g; break;
+    case 0x3024: *v = c->r; break;
+    case 0x3025: *v = c->depth; break;
+    case 0x3026: *v = c->stencil; break;
+    case 0x3027: *v = 0x3038; break;                /* EGL_CONFIG_CAVEAT: EGL_NONE */
+    case 0x3028: *v = (EGLint)id; break;            /* EGL_CONFIG_ID */
+    case 0x3029: *v = 0; break;                     /* EGL_LEVEL */
+    case 0x302A: case 0x302C: *v = 4096; break;     /* EGL_MAX_PBUFFER_HEIGHT / WIDTH */
+    case 0x302B: *v = 4096 * 4096; break;           /* EGL_MAX_PBUFFER_PIXELS */
+    case 0x302D: *v = 1; break;                     /* EGL_NATIVE_RENDERABLE */
+    case 0x302E: *v = c->visual; break;             /* EGL_NATIVE_VISUAL_ID */
+    case 0x302F: *v = 0x3038; break;                /* EGL_NATIVE_VISUAL_TYPE */
+    case 0x3031: case 0x3032: *v = 0; break;        /* EGL_SAMPLES / EGL_SAMPLE_BUFFERS */
+    case 0x3033: *v = 0x1 | 0x4; break;             /* EGL_SURFACE_TYPE: PBUFFER | WINDOW */
+    case 0x3034: *v = 0x3038; break;                /* EGL_TRANSPARENT_TYPE: EGL_NONE */
+    case 0x3035: case 0x3036: case 0x3037: *v = 0; break;
+    case 0x3039: *v = 0; break;                     /* EGL_BIND_TO_TEXTURE_RGB */
+    case 0x303A: *v = 0; break;                     /* EGL_BIND_TO_TEXTURE_RGBA */
+    case 0x303B: *v = 0; break;                     /* EGL_MIN_SWAP_INTERVAL */
+    case 0x303C: *v = 1; break;                     /* EGL_MAX_SWAP_INTERVAL */
+    case 0x303D: case 0x303E: *v = 0; break;        /* EGL_LUMINANCE_SIZE / EGL_ALPHA_MASK_SIZE */
+    case 0x303F: *v = 0x308E; break;                /* EGL_COLOR_BUFFER_TYPE: EGL_RGB_BUFFER */
+    case 0x3040: *v = 0x1 | 0x4 | 0x40; break;      /* EGL_RENDERABLE_TYPE: ES | ES2 | ES3 */
+    case 0x3042: *v = 0x1 | 0x4 | 0x40; break;      /* EGL_CONFORMANT */
+    case 0x3142: *v = 1; break;                     /* EGL_RECORDABLE_ANDROID */
+    case 0x3147: *v = c->visual != 4; break;        /* EGL_FRAMEBUFFER_TARGET_ANDROID */
+    default: return 0;
+    }
+    return 1;
+}
+static EGLBoolean solo_eglGetConfigAttrib(EGLDisplay d, EGLConfig c, EGLint a, EGLint *v) {
+    (void)d;
+    const struct cfg *k = cfg_of(c);
+    if (!k || !v) { t_err = k ? 0x300C /* EGL_BAD_PARAMETER */ : 0x3005 /* EGL_BAD_CONFIG */; return 0; }
+    if (!solo_cfg_attrib(k, (uintptr_t)c, a, v)) { t_err = 0x3004; /* EGL_BAD_ATTRIBUTE */ return 0; }
+    return 1;
+}
+static EGLBoolean solo_eglGetConfigs(EGLDisplay d, EGLConfig *out, EGLint size, EGLint *n) {
+    (void)d;
+    if (!n) { t_err = 0x300C; return 0; }
+    if (!out) { *n = N_CFG; return 1; }
+    int k = 0;
+    for (; k < N_CFG && k < size; k++) out[k] = (EGLConfig)(uintptr_t)(k + 1);
+    *n = k;
+    return 1;
+}
+/* eglChooseConfig as the spec has it: the sizes are minimums, the bit masks must be contained, the rest must be equal; a
+ * value of EGL_DONT_CARE (-1) matches everything. Order: more colour bits (of the channels asked for), then smaller buffer,
+ * depth and stencil, then the lower id. */
+static EGLBoolean solo_eglChooseConfig(EGLDisplay d, const EGLint *attribs, EGLConfig *out, EGLint size, EGLint *n) {
+    (void)d;
+    if (!n) { t_err = 0x300C; return 0; }
+    int ok[N_CFG];
+    for (int i = 0; i < N_CFG; i++) ok[i] = 1;
+    int want_r = 0, want_g = 0, want_b = 0, want_a = 0;
+    int renderable_given = 0;
+    for (const EGLint *a = attribs; a && *a != EGL_NONE; a += 2) {
+        EGLint name = a[0], want = a[1];
+        if (name == 0x3024) want_r = want > 0;
+        if (name == 0x3023) want_g = want > 0;
+        if (name == 0x3022) want_b = want > 0;
+        if (name == 0x3021) want_a = want > 0;
+        if (name == 0x3040) renderable_given = 1;
+        if (want == -1) continue;
+        for (int i = 0; i < N_CFG; i++) {
+            EGLint have;
+            if (!solo_cfg_attrib(&kCfg[i], (uintptr_t)(i + 1), name, &have)) { t_err = 0x3004; return 0; }
+            switch (name) {
+            case 0x3020: case 0x3021: case 0x3022: case 0x3023: case 0x3024: case 0x3025: case 0x3026:
+            case 0x3031: case 0x3032: case 0x303D: case 0x303E:
+                { if (have < want) ok[i] = 0; break; }
+            case 0x3033: case 0x3040: case 0x3042:
+                { if ((have & want) != want) ok[i] = 0; break; }
+            case 0x3028: case 0x3029: case 0x302D: case 0x302E: case 0x302F: case 0x3027: case 0x3034:
+            case 0x3039: case 0x303A: case 0x303B: case 0x303C: case 0x303F: case 0x3142: case 0x3147:
+                { if (have != want) ok[i] = 0; break; }
+            default: break;      /* (max pbuffer sizes and the transparent values: not a selection criterion here) */
+            }
+        }
+    }
+    (void)renderable_given;
+    int idx[N_CFG], cnt = 0;
+    for (int i = 0; i < N_CFG; i++) if (ok[i]) idx[cnt++] = i;
+    /* insertion sort: nine entries */
+    for (int i = 1; i < cnt; i++) {
+        int v = idx[i], j = i - 1;
+        for (; j >= 0; j--) {
+            const struct cfg *x = &kCfg[idx[j]], *y = &kCfg[v];
+            int bx = (want_r || (!want_g && !want_b && !want_a) ? x->r : 0) + (want_g || (!want_r && !want_b && !want_a) ? x->g : 0) +
+                     (want_b || (!want_r && !want_g && !want_a) ? x->b : 0) + (want_a ? x->a : 0);
+            int by = (want_r || (!want_g && !want_b && !want_a) ? y->r : 0) + (want_g || (!want_r && !want_b && !want_a) ? y->g : 0) +
+                     (want_b || (!want_r && !want_g && !want_a) ? y->b : 0) + (want_a ? y->a : 0);
+            int before;     /* does y (the one being placed) sort before x? */
+            if (by != bx) before = by > bx;
+            else if (y->r + y->g + y->b + y->a != x->r + x->g + x->b + x->a) before = (y->r + y->g + y->b + y->a) < (x->r + x->g + x->b + x->a);
+            else if (y->depth != x->depth) before = y->depth < x->depth;
+            else if (y->stencil != x->stencil) before = y->stencil < x->stencil;
+            else before = v < idx[j];
+            if (!before) break;
+            idx[j + 1] = idx[j];
+        }
+        idx[j + 1] = v;
+    }
+    if (!out) { *n = cnt; return 1; }
+    int k = 0;
+    for (; k < cnt && k < size; k++) out[k] = (EGLConfig)(uintptr_t)(idx[k] + 1);
+    *n = k;
+    return 1;
+}
+static EGLDisplay solo_eglGetDisplay(void *native) { (void)native; return g_solo_dpy; }
+static EGLBoolean solo_eglInitialize(EGLDisplay d, EGLint *major, EGLint *minor) {
+    if (d != g_solo_dpy) { t_err = 0x3008; /* EGL_BAD_DISPLAY */ return 0; }
+    if (major) *major = 1;
+    if (minor) *minor = 4;
+    return 1;
+}
+static EGLBoolean solo_eglTerminate(EGLDisplay d) { (void)d; return 1; }
+static EGLBoolean solo_eglBindAPI(EGLenum api) { if (api == 0x30A0) return 1; t_err = 0x300C; return 0; }
+static EGLenum solo_eglQueryAPI(void) { return 0x30A0; }
+static EGLBoolean solo_eglWaitNative(EGLint e) { (void)e; return 1; }
+static const char *solo_QueryString(EGLDisplay d, EGLint name) {
+    (void)d;
+    switch (name) {
+    case 0x3053: return "AEmulator";
+    case 0x3054: return "1.4 AEmulator GL bridge";
+    case 0x308D: return "OpenGL_ES";
+    case 0x3055: return "EGL_KHR_image EGL_KHR_image_base EGL_KHR_gl_texture_2D_image EGL_ANDROID_image_native_buffer "
+                        "EGL_KHR_surfaceless_context EGL_ANDROID_recordable EGL_ANDROID_framebuffer_target";
+    }
+    t_err = 0x300C;
+    return 0;
+}
+
 #define FWD(ret, name, params, args) \
-    EXPORT ret name params { static ret (*f) params; if (!f) f = sse(#name); return f ? f args : (ret)0; }
+    EXPORT ret name params { static ret (*f) params; if (!f) f = sse(#name); return f ? f args : solo_##name args; }
 #define SSF(ret, name, params) static ret (*name) params; if (!name) name = sse("egl" #name)
 
 FWD(EGLDisplay, eglGetDisplay, (void *native), (native))
@@ -914,7 +1306,7 @@ EXPORT const char *eglQueryString(EGLDisplay d, EGLint name) {
     static const char *(*f)(EGLDisplay, EGLint);
     static char *ext;
     if (!f) f = sse("eglQueryString");
-    const char *s = f ? f(d, name) : 0;
+    const char *s = f ? f(d, name) : solo_QueryString(d, name);
     if (name != 0x3055 /* EGL_EXTENSIONS */ || !s) return s;
     /* and EGL_KHR_fence_sync (the sync objects below): the 4.4 engine's driver leaves it out, and WebView 44 (6.0)
      * creates a fence anyway, through a function it bound only for that extension - a call to null */
@@ -942,6 +1334,7 @@ struct esurf {
     int kind, w, h, current, doomed, ready;
     void *dpy, *cfg;
     struct ANativeWindow *win;
+    struct egl_native_window_t *ewin;   /* Android 1.0 - 1.6: the window is one of these instead (win is 0) */
     struct ANativeWindowBuffer *buf;    /* dequeued for the frame being drawn */
     void *ss; int ss_tried;
     uint32_t key;
@@ -949,12 +1342,37 @@ struct esurf {
     uint8_t *tmp; uint32_t tmp_n;
 };
 static volatile uint32_t g_keys;
+/* (gles1.h: the viewport before the program sets one is the whole surface) */
+static void g1_surface_size(int *w, int *h) {
+    struct esurf *s = t_ts && t_ts->ctx ? t_ts->draw : 0;
+    *w = *h = 0;
+    if (!s) return;
+    *w = s->w; *h = s->h;
+    if (s->ewin) { *w = s->ewin->width; *h = s->ewin->height; }
+    else if (s->kind == S_WINDOW && !s->buf && s->win && s->win->query) { int v = 0; s->win->query(s->win, 0, &v); *w = v; v = 0; s->win->query(s->win, 1, &v); *h = v; }
+}
+
+/* A function of libc that an old release may not have: 0 when it is missing (looked up once per name by the callers) */
+static void *libc_sym(const char *name) {
+    static void *h;
+    if (!h) h = dlopen("libc.so", RTLD_NOW);
+    return h ? dlsym(h, name) : 0;
+}
+/* the calling thread's name (prctl PR_GET_NAME) into a 17-byte buffer; left empty where libc has no prctl */
+static void thread_name(char *name) {
+    static int (*pr)(int, ...);
+    static int looked;
+    if (!looked) { pr = (int (*)(int, ...))libc_sym("prctl"); looked = 1; }
+    if (pr) pr(PR_GET_NAME, name);
+}
 
 /* (bionic has getprogname from 5.0; before it: the translator shows the guest's own argv in /proc/self/cmdline) */
-extern const char *getprogname(void) __attribute__((weak));
 static const char *prog_name(void) {
     static char name[128];
-    const char *c = getprogname ? getprogname() : 0;
+    static const char *(*gp)(void);
+    static int looked;
+    if (!looked) { gp = (const char *(*)(void))libc_sym("getprogname"); looked = 1; }
+    const char *c = gp ? gp() : 0;
     if (c) return c;
     int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
     if (fd >= 0) { ssize_t n = read(fd, name, sizeof(name) - 1); name[n > 0 ? n : 0] = 0; close(fd); }
@@ -982,7 +1400,7 @@ static int policy(int version) {
     /* the window toolkit and Chromium hand textures to each other, and their drawing is light: left where it was */
     static const char *const soft[] = { "RenderThread", "hwuiTask", "GrallocUpload", "Chrome_", "CrGpu", "Compositor", "GpuThread", "Viz" };
     char name[17] = "";
-    prctl(PR_GET_NAME, name);
+    thread_name(name);
     for (unsigned i = 0; i < sizeof(soft) / sizeof(soft[0]); i++) if (!strncmp(name, soft[i], strlen(soft[i]))) return 0;
     return 1;
 }
@@ -1017,6 +1435,10 @@ static struct ts *ts_get(void) {
     begin(T, OP_HELLO, 4, 4); put32(T, AEMU_GL_PROTOCOL);
     rsync(T);
     if (get32v(T) != AEMU_GL_PROTOCOL) { LOG("the host renderer speaks another protocol"); close(T->fd); free(T->buf); free(T); return 0; }
+    /* what else the host does: a host that knows the probe answers 1 | caps << 1, an older one just 1 */
+    begin(T, OP_PING, 4, 4); put32(T, AEMU_CAPS_PROBE);
+    rsync(T);
+    { uint32_t r = get32v(T); T->caps = (r & 1) && r > 1 ? r >> 1 : 0; }
     pthread_once(&g_key_once, key_make);
     pthread_setspecific(g_key, T);
     t_ts = T;
@@ -1036,10 +1458,17 @@ static void copy_attribs(struct esurf *s, const EGLint *a) {
 EXPORT EGLSurface eglCreateWindowSurface(EGLDisplay d, EGLConfig c, void *win, const EGLint *attribs) {
     struct esurf *s = calloc(1, sizeof(*s));
     if (!s || !win) { free(s); t_err = EGL_BAD_ALLOC; return 0; }
-    s->kind = S_WINDOW; s->dpy = d; s->cfg = c; s->win = win;
+    s->kind = S_WINDOW; s->dpy = d; s->cfg = c;
     s->key = __sync_add_and_fetch(&g_keys, 1);
     copy_attribs(s, attribs);
-    s->win->common.incRef(&s->win->common);
+    if (*(uint32_t *)win == EGL_NATIVE_WINDOW_MAGIC) {
+        s->ewin = win;
+        s->ewin->incRef(s->ewin);
+        s->w = s->ewin->width; s->h = s->ewin->height;
+    } else {
+        s->win = win;
+        s->win->common.incRef(&s->win->common);
+    }
     return s;
 }
 EXPORT EGLSurface eglCreatePbufferSurface(EGLDisplay d, EGLConfig c, const EGLint *attribs) {
@@ -1060,12 +1489,12 @@ EXPORT EGLSurface eglCreatePixmapSurface(EGLDisplay d, EGLConfig c, void *pixmap
 }
 /* SwiftShader's surface for ours: made when a SwiftShader context first draws to it */
 static void *ss_surface(struct esurf *s) {
-    if (!s) return 0;
+    if (!s || s->ewin) return 0;           /* (a 1.x window is not one SwiftShader knows) */
     if (!s->ss && !s->ss_tried) {
         s->ss_tried = 1;
         if (s->kind == S_WINDOW) {
             SSF(EGLSurface, CreateWindowSurface, (EGLDisplay, EGLConfig, void *, const EGLint *));
-            if (s->buf) { s->win->cancelBuffer(s->win, s->buf, -1); s->buf = 0; }
+            if (s->buf) { w_cancel(s->win, s->buf); s->buf = 0; }
             s->ss = CreateWindowSurface ? CreateWindowSurface(s->dpy, s->cfg, s->win, s->attribs) : 0;
         } else {
             SSF(EGLSurface, CreatePbufferSurface, (EGLDisplay, EGLConfig, const EGLint *));
@@ -1074,12 +1503,80 @@ static void *ss_surface(struct esurf *s) {
     }
     return s->ss;
 }
+#if defined(__arm__) && !defined(__LP64__)
+/* A guest process that dies of SIGSEGV leaves nothing in the log but "terminated by signal (11)" (no debuggerd in these images). Say where,
+ * once, and let the signal run its course (SA_RESETHAND: the faulting instruction runs again and kills the process as before). */
+struct bsigaction { void (*handler)(int, void *, void *); unsigned long mask; unsigned long flags; void (*restorer)(void); };
+static uint32_t hexv(const char **pp, char stop) {
+    uint32_t v = 0;
+    const char *q = *pp;
+    for (; *q && *q != stop && *q != ' '; q++) v = v * 16 + (uint32_t)((*q <= '9') ? *q - '0' : (*q | 32) - 'a' + 10);
+    *pp = q;
+    return v;
+}
+static void where_is(const char *what, uint32_t a) {
+    static char maps[65536];
+    int (*op)(const char *, int, ...) = (int (*)(const char *, int, ...))libc_sym("open");
+    long (*rd)(int, void *, unsigned long) = (long (*)(int, void *, unsigned long))libc_sym("read");
+    int (*cl)(int) = (int (*)(int))libc_sym("close");
+    if (!op || !rd || !cl) return;
+    int fd = op("/proc/self/maps", 0);
+    if (fd < 0) { LOG("  %s %08x", what, a); return; }
+    long n = rd(fd, maps, sizeof maps - 1);
+    cl(fd);
+    if (n <= 0) return;
+    maps[n] = 0;
+    for (char *l = maps; l && *l;) {
+        char *e = l;
+        while (*e && *e != '\n') e++;
+        if (*e) *e = 0; else e = 0;
+        const char *q = l;
+        uint32_t lo = hexv(&q, '-');
+        if (*q == '-') q++;
+        uint32_t hi = hexv(&q, ' ');
+        if (a >= lo && a < hi) {
+            while (*q == ' ') q++;
+            while (*q && *q != ' ') q++;                 /* perms */
+            while (*q == ' ') q++;
+            uint32_t off = hexv(&q, ' ');
+            for (int sp = 0; *q && sp < 2; ) { while (*q == ' ') q++; while (*q && *q != ' ') q++; sp++; }   /* dev, inode */
+            while (*q == ' ') q++;
+            LOG("  %s %08x = %s +0x%x", what, a, *q ? q : "(anonymous)", a - lo + off);
+            return;
+        }
+        l = e ? e + 1 : 0;
+    }
+    LOG("  %s %08x is in no mapping", what, a);
+}
+static void segv_log(int sig, void *info, void *uc) {
+    const uint32_t *c = (const uint32_t *)uc;
+    uint32_t fa = info ? ((const uint32_t *)info)[3] : 0u;
+    LOG("signal %d: fault address %08x", sig, fa);
+    where_is("pc", c[23]);
+    where_is("lr", c[22]);
+    where_is("fault", fa);
+    LOG("  r0 %08x r1 %08x r2 %08x r3 %08x r4 %08x r5 %08x sp %08x", c[8], c[9], c[10], c[11], c[12], c[13], c[21]);
+}
+static void crash_logger_install(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    int (*sa)(int, const void *, void *) = (int (*)(int, const void *, void *))libc_sym("sigaction");
+    if (!sa) return;
+    struct bsigaction a = { segv_log, 0, 4 /* SA_SIGINFO */ | 0x80000000u /* SA_RESETHAND */, 0 };
+    sa(11, &a, 0);
+    sa(7, &a, 0);
+}
+#else
+static void crash_logger_install(void) {}
+#endif
 static void surf_free(struct esurf *s) {
     if (s->ss) { SSF(EGLBoolean, DestroySurface, (EGLDisplay, EGLSurface)); if (DestroySurface) DestroySurface(s->dpy, s->ss); }
     if (s->win) {
-        if (s->buf) s->win->cancelBuffer(s->win, s->buf, -1);
+        if (s->buf) w_cancel(s->win, s->buf);
         s->win->common.decRef(&s->win->common);
     }
+    if (s->ewin) s->ewin->decRef(s->ewin);
     free(s->tmp); free(s);
 }
 static void surf_unref(struct esurf *s) { if (s && --s->current <= 0 && s->doomed) surf_free(s); }
@@ -1094,10 +1591,30 @@ EXPORT EGLBoolean eglDestroySurface(EGLDisplay d, EGLSurface surface) {
 }
 static void win_dequeue(struct esurf *s) {
     int fence = -1;
+    if (s->ewin) { s->w = s->ewin->width; s->h = s->ewin->height; return; }      /* (1.x: the window is always its own buffer) */
     if (s->buf) return;
-    if (!s->ready) { s->win->perform(s->win, 0 /* NATIVE_WINDOW_SET_USAGE */, 0x933); s->ready = 1; }
-    if (s->win->dequeueBuffer(s->win, &s->buf, &fence) != 0) { s->buf = 0; return; }
-    if (fence >= 0) { struct pollfd p = { fence, POLLIN, 0 }; poll(&p, 1, 1000); close(fence); }
+    if (!s->ready) {
+        /* (before 4.2: SW_READ_OFTEN | SW_WRITE_OFTEN, what AOSP's libagl asks for; the compositor adds its own texture usage. HW_RENDER / HW_COMPOSER would send a vendor
+         * gralloc to pmem or the GPU's own memory, which the bridge can neither lock nor fill) */
+        s->win->perform(s->win, 0 /* NATIVE_WINDOW_SET_USAGE */, win_new_abi(s->win) ? 0x933 : 0x33);
+        s->ready = 1;
+    }
+    s->buf = 0;
+    /* (a window can report success and still hand back no buffer, e.g. when its gralloc allocation failed: treat that as a failed dequeue,
+     * every caller already copes with s->buf == 0 - dereferencing it killed SurfaceFlinger with SIGSEGV at address 0x20) */
+    if (w_dequeue(s->win, &s->buf, &fence) != 0 || !s->buf) {
+        if (fence >= 0) close(fence);
+        s->buf = 0;
+        return;
+    }
+    if (fence >= 0) {
+        static int (*pl)(struct pollfd *, unsigned long, int);
+        static int looked;
+        struct pollfd p = { fence, POLLIN, 0 };
+        if (!looked) { pl = (int (*)(struct pollfd *, unsigned long, int))libc_sym("poll"); looked = 1; }
+        if (pl) pl(&p, 1, 1000);
+        close(fence);
+    }
     s->w = s->buf->width; s->h = s->buf->height;
 }
 EXPORT EGLBoolean eglQuerySurface(EGLDisplay d, EGLSurface surface, EGLint attr, EGLint *value) {
@@ -1106,7 +1623,8 @@ EXPORT EGLBoolean eglQuerySurface(EGLDisplay d, EGLSurface surface, EGLint attr,
     if (s->ss) { SSF(EGLBoolean, QuerySurface, (EGLDisplay, EGLSurface, EGLint, EGLint *)); return QuerySurface(d, s->ss, attr, value); }
     switch (attr) {
     case EGL_WIDTH: case EGL_HEIGHT:
-        if (s->kind == S_WINDOW && !s->buf) { int v = 0; s->win->query(s->win, attr == EGL_WIDTH ? 0 : 1, &v); *value = v; }
+        if (s->ewin) *value = attr == EGL_WIDTH ? s->ewin->width : s->ewin->height;
+        else if (s->kind == S_WINDOW && !s->buf) { int v = 0; s->win->query(s->win, attr == EGL_WIDTH ? 0 : 1, &v); *value = v; }
         else *value = attr == EGL_WIDTH ? s->w : s->h;
         return 1;
     case 0x3086: *value = 0x3084; return 1;     /* EGL_RENDER_BUFFER: EGL_BACK_BUFFER */
@@ -1132,22 +1650,34 @@ EXPORT EGLContext eglCreateContext(EGLDisplay d, EGLConfig cfg, EGLContext share
     c->version = attr_of(attribs, 0x3098 /* EGL_CONTEXT_CLIENT_VERSION */, 1);
     c->dpy = d; c->cfg = cfg;
     c->g.p_align = c->g.u_align = 4;
-    if (sh ? sh->bridged : policy(c->version)) {
+    if (sh ? sh->bridged : (solo() || policy(c->version))) {
         struct ts *T = ts_get();
         if (T) {
             begin(T, OP_CTX_CREATE, 8, 8); put32(T, sh ? sh->host : 0); put32(T, (uint32_t)c->version);
             rsync(T);
             c->host = get32v(T);
             c->g.root = sh ? sh->g.root : c->host;
+            if (!c->host && sh) {
+                /* The phone's driver refused a context that shares with another. SPen (S Note, Quick Memo, Flash Annotate) answers
+                 * a refused window context with an eglMakeCurrent on nothing and then reads GL_RENDERER from no context: the program
+                 * dies. A context of its own draws (its objects are its own, not the group's) and the program lives. */
+                LOG("the host refused a GLES %d context sharing with %u: a context of its own", c->version, sh->host);
+                begin(T, OP_CTX_CREATE, 8, 8); put32(T, 0); put32(T, (uint32_t)c->version);
+                rsync(T);
+                c->host = get32v(T);
+                c->g.root = c->host;
+            }
         }
         if (c->host) {
             char name[17] = "";
-            prctl(PR_GET_NAME, name);
+            thread_name(name);
             c->bridged = 1;
             LOG("a GLES %d context on the phone's GPU (%u), thread %s", c->version, c->host, name);
+        crash_logger_install();
             return c;
         }
         if (sh) { free(c); t_err = EGL_BAD_ALLOC; return 0; }
+        if (solo()) { free(c); t_err = EGL_BAD_ALLOC; LOG("the host gave no context and there is no software renderer"); return 0; }
         LOG("the host gave no context: SwiftShader");
     }
     SSF(EGLContext, CreateContext, (EGLDisplay, EGLConfig, EGLContext, const EGLint *));
@@ -1169,6 +1699,7 @@ static void ctx_free(struct ectx *c) {
         for (int i = 0; i < c->g.next; i++) free(c->g.ext[i]);
         free(c->g.ext);
         for (int i = 0; i < 8; i++) free(c->g.maps[i].ptr);
+        free(c->g1);
     } else { SSF(EGLBoolean, DestroyContext, (EGLDisplay, EGLContext)); if (DestroyContext) DestroyContext(c->dpy, c->ss); }
     free(c);
 }
@@ -1249,7 +1780,7 @@ EXPORT EGLBoolean eglMakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read,
             surf_unref(od); if (orr != od) surf_unref(orr);
             if (--old->current == 0x10000) ctx_free(old);
         }
-        t_tbl = SS.enc;
+        t_tbl = c->version == 1 ? SS.enc1 : SS.enc;
         return 1;
     }
     bridge_release();
@@ -1296,10 +1827,134 @@ EXPORT EGLBoolean eglWaitGL(void) {
 }
 EXPORT EGLBoolean eglWaitClient(void) { return eglWaitGL(); }
 
-/* The frame of a bridged context: the host reads it back, bottom row first, and it is copied into the window's
- * buffer the other way up. */
+/* ---- the layout of the framebuffer's own memory ----
+ * A window buffer with GRALLOC_USAGE_HW_FB (0x1000) lives in fb0's memory and has fb0's pixel layout, whatever format the window asked for
+ * (the fbdev gralloc of an x86 firmware). Read once from fb0 (FBIOGET_VSCREENINFO): bits per pixel and where each channel sits. */
+struct fbfmt { int ok, bpp, ro, rl, go, gl, bo, bl, ao, al; };
+static struct fbfmt g_fb;
+static const struct fbfmt *fb_layout(void) {
+    static volatile int tried;
+    if (!tried) {
+        tried = 1;
+        uint32_t v[40];
+        static const char *const dev[] = { "/dev/graphics/fb0", "/dev/fb0" };
+        for (unsigned i = 0; i < 2 && !g_fb.ok; i++) {
+            int fd = open(dev[i], O_RDONLY | O_CLOEXEC);
+            if (fd < 0) continue;
+            memset(v, 0, sizeof(v));
+            if (ioctl(fd, 0x4600 /* FBIOGET_VSCREENINFO */, v) == 0 && (v[6] == 16 || v[6] == 24 || v[6] == 32)) {
+                g_fb.bpp = (int)v[6];
+                g_fb.ro = (int)v[8]; g_fb.rl = (int)v[9]; g_fb.go = (int)v[11]; g_fb.gl = (int)v[12];
+                g_fb.bo = (int)v[14]; g_fb.bl = (int)v[15]; g_fb.ao = (int)v[17]; g_fb.al = (int)v[18];
+                /* a driver that left the channels empty: the usual layouts */
+                if (!g_fb.rl || !g_fb.gl || !g_fb.bl) {
+                    if (g_fb.bpp == 16) { g_fb.ro = 11; g_fb.rl = 5; g_fb.go = 5; g_fb.gl = 6; g_fb.bo = 0; g_fb.bl = 5; g_fb.ao = g_fb.al = 0; }
+                    else { g_fb.ro = 0; g_fb.rl = 8; g_fb.go = 8; g_fb.gl = 8; g_fb.bo = 16; g_fb.bl = 8; g_fb.ao = 24; g_fb.al = g_fb.bpp == 32 ? 8 : 0; }
+                }
+                g_fb.ok = 1;
+                LOG("fb0: %d bpp, r %d:%d g %d:%d b %d:%d a %d:%d", g_fb.bpp, g_fb.ro, g_fb.rl, g_fb.go, g_fb.gl, g_fb.bo, g_fb.bl, g_fb.ao, g_fb.al);
+            }
+            close(fd);
+        }
+        if (!g_fb.ok) LOG("fb0: layout not readable, a framebuffer window buffer is taken as RGB_565");
+    }
+    return g_fb.ok ? &g_fb : 0;
+}
+/* one row of RGBA (the host's readback) into the memory of a buffer of this layout */
+static void fb_row(uint8_t *dst, const uint8_t *src, uint32_t w, const struct fbfmt *f) {
+    for (uint32_t x = 0; x < w; x++, src += 4) {
+        uint32_t v = (uint32_t)(src[0] >> (8 - f->rl)) << f->ro | (uint32_t)(src[1] >> (8 - f->gl)) << f->go | (uint32_t)(src[2] >> (8 - f->bl)) << f->bo;
+        if (f->al) v |= (uint32_t)(src[3] >> (8 - f->al)) << f->ao;
+        if (f->bpp == 16) ((uint16_t *)dst)[x] = (uint16_t)v;
+        else if (f->bpp == 24) { dst[x * 3] = (uint8_t)v; dst[x * 3 + 1] = (uint8_t)(v >> 8); dst[x * 3 + 2] = (uint8_t)(v >> 16); }
+        else ((uint32_t *)dst)[x] = v;
+    }
+}
+
+/* The layout a pixel format (HAL_PIXEL_FORMAT_* = PixelFormat of 1.x) names; 0: one the bridge does not know */
+static const struct fbfmt *fmt_layout(int format, struct fbfmt *own) {
+    *own = (struct fbfmt){ 1, 32, 0, 8, 8, 8, 16, 8, 24, 8 };       /* RGBA_8888 */
+    switch (format) {
+    case 1: return own;                                                                       /* RGBA_8888 */
+    case 2: own->al = 0; return own;                                                          /* RGBX_8888 */
+    case 5: own->ro = 16; own->bo = 0; return own;                                            /* BGRA_8888 */
+    case 3: own->bpp = 24; own->al = 0; return own;                                           /* RGB_888 */
+    case 4: *own = (struct fbfmt){ 1, 16, 11, 5, 5, 6, 0, 5, 0, 0 }; return own;             /* RGB_565 */
+    }
+    return 0;
+}
+
+/* What a window buffer's memory looks like: a framebuffer buffer has fb0's layout (see fb_layout), any other the layout its HAL
+ * format names. 0: a format the bridge does not know. */
+static const struct fbfmt *buf_layout(const struct ANativeWindowBuffer *b, struct fbfmt *own, int *hw_fb) {
+    const struct fbfmt *lay = 0;
+    *hw_fb = (b->usage_deprecated & 0x1000) != 0;
+    if (*hw_fb) lay = fb_layout();
+    if (!lay) {
+        lay = fmt_layout(b->format, own);
+        if (!lay && *hw_fb) { *own = (struct fbfmt){ 1, 16, 11, 5, 5, 6, 0, 5, 0, 0 }; lay = own; }     /* (fb0 unreadable: 16 bit, as before) */
+    }
+    return lay;
+}
+
+/* Android 1.0 - 1.6: the frame goes into the window's own pixels (base + offset), then the window posts / flips (see egl_native_window_t) */
+static EGLBoolean bridge_swap_egl(struct ts *T, struct esurf *s) {
+    struct egl_native_window_t *e = s->ewin;
+    uint32_t w = e->width > 0 ? (uint32_t)e->width : 0, h = e->height > 0 ? (uint32_t)e->height : 0;
+    struct fbfmt own;
+    const struct fbfmt *lay = e->memory_type == 2 ? fb_layout() : 0;                 /* NATIVE_MEMORY_TYPE_FB: fb0's own layout */
+    if (!lay) lay = fmt_layout(e->format, &own);
+    if (!lay && e->memory_type == 2) { own = (struct fbfmt){ 1, 16, 11, 5, 5, 6, 0, 5, 0, 0 }; lay = &own; }
+    uint8_t *va = e->base ? (uint8_t *)(e->base + e->offset) : 0;
+    {   static int said;
+        if (said < 3) { said++; LOG("1.x window %ux%u stride %d format %d memory %d -> %d bpp", w, h, e->stride, e->format, e->memory_type, lay ? lay->bpp : 0); }
+    }
+    if (w && h) {
+        if (!lay) { static int said; if (said++ < 5) LOG("a frame is dropped: window format %d has no layout the bridge knows", e->format); }
+        if (!va) { static int said; if (said++ < 5) LOG("a frame is dropped: the window has no pixels"); }
+        uint32_t need = w * h * 4;
+        if (lay && (T->caps & AEMU_CAP_SWAP_FMT)) {
+            uint32_t px = lay->bpp / 8, stride = e->stride >= (int)w ? (uint32_t)e->stride : w, pitch = stride * px;
+            uint32_t total = pitch * (h - 1) + w * px;
+            begin(T, OP_SWAP_FMT, 48, 48);
+            put32(T, w); put32(T, h); put32(T, (uint32_t)lay->bpp); put32(T, pitch);
+            put32(T, (uint32_t)lay->ro); put32(T, (uint32_t)lay->rl); put32(T, (uint32_t)lay->go); put32(T, (uint32_t)lay->gl);
+            put32(T, (uint32_t)lay->bo); put32(T, (uint32_t)lay->bl); put32(T, (uint32_t)lay->ao); put32(T, (uint32_t)lay->al);
+            rsync(T);
+            if (va) rd_all(T, va, total); else get(T, 0, total);
+        } else {
+            if (s->tmp_n < need) { free(s->tmp); s->tmp = malloc(need); s->tmp_n = s->tmp ? need : 0; }
+            begin(T, OP_SWAP, 8, 8); put32(T, w); put32(T, h);
+            rsync(T);
+            get(T, s->tmp, need);
+            if (va && lay && s->tmp) {
+                uint32_t stride = e->stride >= (int)w ? (uint32_t)e->stride : w;
+                for (uint32_t y = 0; y < h; y++) fb_row(va + (size_t)y * stride * (uint32_t)(lay->bpp / 8), s->tmp + (size_t)(h - 1 - y) * w * 4, w, lay);
+            }
+        }
+    }
+    uint32_t flags = e->swapBuffers(e);
+    if ((flags & EGL_NATIVES_FLAG_SIZE_CHANGED) || (uint32_t)e->width != w || (uint32_t)e->height != h) {
+        s->w = e->width; s->h = e->height;
+        begin(T, OP_SURF_SIZE, 8, 8); put32(T, (uint32_t)s->w); put32(T, (uint32_t)s->h);
+    }
+    return 1;
+}
+
+/* The frame of a bridged context goes into the window's buffer. A buffer of the engine's gralloc stays on the host (the frame is
+ * copied into the host's buffer of the same number); any other is filled from a read-back: by the host in the buffer's own layout, top
+ * row first, straight into the memory (the host's CPU does what a translated guest's would take milliseconds for), or - a host
+ * that does not offer that - from RGBA, bottom row first, converted here. */
+/* how much of a block is not zero (every 4th byte looked at): the log says where a frame turns black */
+static unsigned nz_pct(const uint8_t *p, size_t n) {
+    if (!p || !n) return 0;
+    size_t hit = 0, seen = 0;
+    for (size_t i = 0; i < n; i += 4, seen++) if (p[i] | p[i + 1 < n ? i + 1 : i]) hit++;
+    return (unsigned)(hit * 100 / (seen ? seen : 1));
+}
 static EGLBoolean bridge_swap(struct ts *T, struct esurf *s) {
     if (s->kind != S_WINDOW) return 1;
+    if (s->ewin) return bridge_swap_egl(T, s);
     win_dequeue(s);
     if (!s->buf) { t_err = EGL_BAD_SURFACE; return 0; }
     struct ANativeWindowBuffer *b = s->buf;
@@ -1314,29 +1969,51 @@ static EGLBoolean bridge_swap(struct ts *T, struct esurf *s) {
         begin(T, OP_SWAP_BUF, 32, 32); put32(T, w); put32(T, h); put64(T, note->id); put64(T, note->pad[0]); put64(T, frame);
         flush(T);
         s->buf = 0;
-        s->win->queueBuffer(s->win, b, -1);
+        w_queue(s->win, b);
         win_dequeue(s);
         if (s->buf && ((uint32_t)s->w != w || (uint32_t)s->h != h)) { begin(T, OP_SURF_SIZE, 8, 8); put32(T, (uint32_t)s->w); put32(T, (uint32_t)s->h); }
         return 1;
     }
-    if (s->tmp_n < need) { free(s->tmp); s->tmp = malloc(need); s->tmp_n = s->tmp ? need : 0; }
-    begin(T, OP_SWAP, 8, 8); put32(T, w); put32(T, h);
-    rsync(T);
-    get(T, s->tmp, need);
-    uint8_t *va = s->tmp ? buf_lock(b, 1) : 0;
-    if (va) {
-        if (b->format == 4) {       /* RGB_565 */
-            for (uint32_t y = 0; y < h; y++) {
-                const uint8_t *src = s->tmp + (size_t)(h - 1 - y) * w * 4;
-                uint16_t *dst = (uint16_t *)(va + (size_t)y * (uint32_t)b->stride * 2);
-                for (uint32_t x = 0; x < w; x++, src += 4) dst[x] = (uint16_t)((src[0] >> 3) << 11 | (src[1] >> 2) << 5 | src[2] >> 3);
-            }
-        } else for (uint32_t y = 0; y < h; y++)
-            memcpy(va + (size_t)y * (uint32_t)b->stride * 4, s->tmp + (size_t)(h - 1 - y) * w * 4, (size_t)w * 4);
-        buf_unlock(b);
+    struct fbfmt own;
+    int hw_fb = 0;
+    const struct fbfmt *lay = buf_layout(b, &own, &hw_fb);
+    {   static int said;
+        if (said < 3) { said++; LOG("window buffer %dx%d stride %d format %d usage 0x%x -> %d bpp%s%s", b->width, b->height, b->stride, b->format, b->usage_deprecated, lay ? lay->bpp : 0, hw_fb ? " (framebuffer)" : "", (T->caps & AEMU_CAP_SWAP_FMT) ? ", converted by the host" : ""); }
+    }
+    if (!lay) { static int said; if (said++ < 5) LOG("a frame is dropped: window buffer format %d has no layout the bridge knows", b->format); }
+    if (lay && (T->caps & AEMU_CAP_SWAP_FMT)) {
+        uint32_t px = lay->bpp / 8, stride = b->stride >= (int)w ? (uint32_t)b->stride : w, pitch = stride * px;
+        uint32_t total = pitch * (h - 1) + w * px;
+        uint8_t *va = buf_lock(b, 1);
+        int swap_log = 0;
+        if (!va) { static int said; if (said++ < 5) LOG("a frame is dropped: the gralloc would not lock the window buffer (usage 0x%x)", b->usage_deprecated); }
+        {   static __thread unsigned n, dropped;
+            n++; if (!va) dropped++;
+            swap_log = (n == 1 || n == 10 || n == 60 || n == 300 || n % 1500 == 0);
+            if (swap_log) { char nm[17] = ""; thread_name(nm); LOG("swaps of thread %s: %u, %u without pixels (%dx%d usage 0x%x)", nm, n, dropped, b->width, b->height, b->usage_deprecated); }
+        }
+        begin(T, OP_SWAP_FMT, 48, 48);
+        put32(T, w); put32(T, h); put32(T, (uint32_t)lay->bpp); put32(T, pitch);
+        put32(T, (uint32_t)lay->ro); put32(T, (uint32_t)lay->rl); put32(T, (uint32_t)lay->go); put32(T, (uint32_t)lay->gl);
+        put32(T, (uint32_t)lay->bo); put32(T, (uint32_t)lay->bl); put32(T, (uint32_t)lay->ao); put32(T, (uint32_t)lay->al);
+        rsync(T);
+        if (va) { rd_all(T, va, total); if (swap_log) { char nm[17] = ""; thread_name(nm); LOG("  frame of thread %s read back from the host: %u%% not zero", nm, nz_pct(va, total)); } buf_unlock(b); }
+        else get(T, 0, total);                     /* (the frame has to be taken off the socket either way) */
+    } else {
+        if (s->tmp_n < need) { free(s->tmp); s->tmp = malloc(need); s->tmp_n = s->tmp ? need : 0; }
+        begin(T, OP_SWAP, 8, 8); put32(T, w); put32(T, h);
+        rsync(T);
+        get(T, s->tmp, need);
+        uint8_t *va = s->tmp ? buf_lock(b, 1) : 0;
+        if (!va && lay) { static int said; if (said++ < 5) LOG("a frame is dropped: the gralloc would not lock the window buffer (usage 0x%x)", b->usage_deprecated); }
+        if (va) {
+            if (lay) for (uint32_t y = 0; y < h; y++)
+                fb_row(va + (size_t)y * (uint32_t)b->stride * (uint32_t)(lay->bpp / 8), s->tmp + (size_t)(h - 1 - y) * w * 4, w, lay);
+            buf_unlock(b);
+        }
     }
     s->buf = 0;
-    s->win->queueBuffer(s->win, b, -1);
+    w_queue(s->win, b);
     win_dequeue(s);
     if (s->buf && ((uint32_t)s->w != w || (uint32_t)s->h != h)) { begin(T, OP_SURF_SIZE, 8, 8); put32(T, (uint32_t)s->w); put32(T, (uint32_t)s->h); }
     return 1;
@@ -1347,7 +2024,7 @@ EXPORT EGLBoolean eglSwapInterval(EGLDisplay d, EGLint interval) {
     struct ts *T = t_ts;
     if (T && T->ctx) {
         struct esurf *s = T->draw;
-        if (s && s->kind == S_WINDOW && s->win->setSwapInterval) s->win->setSwapInterval(s->win, interval < 0 ? 0 : interval);
+        if (s && s->kind == S_WINDOW && s->win && s->win->setSwapInterval) s->win->setSwapInterval(s->win, interval < 0 ? 0 : interval);
         return 1;
     }
     SSF(EGLBoolean, SwapInterval, (EGLDisplay, EGLint));
@@ -1364,33 +2041,125 @@ EXPORT EGLBoolean eglSwapBuffers(EGLDisplay d, EGLSurface surface) {
 EXPORT EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay d, EGLSurface s, EGLint *rects, EGLint n) { (void)rects; (void)n; return eglSwapBuffers(d, s); }
 EXPORT EGLBoolean eglSetDamageRegionKHR(EGLDisplay d, EGLSurface s, EGLint *rects, EGLint n) { (void)d; (void)s; (void)rects; (void)n; return 1; }
 
+/* ---- YUV buffers: converted to RGBA on the guest side, then carried like any RGBA buffer ----
+ * The host GPU bridge only knows RGBA/RGBX/RGB888/RGB565 (host.c buf_fill), so a video decoder's NV21 / YV12 buffer
+ * is turned into a tight RGBA block here and goes out through the existing OP_IMAGE_DATA / OP_IMAGE_TEX paths.
+ * The layouts are the ones the engine's gralloc gives (gralloc5/mapper.c planes(), grallocwrap/gralloc_wrap.c):
+ *   0x11 / 0x23  NV21 in one block: Y (stride = width), then V and U interleaved, no row padding
+ *   0x32315659   YV12: Y, V, U; the Y stride aligned to 16, the chroma stride to 16 of half that */
+#define YUV_NV21 1
+#define YUV_YV12 2
+static int yuv_kind(uint32_t f) { return f == 0x11 || f == 0x23 ? YUV_NV21 : f == 0x32315659 ? YUV_YV12 : 0; }
+static inline uint8_t yuv_clamp(int v) { return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+/* The buffer's format: its own, else what the note says (the note is the gralloc's truth for the buffer) */
+static int yuv_kind_of(const struct ANativeWindowBuffer *b, const struct meta_note *note) {
+    int k = yuv_kind((uint32_t)b->format);
+    if (!k && note && note->magic == META_NOTE) k = yuv_kind((uint32_t)note->format);
+    return k;
+}
+/* Returns w*h*4 bytes of RGBA (top row first, alpha 255, malloc'd), or 0: not a YUV buffer this converts, or its
+ * memory cannot be read. BT.709 video range, integer math (BT.601 when the note's dataspace says so). */
+static uint8_t *yuv_take(struct ANativeWindowBuffer *b, const struct meta_note *note) {
+    static int said;
+    int kind = yuv_kind_of(b, note);
+    if (!kind || b->width <= 0 || b->height <= 0 || b->width > 8192 || b->height > 8192) return 0;
+    uint32_t w = (uint32_t)b->width, h = (uint32_t)b->height, cw = (w + 1) / 2, ch = (h + 1) / 2;
+    int have = note && note->magic == META_NOTE;
+    uint32_t ys = w, cs = 0, stride = have && note->stride > 0 ? (uint32_t)note->stride : b->stride > 0 ? (uint32_t)b->stride : 0;
+    uint64_t need;
+    if (kind == YUV_YV12) {
+        ys = stride >= w ? stride : (w + 15) & ~15u;
+        cs = (ys / 2 + 15) & ~15u;
+        need = (uint64_t)ys * h + 2 * (uint64_t)cs * ch;
+    } else need = (uint64_t)w * h + 2 * (uint64_t)cw * ch;
+    uint8_t *out = malloc((size_t)w * h * 4);
+    if (!out) return 0;
+    /* (a buffer that refuses a plain lock is read through the note's base, without a fence) */
+    uint8_t *va = buf_lock(b, 0);
+    int locked = va != 0;
+    if (!va) {
+        const struct rgb_note_handle *p = note_handle_of(b->handle);
+        if (p && p->base && p->size > 0 && (uint64_t)p->size >= need) va = (uint8_t *)(uintptr_t)p->base;
+        if (va && said < 5) LOG("a YUV buffer would not lock: read through the note's base");
+    }
+    if (!va) { free(out); return 0; }
+    /* BT.709 by default; BT.601 for the dataspace standards 2 and 3 (BT601_625, BT601_525) */
+    uint32_t std = have ? ((uint32_t)note->dataspace >> 16) & 0x3f : 0;
+    int crv = 459, cgu = 55, cgv = 136, cbu = 541;
+    if (std == 2 || std == 3) { crv = 409; cgu = 100; cgv = 208; cbu = 516; }
+    const uint8_t *Y = va, *UV = va + (size_t)w * h, *V = va + (size_t)ys * h, *U = V + (size_t)cs * ch;
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t *yr = Y + (size_t)y * ys;
+        const uint8_t *uv = UV + (size_t)(y >> 1) * 2 * cw, *vr = V + (size_t)(y >> 1) * cs, *ur = U + (size_t)(y >> 1) * cs;
+        uint8_t *d = out + (size_t)y * w * 4;
+        for (uint32_t x = 0; x < w; x++, d += 4) {
+            int v, u, c = (yr[x] - 16) * 298;
+            if (kind == YUV_NV21) { v = uv[(x >> 1) * 2]; u = uv[(x >> 1) * 2 + 1]; }
+            else { v = vr[x >> 1]; u = ur[x >> 1]; }
+            u -= 128; v -= 128;
+            d[0] = yuv_clamp((c + crv * v + 128) >> 8);
+            d[1] = yuv_clamp((c - cgu * u - cgv * v + 128) >> 8);
+            d[2] = yuv_clamp((c + cbu * u + 128) >> 8);
+            d[3] = 255;
+        }
+    }
+    if (locked) buf_unlock(b);
+    if (said < 5) { said++; LOG("a %ux%u YUV frame (format 0x%x, stride %u): converted for the phone's GPU", w, h, (unsigned)b->format, ys); }
+    return out;
+}
+
 /* ---- images: SwiftShader's own, and for each the buffer it was made of (a bridged context uploads its pixels) ---- */
-static struct { void *img; struct ANativeWindowBuffer *buf; uint32_t host; } g_img[256];     /* host: an image of a bridged context's texture */
+/* host: an image of a bridged context's texture; own: a handle of ours that only carries the buffer to the upload */
+static struct { void *img; struct ANativeWindowBuffer *buf; uint32_t host; int own; } g_img[256];
+/* An image that is only the buffer: what a YUV buffer gets when SwiftShader (or a bridged context) cannot make one */
+static EGLImageKHR own_image(struct ANativeWindowBuffer *b) {
+    void *h = b ? malloc(8) : 0;
+    int ok = 0;
+    if (!h) { t_err = EGL_BAD_ALLOC; return 0; }
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < 256; i++) if (!g_img[i].img) { g_img[i].img = h; g_img[i].buf = b; g_img[i].host = 0; g_img[i].own = 1; ok = 1; break; }
+    pthread_mutex_unlock(&g_lock);
+    if (!ok) { free(h); t_err = EGL_BAD_ALLOC; return 0; }
+    b->common.incRef(&b->common);
+    return h;
+}
 EXPORT EGLImageKHR eglCreateImageKHR(EGLDisplay d, EGLContext context, EGLenum target, EGLClientBuffer buffer, const EGLint *attribs) {
     struct ectx *c = context;
     SSF(EGLImageKHR, CreateImageKHR, (EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint *));
+    {   static int said;
+        if (said++ < 4) LOG("eglCreateImageKHR: target 0x%x, buffer %p, context %p (bridged %d), solo %d", (unsigned)target, buffer, context, c ? c->bridged : -1, solo());
+    }
+    /* (no software renderer: a native buffer is only carried to the upload, whatever context - or none - the call names;
+     * RenderEngine makes its images with EGL_NO_CONTEXT) */
+    if (solo() && target == 0x3140 /* EGL_NATIVE_BUFFER_ANDROID */ && buffer && !(c && !c->bridged)) return own_image(buffer);
     if (c && c->bridged) {
         /* a bridged context's texture: the image is the host's, and only bridged contexts can use it */
         struct ts *T = t_ts;
         void *h = 0;
         uint32_t id = 0;
+        /* (a native buffer is only carried: its pixels go to the host when a texture is bound to the image) */
+        if (target == 0x3140 /* EGL_NATIVE_BUFFER_ANDROID */ && buffer) return own_image(buffer);
         if (target != 0x30B1 /* EGL_GL_TEXTURE_2D_KHR */ || !T || !T->ctx) { t_err = EGL_BAD_MATCH; return 0; }
         begin(T, OP_IMAGE_CREATE, 8, 8); put32(T, (uint32_t)(uintptr_t)buffer); put32(T, (uint32_t)attr_of(attribs, 0x30BC, 0));
         rsync(T);
         id = get32v(T);
         if (id && (h = malloc(8))) {
             pthread_mutex_lock(&g_lock);
-            for (int i = 0; i < 256; i++) if (!g_img[i].img) { g_img[i].img = h; g_img[i].buf = 0; g_img[i].host = id; id = 0; break; }
+            for (int i = 0; i < 256; i++) if (!g_img[i].img) { g_img[i].img = h; g_img[i].buf = 0; g_img[i].host = id; g_img[i].own = 0; id = 0; break; }
             pthread_mutex_unlock(&g_lock);
         }
         if (!h || id) { free(h); t_err = EGL_BAD_ALLOC; return 0; }
         return h;
     }
     void *img = CreateImageKHR ? CreateImageKHR(d, c ? c->ss : 0, target, buffer, attribs) : 0;
+    /* SwiftShader may decline a YUV buffer: the image is then ours, and only carries the buffer to the upload */
+    if (!img && target == 0x3140 /* EGL_NATIVE_BUFFER_ANDROID */ && buffer &&
+        yuv_kind_of(buffer, meta_note_at(((struct ANativeWindowBuffer *)buffer)->handle)))
+        return own_image(buffer);
     if (img && target == 0x3140 /* EGL_NATIVE_BUFFER_ANDROID */) {
         struct ANativeWindowBuffer *b = buffer;
         pthread_mutex_lock(&g_lock);
-        for (int i = 0; i < 256; i++) if (!g_img[i].img) { g_img[i].img = img; g_img[i].buf = b; b->common.incRef(&b->common); break; }
+        for (int i = 0; i < 256; i++) if (!g_img[i].img) { g_img[i].img = img; g_img[i].buf = b; g_img[i].host = 0; g_img[i].own = 0; b->common.incRef(&b->common); break; }
         pthread_mutex_unlock(&g_lock);
     }
     return img;
@@ -1399,9 +2168,11 @@ EXPORT EGLBoolean eglDestroyImageKHR(EGLDisplay d, EGLImageKHR img) {
     struct ANativeWindowBuffer *b = 0;
     pthread_mutex_lock(&g_lock);
     uint32_t host = 0;
-    for (int i = 0; i < 256; i++) if (g_img[i].img == img) { b = g_img[i].buf; host = g_img[i].host; g_img[i].img = 0; g_img[i].buf = 0; g_img[i].host = 0; break; }
+    int own = 0;
+    for (int i = 0; i < 256; i++) if (g_img[i].img == img) { b = g_img[i].buf; host = g_img[i].host; own = g_img[i].own; g_img[i].img = 0; g_img[i].buf = 0; g_img[i].host = 0; g_img[i].own = 0; break; }
     pthread_mutex_unlock(&g_lock);
     if (b) b->common.decRef(&b->common);
+    if (own) { free(img); return 1; }     /* (ours: nothing of SwiftShader's behind it) */
     if (host) {
         struct ts *T = ts_get();
         if (T) { begin(T, OP_IMAGE_DESTROY, 4, 4); put32(T, host); }
@@ -1411,7 +2182,7 @@ EXPORT EGLBoolean eglDestroyImageKHR(EGLDisplay d, EGLImageKHR img) {
     SSF(EGLBoolean, DestroyImageKHR, (EGLDisplay, EGLImageKHR));
     return DestroyImageKHR ? DestroyImageKHR(d, img) : 0;
 }
-static void e_glEGLImageTargetTexture2DOES(GLenum target, GLeglImageOES image) {
+static void image_upload(GLenum target, GLeglImageOES image) {
     struct ts *T = TS();
     struct ANativeWindowBuffer *b = 0;
     pthread_mutex_lock(&g_lock);
@@ -1434,7 +2205,17 @@ static void e_glEGLImageTargetTexture2DOES(GLenum target, GLeglImageOES image) {
         uint32_t wanted = get32v(T);
         /* (it may be drawn into from now on: gralloc asks the host before the memory is read) */
         if (target == 0x0DE1 && !note->pad[1]) note->pad[1] = 1;
-        if (!wanted || !bpp) return;
+        if (!wanted) return;
+        if (!bpp && yuv_kind_of(b, note)) {     /* video: converted to RGBA, then as an RGBA buffer of the width's stride */
+            uint8_t *rgba = yuv_take(b, note);
+            if (!rgba) return;
+            begin(T, OP_IMAGE_DATA, 36, 36 + BLOB(w * h * 4));
+            put64(T, note->id); put64(T, count); put32(T, w); put32(T, h); put32(T, w); put32(T, 1 /* RGBA_8888 */);
+            putblob(T, rgba, w * h * 4);
+            free(rgba);
+            return;
+        }
+        if (!bpp) return;
         uint8_t *px = buf_lock(b, 0);
         if (!px) return;
         uint32_t n = (uint32_t)b->stride * h * (uint32_t)bpp;
@@ -1444,9 +2225,31 @@ static void e_glEGLImageTargetTexture2DOES(GLenum target, GLeglImageOES image) {
         buf_unlock(b);
         return;
     }
+    if (!bpp && yuv_kind_of(b, note)) {
+        uint8_t *rgba = yuv_take(b, note);
+        if (rgba) {
+            begin(T, OP_IMAGE_TEX, 16, 16 + BLOB(w * h * 4));
+            put32(T, target); put32(T, w); put32(T, h); putblob(T, rgba, w * h * 4);
+            free(rgba);
+        }
+        return;
+    }
     if (!bpp) { not_carried(); return; }
     uint8_t *va = buf_lock(b, 0), *tight = 0;
+    {   static unsigned n, nopx;
+        n++; if (!va) nopx++;
+        if (n <= 6 || n == 50 || n == 500 || n % 5000 == 0) { char nm[17] = ""; thread_name(nm); LOG("texture upload %u in thread %s: %dx%d format %d stride %d usage 0x%x, %s (%u without pixels), %u%% not zero", n, nm, b->width, b->height, b->format, b->stride, b->usage_deprecated, va ? "pixels read" : "NO PIXELS", nopx, va ? nz_pct(va, (size_t)b->stride * (size_t)b->height * (size_t)(bpp ? bpp : 4)) : 0u); }
+    }
     if (!va) return;
+    if ((T->caps & AEMU_CAP_IMAGE_TEX2) && b->format >= 1 && b->format <= 4 && b->stride >= (int)w) {
+        /* the rows as the buffer holds them (the pitch, the format): the host's GPU takes any of them, the guest repacks nothing */
+        uint32_t n = ((uint32_t)(b->stride) * (h - 1) + w) * (uint32_t)bpp;
+        begin(T, OP_IMAGE_TEX2, 24, 24 + BLOB(n));
+        put32(T, target); put32(T, w); put32(T, h); put32(T, (uint32_t)b->stride); put32(T, (uint32_t)b->format);
+        putblob(T, va, n);
+        buf_unlock(b);
+        return;
+    }
     if (bpp != 4) {     /* RGB_565 / RGB_888 (a camera preview's window, say): widened to RGBA */
         if (!(tight = malloc((size_t)w * h * 4))) { buf_unlock(b); return; }
         for (uint32_t y = 0; y < h; y++) {
@@ -1468,6 +2271,75 @@ static void e_glEGLImageTargetTexture2DOES(GLenum target, GLeglImageOES image) {
     buf_unlock(b);
 }
 
+
+/* glTexSubImage2D into a texture that is an image of a buffer without a note: the rows go into the buffer's memory too */
+static void tex_mirror(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, const void *pixels) {
+    struct gstate *g = G();
+    void *img = 0;
+    struct ANativeWindowBuffer *b = 0;
+    unsigned tex = g->unit < 32 ? g->tex2d[g->unit] : 0;
+    for (int i = 0; tex && i < 16; i++) if (g->timg[i].tex == tex) { img = g->timg[i].img; break; }
+    if (!img || format != 0x1908 || type != 0x1401 || x < 0 || y < 0 || w <= 0 || h <= 0) return;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < 256; i++) if (g_img[i].img == img) { b = g_img[i].host ? 0 : g_img[i].buf; break; }
+    pthread_mutex_unlock(&g_lock);
+    if (!b || x + w > b->width || y + h > b->height || b->stride < x + w || (b->format != 1 && b->format != 2 && b->format != 5)) return;
+    struct meta_note *note = meta_note_at(b->handle);
+    if (note && note->magic == META_NOTE && note->id) return;       /* (the host keeps this buffer's pixels itself) */
+    long align = g->u_align < 1 ? 4 : g->u_align, rowlen = g->u_row > 0 ? g->u_row : w;
+    long stride = (rowlen * 4 + align - 1) / align * align;
+    const uint8_t *src = (const uint8_t *)pixels + (long)g->u_skip_rows * stride + (long)g->u_skip_pix * 4;
+    uint8_t *va = buf_lock(b, 1);
+    if (!va) return;
+    for (int r = 0; r < h; r++) {
+        const uint8_t *s = src + (long)r * stride;
+        uint8_t *d = va + ((size_t)(y + r) * (size_t)b->stride + (size_t)x) * 4;
+        if (b->format == 5) for (int k = 0; k < w; k++) { d[k * 4] = s[k * 4 + 2]; d[k * 4 + 1] = s[k * 4 + 1]; d[k * 4 + 2] = s[k * 4]; d[k * 4 + 3] = s[k * 4 + 3]; }
+        else memcpy(d, s, (size_t)w * 4);
+    }
+    buf_unlock(b);
+}
+
+/* The bytes of a window buffer's pixels as a texture reads them (0: not a buffer this driver carries) */
+static uint64_t image_sum(GLeglImageOES image, struct ANativeWindowBuffer **bo) {
+    struct ANativeWindowBuffer *b = 0;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < 256; i++) if (g_img[i].img == image) { b = g_img[i].host ? 0 : g_img[i].buf; break; }
+    pthread_mutex_unlock(&g_lock);
+    if (bo) *bo = b;
+    if (!b) return 0;
+    int bpp = b->format == 1 || b->format == 2 ? 4 : b->format == 3 ? 3 : b->format == 4 ? 2 : 0;
+    if (!bpp || b->height <= 0 || b->stride <= 0) return 0;
+    uint8_t *px = buf_lock(b, 0);
+    if (!px) return 0;
+    uint64_t s = sum_of(px, (uint32_t)b->stride * (uint32_t)b->height * (uint32_t)bpp) | 1;
+    buf_unlock(b);
+    return s;
+}
+static void e_glEGLImageTargetTexture2DOES(GLenum target, GLeglImageOES image) {
+    image_upload(target, image);
+    if (target == 0x0DE1 && t_ts && t_ts->ctx && !t_ts->ctx->g1 && t_ts->ctx->g.unit < 32) timg_set(&t_ts->ctx->g, t_ts->ctx->g.tex2d[t_ts->ctx->g.unit], image);
+    /* a GLES 1 context (SurfaceFlinger of 2.x - 4.1) keeps the image with the texture, see aemu_image_refresh */
+    if (target == 0x0DE1 && t_ts && t_ts->ctx && t_ts->ctx->g1) {
+        struct g1 *s = G1();
+        struct g1_tex *r = g1_target_rec(s, target, 1);
+        if (r) {
+            /* (the texture's size is the buffer's: glDrawTexiOES - how SurfaceFlinger of 2.x draws a layer - takes its crop rectangle
+             * against it and drops the draw when it is 0; only glTexImage2D used to say it, so every layer of the phone's GPU was dropped) */
+            struct ANativeWindowBuffer *bb = 0;
+            r->img = image; r->img_sum = image_sum(image, &bb);
+            if (bb && bb->width > 0 && bb->height > 0) { r->w = bb->width; r->h = bb->height; r->defined = 1; }
+        }
+    }
+}
+static void aemu_image_refresh(void *image, uint64_t *sum) {
+    struct ANativeWindowBuffer *b = 0;
+    uint64_t now = image_sum(image, &b);
+    if (!b || !now || now == *sum) return;
+    *sum = now;
+    image_upload(0x0DE1, image);
+}
+
 /* ---- sync objects: SwiftShader's, or for a bridged context one that is signalled once the host caught up ---- */
 #define BRIDGE_SYNC ((void *)(uintptr_t)0xAE5C0001)
 EXPORT EGLSyncKHR eglCreateSyncKHR(EGLDisplay d, EGLenum type, const EGLint *attribs) {
@@ -1476,6 +2348,7 @@ EXPORT EGLSyncKHR eglCreateSyncKHR(EGLDisplay d, EGLenum type, const EGLint *att
         begin(T, OP_PING, 0, 0); rsync(T); get32v(T);
         return BRIDGE_SYNC;
     }
+    if (solo()) return BRIDGE_SYNC;     /* (nothing of ours is drawn anywhere else) */
     SSF(EGLSyncKHR, CreateSyncKHR, (EGLDisplay, EGLenum, const EGLint *));
     return CreateSyncKHR ? CreateSyncKHR(d, type, attribs) : 0;
 }
