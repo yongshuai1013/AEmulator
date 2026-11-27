@@ -3123,10 +3123,13 @@ static void cc_mod(u64 addr, char *out, u64 cap) {
     if (!found) { u64 o = 0; while (miss[o] && o + 1 < cap) { out[o] = miss[o]; o++; } out[o] = 0; }
 }
 
-static void cc_emit(int sig, void *info, void *uc) {
+// The one structured naming line, printed from an explicit context: pid/tid/comm of the faulting
+// thread, the signal, the fault address, pc/lr with their mappings, sp, and the VPN session tag
+// this process's supervisor currently carries (the aemu-137r tag of the session now up, so a death
+// can be read next to the session it died in). g_cc_done keeps it to one line per process,
+// whichever path gets here first.
+static void cc_emit_ctx(int sig, u64 fault, struct sigctx *c, long tid) {
     if (__atomic_exchange_n(&g_cc_done, 1, __ATOMIC_ACQUIRE)) return;
-    struct sigctx *c = (struct sigctx *)((char *)uc + 176);
-    u64 fault = *(u64 *)((char *)info + 16);                    // siginfo's si_addr, as in on_crash
     int ownfd = -1;
     if (g_sayfd < 0) {                                          // land in <root>/dev/aemu_crash.log too, as on_crash does
         static char lp[600];
@@ -3139,6 +3142,7 @@ static void cc_emit(int sig, void *info, void *uc) {
     cc_mod(c->regs[30], lrmod, sizeof lrmod);
     char t[24];
     say("aemu-crash: pid="); say(utoa((u64)S0(NR_getpid), t + sizeof t));
+    say(" tid="); say(utoa((u64)tid, t + sizeof t));
     say(" comm=");
     { char nm[20]; memset(nm, 0, sizeof nm); S5(NR_prctl, 16 /*PR_GET_NAME*/, nm, 0, 0, 0); say(nm[0] ? nm : g_exe); }
     say(" sig="); say(utoa((u64)sig, t + sizeof t));
@@ -3146,8 +3150,14 @@ static void cc_emit(int sig, void *info, void *uc) {
     say(" pc="); hex(c->pc); say(" ("); say(pcmod); say(")");
     say(" lr="); hex(c->regs[30]); say(" ("); say(lrmod); say(")");
     say(" sp="); hex(c->sp);
+    { char stag[16]; u64 so = 0; stag[0] = 0; r137_tag_into(stag, &so, g_137r_cur, r137_pending()); say(" sess="); say(stag); }
     say("\n");
     if (ownfd >= 0) { S1(NR_close, ownfd); g_sayfd = -1; }
+}
+
+static void cc_emit(int sig, void *info, void *uc) {
+    struct sigctx *c = (struct sigctx *)((char *)uc + 176);
+    cc_emit_ctx(sig, *(u64 *)((char *)info + 16), c, S0(NR_gettid));   // siginfo's si_addr, as in on_crash
 }
 
 // A fatal delivery, seen by the relay: stash it, and if the identical fault comes straight back on
@@ -3159,6 +3169,41 @@ static void cc_note(int sig, void *info, void *uc) {
     if (g_cc_pend && g_cc_sig == sig && g_cc_tid == tid && g_cc_pc == c->pc && g_cc_fault == fault)
         cc_emit(sig, info, uc);
     g_cc_pend = 1; g_cc_sig = sig; g_cc_tid = tid; g_cc_pc = c->pc; g_cc_fault = fault;
+}
+
+// ---------------------------------------------------------------------------------------------------- system-server capture
+//
+// Why system_server leaves no record (seven fields, the latest the 19:31 one on this tree): every
+// capture above hangs on the relay's two exits — no guest handler, so on_crash reports the first
+// delivery (the native services, mediaserver among them), or the identical fault delivered again
+// after the guest's handler returned without handling it, so cc_note's repeat match names it (the
+// ART app processes). system_server takes neither exit: its death is consumed inside the
+// guest-handler branch — no identical re-delivery, no fall-through to on_crash — and the guest's
+// own debuggerd path leaves /data/tombstones empty in this environment, so the guest side holds no
+// record either. The first delivery, before the guest handler runs, is the only observation point
+// that branch guarantees. So for this one process the delivery is snapshotted before the handler
+// runs, and named if the handler comes back with the fault still standing (pc untouched: it
+// neither redirected execution onto a throw path — the handled exit, ART's implicit checks — nor
+// repaired the fault, so the delivery in flight is the death). Observation only: the relay then
+// does exactly what it did before, and g_cc_done still keeps the process to one aemu-crash line.
+// Identity is the process name the guest itself set, read back from /proc/self/comm and latched
+// only on a match, so a forked child is judged by its own name, never its parent's.
+
+static volatile int g_ssc_ss;               // this process has been identified as system_server
+
+static int ssc_is_ss(void) {
+    if (g_ssc_ss) return 1;
+    static const char want[] = "system_server";
+    char buf[24];
+    long n = -1;
+    long fd = S4(NR_openat, AT_FDCWD, "/proc/self/comm", 0 /*O_RDONLY*/, 0);
+    if (fd >= 0) { n = S3(NR_read, fd, buf, sizeof buf); S1(NR_close, fd); }
+    if (n == 13 || (n == 14 && buf[13] == '\n')) {
+        int i = 0;
+        while (i < 13 && buf[i] == want[i]) i++;
+        if (i == 13) { g_ssc_ss = 1; return 1; }
+    }
+    return 0;
 }
 
 static void on_crash(int sig, void *info, void *uc) {
@@ -3243,7 +3288,23 @@ static void fatal_relay(int sig, void *info, void *uc) {
         return;
     }
     void (*h)(int, void *, void *) = g_fatal[sig & 31];
-    if ((u64)h > 1) h(sig, info, uc); else on_crash(sig, info, uc);
+    if ((u64)h > 1) {
+        // System-server capture (above): snapshot the delivery before the guest handler runs;
+        // if it comes back with the fault still standing, this delivery is the death — name it
+        // from the snapshot, then let the relay do exactly what it did before.
+        int ssc = is_fatal(sig) && sig != 8 && ssc_is_ss();
+        struct sigctx saved; u64 sfault = 0; long stid = 0;
+        if (ssc) {
+            struct sigctx *c = (struct sigctx *)((char *)uc + 176);
+            saved.fault = c->fault; saved.sp = c->sp; saved.pc = c->pc; saved.pstate = c->pstate;
+            for (int i = 0; i < 31; i++) saved.regs[i] = c->regs[i];
+            sfault = *(u64 *)((char *)info + 16);
+            stid = S0(NR_gettid);
+        }
+        h(sig, info, uc);
+        if (ssc && ((struct sigctx *)((char *)uc + 176))->pc == saved.pc)
+            cc_emit_ctx(sig, sfault, &saved, stid);
+    } else on_crash(sig, info, uc);
     if (g_is32) *(u64 *)((char *)uc + 40) &= ~SYSBIT;
 }
 
