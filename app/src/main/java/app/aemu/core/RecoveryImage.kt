@@ -100,18 +100,23 @@ object RecoveryImage {
         File(r, "dev/aemu_power").let { if (!it.exists()) it.createNewFile() }
         runCatching { File(r, "dhd.fbgeom").writeText("$w $h\n") }
 
-        // Virtual mount table for TWRP/OrangeFox: redirected from /proc/mounts and /proc/self/mounts
+        // Virtual mount table for TWRP/OrangeFox: redirected from /proc/mounts and /proc/self/mounts.
+        // The device column spells the by-name parent the guest's own fstab uses (parsed by
+        // PartitionSeat, the same parent the by-name links are planted under), so readers of
+        // this table see the same devices the tables and the links describe.
+        val byName = PartitionSeat.byNameParent(r, paths)
         val mounts = """
 rootfs / rootfs rw,relatime 0 0
 tmpfs /dev tmpfs rw,nosuid,relatime,mode=755 0 0
 devpts /dev/pts devpts rw,relatime,mode=600 0 0
 proc /proc proc rw,relatime 0 0
 sysfs /sys sysfs rw,relatime 0 0
-/dev/block/bootdevice/by-name/system /system ext4 rw,relatime 0 0
-/dev/block/bootdevice/by-name/userdata /data ext4 rw,relatime 0 0
-/dev/block/bootdevice/by-name/cache /cache ext4 rw,relatime 0 0
-/dev/block/bootdevice/by-name/boot /boot emmc rw,relatime 0 0
-/dev/block/bootdevice/by-name/recovery /recovery emmc rw,relatime 0 0
+$byName/system /system ext4 rw,relatime 0 0
+$byName/userdata /data ext4 rw,relatime 0 0
+$byName/cache /cache ext4 rw,relatime 0 0
+$byName/vendor /vendor ext4 rw,relatime 0 0
+$byName/boot /boot emmc rw,relatime 0 0
+$byName/recovery /recovery emmc rw,relatime 0 0
 /data/media/0 /sdcard vfat rw,relatime 0 0
 """.trimIndent()
         runCatching { File(r, "tmp/aemu_mounts").writeText(mounts + "\n") }
