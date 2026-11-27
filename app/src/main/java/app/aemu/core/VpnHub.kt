@@ -538,11 +538,16 @@ class VpnHub(private val paths: VmPaths, private val log: (String) -> Unit) {
     private fun flowWriter(s: Session, f: Flow, conn: VpnTcpConn) {
         val fd = f.fd ?: return
         val out = FileOutputStream(fd)
+        var firstData = true   // gate2 egress series: first downstream byte handed to the guest
         while (true) {
             when (val d = conn.nextDeliverable()) {
                 is TcpDeliverable.Data -> {
                     try {
                         out.write(d.bytes); out.flush()
+                        if (firstData) {
+                            firstData = false
+                            log("aemu-egress: flow ${f.id} first-delivered bytes=${d.bytes.size}")
+                        }
                     } catch (_: Throwable) {
                         conn.guestGone()
                         break
