@@ -71,6 +71,20 @@ object RecoveryImage {
             if (!fb.exists() || fb.length() < minSize) {
                 RandomAccessFile(fb, "rw").use { it.setLength(minSize) }
             }
+            // a real framebuffer powers up blank: the previous session's last frame must not survive into
+            // this one (the screen's page choice reads the file before the guest has drawn over all of it)
+            if (fb.isFile) {
+                RandomAccessFile(fb, "rw").use { raf ->
+                    val zeros = ByteArray(64 * 1024)
+                    var left = raf.length()
+                    raf.seek(0)
+                    while (left > 0) {
+                        val n = minOf(left, zeros.size.toLong()).toInt()
+                        raf.write(zeros, 0, n)
+                        left -= n
+                    }
+                }
+            }
         }
 
         // dynamic recoveries (TWRP, OrangeFox) get librecshim.so preloaded: mount points look mounted, evdev ioctls answered.
