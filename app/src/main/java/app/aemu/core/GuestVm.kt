@@ -218,6 +218,8 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
 
     /** Boot the firmware's recovery (RecoveryImage) instead of Android. */
     @Volatile var recoveryMode = false
+    /** Partition seat boot in progress: the ramdisk /init runs the boot, the plan stands down. */
+    @Volatile var seatMode = false
     /** recovery framebuffer format for the screen view: 0 RGB565, 1 RGBA/RGBX_8888, 2 BGRA_8888.
      *  Default 1: modern recoveries draw 32bpp, so the geometry is right from the first frame
      *  (at worst R/B swapped until detection below pins the exact variant). */
@@ -457,6 +459,19 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         // 1. дерево
         val fixer = TreeFixer(ctx, paths, img, ::log)
         fixer.fixup()
+        // partition seat: with the setting on and a boot image kept at import, present the
+        // partitions in this boot (by-name devices, the supervisor's mount table) and lay
+        // the boot ramdisk over the tree, so the seat branch below can run its /init first
+        seatMode = false
+        if (settings.bootSeat && engine == Engine.N64 && PartitionSeat.available(paths)) {
+            PartitionSeat.plantByName(paths.root, paths, ::log)
+            PartitionSeat.arm(paths.root, ::log)
+            seatMode = PartitionSeat.overlayBootrd(paths, ::log)
+            if (!seatMode) log("seat: the ramdisk overlay failed, booting the service plan (the partitions stay presented)")
+        } else {
+            if (settings.bootSeat) log("seat: on, but unusable for this image (the native arm64 engine and a boot image kept at import are required), booting the service plan")
+            PartitionSeat.disarm(paths.root)
+        }
         // политика звука уже подменялась раньше — обновить её файлы (обёртка/AOSP) до текущей версии
         if (File(paths.root, "system/.aemu-parked/system#lib#hw#audio_policy.default.so").isFile) swapAudioPolicy()
         GuestLog.clear(paths.root)
@@ -843,8 +858,12 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         // the payload tmp is prepared and the post-fs-data stage runs (the daemon itself is
         // woken by that first root client, never exec'd by the host). Every host-log line of
         // this stage carries the magisk-sub: prefix, distinct from any real Magisk boot.
-        substOn = SubstituteSupport.on(img)
+        substOn = SubstituteSupport.on(img) && !seatMode
         if (substOn) substPostFsData()
+        // partition seat, layer 2: the ramdisk /init is the boot; the plan, the substitute
+        // and the ctl proxy stand down (onCtl checks seatMode), the host keeps the session
+        // furniture (the binder core above, screen, input, power via the watchdog)
+        if (seatMode) { startSeatInit(r); return }
         var glDone = false
         // (debugging, see Kernel64.syncLog: only the first N services are started, then the guest is left as it is)
         val stopAfter = if (engine == Engine.N64 && kernel.syncLog) runCatching { File(paths.root, "dev/.aemu-stop-after").readText().trim().toInt() }.getOrNull() else null
@@ -940,6 +959,29 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         if (!glDone) glUp()
         log("system started: ${alive().joinToString()}")
         if (substOn) substLateStart()
+        watchdog()
+    }
+
+    /**
+     * The seat boot: start the one process the host starts in this mode — the boot image
+     * ramdisk's /init, under the supervisor, with the seat flag in its environment. It
+     * mounts, sets up and hands over itself; the boot is reported through the same
+     * sys.boot_completed property as a plan boot (onProp). If /init dies, the session is
+     * over: on a device nothing outlives it either.
+     */
+    private fun startSeatInit(r: GuestRunner) {
+        log("seat: plan suppressed, starting the ramdisk /init as the first guest process")
+        glUp()   // the plan loop calls this before SurfaceFlinger/zygote; the seat's init starts them itself, so it is due now
+        spawn("init", r.cmdline(listOf("/init")), r.env(mapOf("AEMU64_SEAT" to "1")))
+        val p = synchronized(procs) { procs["init"] }
+        Thread({
+            val code = runCatching { p?.waitFor() }.getOrDefault(-1)
+            if (!stopping) {
+                failure = "the seat /init exited, code $code"
+                log("✖ seat: /init exited, code $code" + if (bootDoneAt == 0L) " (before the boot completed)" else "")
+                setState(State.FAILED)
+            }
+        }, "seat-init-watch").apply { isDaemon = true; start() }
         watchdog()
     }
 
@@ -1402,6 +1444,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     }.onFailure { log("apex stand-in: ${it.message}") }
 
     private fun onCtl(start: Boolean, svc: String) {
+        if (seatMode) return   // a seat boot's own init owns ctl.* — the host must not double-start
         if (svc.startsWith("aidl/")) {
             // a lazy AIDL service (artd of 14+, a skin's daemon): started when servicemanager is asked for it, and
             // a few times at most, as the question comes every second for as long as the client waits
