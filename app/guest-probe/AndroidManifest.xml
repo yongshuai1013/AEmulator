@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TcpTimingProbe: one-shot guest-side TCP timing probe (see build.sh). A plain
+     user app on purpose: its connects go through the supervisor's detour exactly
+     like any other guest app's, which is the path being measured. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="app.aemu.probe"
+    android:versionCode="1"
+    android:versionName="1.0">
+    <uses-sdk android:minSdkVersion="19" android:targetSdkVersion="22" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <application android:label="TCP Timing Probe" android:theme="@android:style/Theme.Holo">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
