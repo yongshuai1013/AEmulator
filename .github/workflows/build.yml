@@ -48,6 +48,25 @@ jobs:
         with:
           name: aemu-wifi-jar
           path: app/src/main/assets/engines/kk/aemu-wifi.jar
+      - name: Build guest GL bridge driver (KK/GB, armv7) from source
+        run: |
+          python3 -m pip install --quiet "ziglang==0.17.1"
+          python3 -m ziglang version
+          sh native/glbridge/build32-zig.sh
+          ls -l app/src/main/assets/engines/kk/libGLES_aemu.so
+          sha256sum app/src/main/assets/engines/kk/libGLES_aemu.so
+      - name: Assert guest GL bridge driver is the verified build
+        run: |
+          if echo "d34282006bd96fc5aeaf95b73b75f63f120d5bf628eeac92172872a2fd1a5f5a  app/src/main/assets/engines/kk/libGLES_aemu.so" | sha256sum -c -; then
+            echo "OK: guest GL bridge driver matches the byte-verified build (native/glbridge/guest.c via zig)"
+          else
+            echo "ERROR: guest GL bridge driver does NOT match the verified build - the glbridge sources changed without re-verification" >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aemu-glbridge-kk
+          path: app/src/main/assets/engines/kk/libGLES_aemu.so
       - name: Build guest Bluetooth jar from source
         run: |
           export ANDROID_JAR="$ANDROID_HOME/platforms/android-19/android.jar"
