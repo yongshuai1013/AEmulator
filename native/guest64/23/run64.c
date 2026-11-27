@@ -2780,10 +2780,41 @@ static int is_proc_fddir(const char *t) {
 // clone). A slot is claimed on the 0->1 transition and freed on the 1->0 one; depths and the skip
 // counter are only ever mutated by the owning thread. If the table is full the relay runs unmarked
 // and both moves are inert — exactly the pre-fix behaviour.
+//
+// The second move (137 fix, yi'; nested-death-desk.md): skipping the header chores was not enough —
+// the trap BODY still ran on whatever stack the guest handler was standing on, and for a fatal
+// delivery that is the guest's own 16 KB alternate signal stack. The handler chain (ART, then the
+// debuggerd handler reporting the crash) plus this image's trap frames overdraw it: the 2026-11-27
+// 12:52 field died in xl_x's prologue store, sp already past the bottom, on a connect the guest's
+// debuggerd handler issued to report the first fault. So a trap taken while this thread is inside a
+// relay now runs the trap body on a supervisor-owned per-thread stack — 256 KB over a PROT_NONE
+// guard page, mmap'd lazily by the first such trap on the slot and kept for the process's life —
+// entered through rl_call_on_stack (start.S) and left before the result is written back to the
+// ucontext. Only this image's own frames move: the guest's ucontext, its registers, the PB pool
+// (all absolute addresses) and every answer the trap gives are exactly as before, and the guest's
+// own code never leaves its own stacks. A trap that arrives while the thread is already out on the
+// big stack rides the same stack rather than switching again (counted once, at the switch). A fatal
+// signal taken on the big stack is delivered to fatal_relay on that stack and meets the yi fuse
+// there, unchanged; and because the big stack is this image's own mapping, nothing the guest does
+// can resize or unmap it. If the mmap fails the trap runs where it stands — the pre-fix behaviour.
 #define NRELAY 64
 static volatile long g_rl_tid[NRELAY];
 static volatile int g_rl_depth[NRELAY];
 static volatile int g_rl_skip[NRELAY];
+static char *g_rl_stk[NRELAY];                    // yi': the slot's big-stack top (0 = none yet); owner thread only
+static int g_rl_big[NRELAY];                      // yi': traps this relay has run out on the big stack
+static int g_rl_onstk[NRELAY];                    // yi': this thread is out on the big stack right now
+
+long rl_call_on_stack(void *top, void *fn, long a0, long a1, long a2);   // start.S
+
+#define RL_STACK_SZ (256 * 1024)
+static char *rl_mmap_stack(void) {                // top of a fresh big stack, or 0; the page below it stays PROT_NONE
+    u64 total = RL_STACK_SZ + 4096;
+    long b = S6(NR_mmap, 0, total, 0, 0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/, -1, 0);
+    if (b < 0 && b >= -4095) return 0;
+    if (S3(NR_mprotect, (u64)b + 4096, RL_STACK_SZ, 3 /*PROT_READ|PROT_WRITE*/) != 0) { S2(NR_munmap, b, total); return 0; }
+    return (char *)b + total;
+}
 
 static int rl_find(long tid) { for (int i = 0; i < NRELAY; i++) if (g_rl_tid[i] == tid) return i; return -1; }
 
@@ -2818,6 +2849,19 @@ static int rl_mark_skip(void) {                   // trap header, in relay conte
     __atomic_fetch_add(&g_rl_skip[i], 1, __ATOMIC_ACQ_REL);
     return 1;
 }
+
+static int rl_trap_begin(void) {                  // yi': >=0 = run this trap out on the slot's big stack; -1 = run it where you stand
+    int i = rl_find(S0(NR_gettid));
+    if (i < 0 || g_rl_depth[i] <= 0) return -1;   // not in a relay: nothing changes
+    if (g_rl_onstk[i]) return -1;                 // already out there: a nested trap rides the same big stack
+    if (!g_rl_stk[i]) g_rl_stk[i] = rl_mmap_stack();
+    if (!g_rl_stk[i]) return -1;                  // no stack to give: the pre-fix behaviour
+    g_rl_onstk[i] = 1;
+    g_rl_big[i]++;
+    return i;
+}
+
+static void rl_trap_end(int i) { if (i >= 0) g_rl_onstk[i] = 0; }
 
 static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     int err = 0;
@@ -3768,7 +3812,13 @@ static void on_sigsys(int sig, void *info, void *uc) {
     (void)sig; (void)info;
     mask_mediate((u64 *)((char *)uc + 40));                     // mask mediation: the restored mask never blocks the capture-critical set
     if (g_crash) *(u64 *)((char *)uc + 40) &= ~(1UL << 7);      // AEMU64_CRASH also keeps SIGFPE deliverable
-    c->regs[0] = (u64)trap((long)c->regs[8], (long *)c->regs, uc);
+    int rs = rl_trap_begin();                                   // 137 fix (yi'): in a relay, the trap body runs on this image's own stack
+    if (rs >= 0) {
+        c->regs[0] = (u64)rl_call_on_stack(g_rl_stk[rs], (void *)trap, (long)c->regs[8], (long)c->regs, (long)uc);
+        rl_trap_end(rs);
+    } else {
+        c->regs[0] = (u64)trap((long)c->regs[8], (long *)c->regs, uc);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------- filter
