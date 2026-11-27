@@ -124,6 +124,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import app.aemu.core.BluetoothPermissions
 import app.aemu.core.Engine
 import app.aemu.core.GuestLog
 import app.aemu.core.GuestVm
@@ -310,9 +311,12 @@ class VmActivity : ComponentActivity() {
         })
 
         registerShell()
-        if (vm.state == GuestVm.State.STOPPED || vm.state == GuestVm.State.FAILED) {
-            thread(name = "vm-boot") { vm.boot() }
+        val needed = buildList {
+            if (s.bluetooth && vm.bluetoothSupported) addAll(BluetoothPermissions.missing(this@VmActivity))
         }
+        if (needed.isNotEmpty() && (vm.state == GuestVm.State.STOPPED || vm.state == GuestVm.State.FAILED)) {
+            hostPermissions.launch(needed.toTypedArray())
+        } else bootIfStopped()
     }
 
     /** Отладка: adb shell am broadcast -a app.aemu.SHELL --es cmd "dumpsys power" → run/shell.out */
@@ -457,6 +461,27 @@ class VmActivity : ComponentActivity() {
     private val askMic = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (ok) vm.mic.permissionGranted() }
 
     private val askCamera = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    /** Bluetooth runtime permissions are requested before the boot (ported from upstream Plus), so the
+     * bridge's serve() at boot time already sees the answer and the VM boots once. Camera/microphone keep
+     * this tree's on-demand ask (vm.mic / vm.camera onPermissionNeeded). */
+    private val hostPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        if (::vm.isInitialized) {
+            val bluetooth = result.filterKeys { it in BluetoothPermissions.required() }
+            if (bluetooth.isNotEmpty()) {
+                val granted = bluetooth.values.all { it }
+                vm.log("bluetooth: host permission ${if (granted) "granted" else "denied"}")
+                if (!granted) toast(getString(R.string.bluetooth_permission_denied))
+            }
+            bootIfStopped()
+        }
+    }
+
+    private fun bootIfStopped() {
+        if (vm.state == GuestVm.State.STOPPED || vm.state == GuestVm.State.FAILED) {
+            thread(name = "vm-boot") { vm.boot() }
+        }
+    }
 
     private fun toast(msg: String) = runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
 
