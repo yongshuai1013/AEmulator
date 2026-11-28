@@ -792,13 +792,14 @@ static long secon_biglist(long r, void *gbuf, u64 gsize, int have) {
 }
 
 static long g_secon_n;
-static void secon_log(const char *op, const char *path, long r) {
+static void secon_log(const char *op, const char *path, long r, int fc) {
     // the first calls of a process print in full; after that only what did not plainly succeed, so
     // a restorecon of a whole tree cannot flood the log it is being diagnosed from
     if (__atomic_add_fetch(&g_secon_n, 1, __ATOMIC_RELAXED) > 512 && r == 0) return;
     char nb[24];
     say("aemu64: secon "); say(op); say(" "); say(path); say(" -> ");
     if (r < 0) { say("-"); say(utoa((u64)(-r), nb + sizeof nb)); } else say(utoa((u64)r, nb + sizeof nb));
+    if (fc) say(" (fc)");
     say("\n");
 }
 static const char *secon_opname(long nr) {
@@ -813,10 +814,364 @@ static const char *secon_opname(long nr) {
     return "?";
 }
 
+/* FC_BEGIN */
+/* ---- guest file_contexts lookup (fc) -----------------------------------
+   When a security.selinux get finds no ledger entry, the answer comes from
+   the guest's own file_contexts instead of ENODATA: on a real device every
+   file already carries the label its file_contexts entry assigns, and
+   getfilecon there never fails for a labeled filesystem. The semantics
+   mirror libselinux's selabel_file backend (label_file.c) as init's
+   restorecon drives it: patterns are anchored at both ends (^...$) and
+   must match the whole path; specs without metacharacters (exact paths)
+   are considered before specs with them, each class in reverse file
+   order, and the first full match wins; a spec is skipped when its mode
+   flag does not match the file's type, or when its stem -- the raw text
+   of the first path component, when it holds no metacharacters -- differs
+   from the path's first component; a winning "<<none>>" means no label.
+   Tables are read from the guest tree root: plat_file_contexts first,
+   then nonplat_file_contexts, mirroring init's load order. The matcher is
+   a small backtracking ERE engine (alternation, groups with ?, * and +
+   quantifiers, classes, dot, escapes) with a step budget. */
+#define FC_MAXTEXT (128 * 1024)
+#define FC_MAXSPEC 1024
+#define FC_STEPS 1000000L
+#define FC_MAXSEG 24
+
+struct fcspec { const char *pat, *ctx; u32 mode; int meta; int stemlen; };
+static char g_fctext[FC_MAXTEXT];
+static struct fcspec g_fc[FC_MAXSPEC];
+static int g_fcn;
+static volatile int g_fcstate;   /* 0 untried, 2 loading, 1 ready, 3 no tables */
+
+struct fcseg { const char *p, *end; u8 rep, must, started; const char *s0; };
+
+static int fc_ismeta(char c) {
+    return c == '.' || c == '^' || c == '$' || c == '?' || c == '*' || c == '+' ||
+           c == '|' || c == '[' || c == '(' || c == '{';
+}
+static const char *fc_classend(const char *p, const char *end) {
+    const char *q = p + 1;
+    if (q < end && *q == '^') q++;
+    if (q < end && *q == ']') q++;
+    while (q < end && *q != ']') { if (*q == '\\' && q + 1 < end) q++; q++; }
+    return q < end ? q + 1 : end;
+}
+static const char *fc_groupend(const char *p, const char *end) {
+    int depth = 0;
+    for (const char *q = p; q < end; q++) {
+        char c = *q;
+        if (c == '\\') { q++; continue; }
+        if (c == '[') { q = fc_classend(q, end) - 1; continue; }
+        if (c == '(') depth++;
+        else if (c == ')' && --depth == 0) return q + 1;
+    }
+    return end;
+}
+static int fc_classmatch(const char *p, const char *end, char ch) {
+    /* p at '[', end just past ']' */
+    const char *q = p + 1;
+    int neg = 0, hit = 0;
+    if (q < end && *q == '^') { neg = 1; q++; }
+    while (q < end && *q != ']') {
+        char lo;
+        if (*q == '\\' && q + 1 < end) { lo = q[1]; q += 2; }
+        else lo = *q++;
+        if (q < end && *q == '-' && q + 1 < end && q[1] != ']') {
+            char hi;
+            q++;
+            if (*q == '\\' && q + 1 < end) { hi = q[1]; q += 2; }
+            else hi = *q++;
+            if ((u8)lo <= (u8)ch && (u8)ch <= (u8)hi) hit = 1;
+        } else if (lo == ch) hit = 1;
+    }
+    return neg ? !hit : hit;
+}
+static int fc_atomhit(int kind, char lit, const char *ap, const char *ae, char ch) {
+    if (kind == 0) return ch == lit;
+    if (kind == 1) return 1;
+    if (kind == 2) return fc_classmatch(ap, ae, ch);
+    if (kind == 4) {   /* \w \d \s and their negations */
+        int word = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                   (ch >= '0' && ch <= '9') || ch == '_';
+        int dig = ch >= '0' && ch <= '9';
+        int sp = ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
+        switch (lit) {
+        case 'w': return word;
+        case 'W': return !word;
+        case 'd': return dig;
+        case 'D': return !dig;
+        case 's': return sp;
+        case 'S': return !sp;
+        }
+    }
+    return 0;
+}
+static int fc_match_segs(struct fcseg *segs, int n, const char *s, long *steps);
+static int fc_match_seq(const char *p, const char *end, const char *s,
+                        struct fcseg *cont, int cn, long *steps) {
+    if ((*steps)-- <= 0) return 0;
+    if (p == end) return fc_match_segs(cont, cn, s, steps);
+    const char *bar = 0;
+    int depth = 0;
+    for (const char *q = p; q < end; q++) {
+        char c = *q;
+        if (c == '\\') { q++; continue; }
+        if (c == '[') { q = fc_classend(q, end) - 1; continue; }
+        if (c == '(') depth++;
+        else if (c == ')') depth--;
+        else if (c == '|' && depth == 0) { bar = q; break; }
+    }
+    if (bar) {
+        if (fc_match_seq(p, bar, s, cont, cn, steps)) return 1;
+        return fc_match_seq(bar + 1, end, s, cont, cn, steps);
+    }
+    const char *ap = p, *ae;
+    int kind;   /* 0 literal, 1 dot, 2 class, 3 group, 4 escape class (\w \d \s) */
+    char lit = 0;
+    if (*p == '\\') {
+        char e = p + 1 < end ? p[1] : 0;
+        if (e == 'w' || e == 'W' || e == 'd' || e == 'D' || e == 's' || e == 'S') { kind = 4; lit = e; }
+        else { kind = 0; lit = e; }
+        ae = p + 2 <= end ? p + 2 : end;
+    }
+    else if (*p == '.') { kind = 1; ae = p + 1; }
+    else if (*p == '[') { kind = 2; ae = fc_classend(p, end); }
+    else if (*p == '(') { kind = 3; ae = fc_groupend(p, end); }
+    else { kind = 0; lit = *p; ae = p + 1; }
+    char post = ae < end ? *ae : 0;
+    int quant = post == '*' || post == '+' || post == '?';
+    const char *rest = quant ? ae + 1 : ae;
+    struct fcseg cs[FC_MAXSEG];
+    int cn2 = 0;
+    cs[cn2].p = rest; cs[cn2].end = end; cs[cn2].rep = 0; cs[cn2].must = 0; cs[cn2].started = 0; cs[cn2].s0 = 0; cn2++;
+    for (int i = 0; i < cn && cn2 < FC_MAXSEG; i++) cs[cn2++] = cont[i];
+    if (cn2 < cn + 1) return 0;
+    if (kind == 3 && (post == '*' || post == '+')) {
+        /* a repeated group becomes a rep segment in front of the rest:
+           popping it offers stop (once the minimum is met) or one more
+           iteration of the body; an iteration that consumed nothing may
+           not repeat, which keeps the loop finite */
+        struct fcseg all[FC_MAXSEG];
+        int an = 0;
+        all[an].p = ap + 1; all[an].end = ae - 1; all[an].rep = 1;
+        all[an].must = post == '+'; all[an].started = 0; all[an].s0 = s; an++;
+        for (int i = 0; i < cn2 && an < FC_MAXSEG; i++) all[an++] = cs[i];
+        if (an < cn2 + 1) return 0;
+        return fc_match_segs(all, an, s, steps);
+    }
+    if (kind == 3 && post == '?') {
+        if (fc_match_seq(ap + 1, ae - 1, s, cs, cn2, steps)) return 1;
+        return fc_match_segs(cs, cn2, s, steps);
+    }
+    if (kind == 3) return fc_match_seq(ap + 1, ae - 1, s, cs, cn2, steps);
+    if (post == '?') {
+        if (*s && fc_atomhit(kind, lit, ap, ae, *s) && fc_match_segs(cs, cn2, s + 1, steps)) return 1;
+        return fc_match_segs(cs, cn2, s, steps);
+    }
+    if (post == '*' || post == '+') {
+        const char *t = s;
+        if (post == '+') {
+            if (!(*t && fc_atomhit(kind, lit, ap, ae, *t))) return 0;
+            t++;
+        }
+        for (;;) {
+            if (fc_match_segs(cs, cn2, t, steps)) return 1;
+            if (*t && fc_atomhit(kind, lit, ap, ae, *t)) t++; else break;
+        }
+        return 0;
+    }
+    if (*s && fc_atomhit(kind, lit, ap, ae, *s)) return fc_match_segs(cs, cn2, s + 1, steps);
+    return 0;
+}
+static int fc_match_segs(struct fcseg *segs, int n, const char *s, long *steps) {
+    if ((*steps)-- <= 0) return 0;
+    if (n == 0) return *s == 0;   /* anchored at both ends: the whole path must be consumed */
+    struct fcseg seg = segs[0];
+    if (seg.rep) {
+        if (!seg.must && fc_match_segs(segs + 1, n - 1, s, steps)) return 1;
+        if (seg.started && s == seg.s0) return 0;
+        struct fcseg gs[FC_MAXSEG];
+        int gn = 0;
+        gs[gn].p = seg.p; gs[gn].end = seg.end; gs[gn].rep = 0; gs[gn].must = 0; gs[gn].started = 0; gs[gn].s0 = 0; gn++;
+        gs[gn] = seg; gs[gn].must = 0; gs[gn].started = 1; gs[gn].s0 = s; gn++;
+        for (int i = 1; i < n && gn < FC_MAXSEG; i++) gs[gn++] = segs[i];
+        if (gn < n + 1) return 0;
+        return fc_match_segs(gs, gn, s, steps);
+    }
+    return fc_match_seq(seg.p, seg.end, s, segs + 1, n - 1, steps);
+}
+static int fc_match(const char *pat, const char *path) {
+    struct fcseg seg;
+    seg.p = pat; seg.end = pat + slen(pat); seg.rep = 0; seg.must = 0; seg.started = 0; seg.s0 = 0;
+    long steps = FC_STEPS;
+    return fc_match_segs(&seg, 1, path, &steps);
+}
+static const char *fc_tok(const char **pp, const char *end) {
+    const char *p = *pp;
+    while (p < end && (*p == ' ' || *p == '\t')) p++;
+    if (p >= end) { *pp = p; return 0; }
+    const char *s = p;
+    while (p < end && *p != ' ' && *p != '\t') p++;
+    *pp = p;
+    return s;
+}
+static u32 fc_modeof(const char *t, const char *te) {
+    if (!t || te - t != 2 || t[0] != '-') return 0;
+    switch (t[1]) {
+    case '-': return 0100000;
+    case 'b': return 0060000;
+    case 'c': return 0020000;
+    case 'd': return 0040000;
+    case 'l': return 0120000;
+    case 'p': return 0010000;
+    case 's': return 0140000;
+    }
+    return 0;
+}
+static void fc_parse(char *text, u64 len) {
+    u64 i = 0;
+    while (i < len) {
+        u64 ls = i;
+        while (i < len && text[i] != '\n') i++;
+        u64 le = i;
+        if (i < len) i++;
+        while (ls < le && (text[ls] == ' ' || text[ls] == '\t' || text[ls] == '\r')) ls++;
+        if (ls >= le || text[ls] == '#') continue;
+        const char *cur = text + ls, *e = text + le;
+        const char *p1 = fc_tok(&cur, e);
+        if (!p1) continue;
+        u64 p1l = (u64)(cur - p1);
+        const char *p2 = fc_tok(&cur, e);
+        if (!p2) continue;
+        u64 p2l = (u64)(cur - p2);
+        const char *p3 = fc_tok(&cur, e);
+        const char *ctx = p2;
+        u32 mode = 0;
+        if (p3) { mode = fc_modeof(p2, p2 + p2l); ctx = p3; }
+        if (g_fcn >= FC_MAXSPEC) return;
+        struct fcspec *sp = &g_fc[g_fcn];
+        /* the text buffer is kept whole, so pattern and context can be
+           NUL-terminated in place at their token ends */
+        if (p1 + p1l < text + len) *(char *)(p1 + p1l) = 0;
+        const char *ce = ctx;
+        while (ce < e && *ce != ' ' && *ce != '\t' && *ce != '\r') ce++;
+        if (ce < text + len) *(char *)ce = 0;
+        sp->pat = p1;
+        sp->ctx = ctx;
+        sp->mode = mode;
+        /* metacharacters and stem, by libselinux's own definitions:
+           hasMetaChars scans for . ^ $ ? * + | [ ( { outside escapes;
+           the stem is the raw text up to the second '/', valid only when
+           that span holds no metacharacter (backslash included) */
+        sp->meta = 0;
+        for (const char *q = p1; *q; q++) {
+            if (*q == '\\') { if (q[1]) q++; continue; }
+            if (fc_ismeta(*q)) { sp->meta = 1; break; }
+        }
+        sp->stemlen = -1;
+        {
+            const char *q = p1 + 1;
+            while (*q && *q != '/') q++;
+            if (*q == '/') {
+                int bad = 0;
+                for (const char *r = p1; r < q; r++) if (*r == '\\' || fc_ismeta(*r)) { bad = 1; break; }
+                if (!bad) sp->stemlen = (int)(q - p1);
+            }
+        }
+        g_fcn++;
+    }
+}
+static u64 fc_readfile(const char *hp, char *dst, u64 cap) {
+    long fd = S3(NR_openat, AT_FDCWD, hp, 0 /* O_RDONLY */);
+    if (fd < 0) return (u64)-1;
+    u64 n = 0;
+    while (n < cap) {
+        long r = S3(NR_read, fd, dst + n, cap - n);
+        if (r < 0) { if (n == 0) { S1(NR_close, fd); return (u64)-1; } break; }
+        if (r == 0) break;
+        n += (u64)r;
+    }
+    S1(NR_close, fd);
+    return n;
+}
+static void fc_load(void) {
+    static const char rel1[] = "/plat_file_contexts";
+    static const char rel2[] = "/nonplat_file_contexts";
+    char hp[600];
+    u64 off = 0;
+    int any = 0;
+    for (int t = 0; t < 2; t++) {
+        const char *rel = t == 0 ? rel1 : rel2;
+        u64 rl = t == 0 ? sizeof rel1 - 1 : sizeof rel2 - 1;
+        if (g_rootlen + rl + 1 > sizeof hp) continue;
+        memcpy(hp, g_root, g_rootlen);
+        memcpy(hp + g_rootlen, rel, rl + 1);
+        u64 n = fc_readfile(hp, g_fctext + off, FC_MAXTEXT - off - 1);
+        if (n == (u64)-1) continue;
+        any = 1;
+        /* entries must not run together across the file seam */
+        if (n > 0 && g_fctext[off + n - 1] != '\n' && off + n < FC_MAXTEXT - 1) g_fctext[off + n++] = '\n';
+        off += n;
+    }
+    if (!any) { __atomic_store_n(&g_fcstate, 3, __ATOMIC_RELEASE); return; }
+    g_fctext[off] = 0;
+    fc_parse(g_fctext, off);
+    __atomic_store_n(&g_fcstate, 1, __ATOMIC_RELEASE);
+}
+static int fc_ensure(void) {
+    int st = __atomic_load_n(&g_fcstate, __ATOMIC_ACQUIRE);
+    if (st == 1) return 1;
+    if (st == 3) return 0;
+    int exp = 0;
+    if (__atomic_compare_exchange_n(&g_fcstate, &exp, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        fc_load();
+        return __atomic_load_n(&g_fcstate, __ATOMIC_ACQUIRE) == 1;
+    }
+    while ((st = __atomic_load_n(&g_fcstate, __ATOMIC_ACQUIRE)) == 2) S0(NR_sched_yield);
+    return st == 1;
+}
+static const char *fc_lookup(const char *path, u32 mode) {
+    if (!fc_ensure()) return 0;
+    int kstem = -1;
+    for (int i = 1; path[i]; i++) if (path[i] == '/') { kstem = i; break; }
+    for (int cls = 0; cls < 2; cls++) {   /* exact (no-meta) specs first, then meta specs */
+        for (int i = g_fcn - 1; i >= 0; i--) {   /* reverse file order: first full match wins */
+            struct fcspec *sp = &g_fc[i];
+            if (cls == 0 && sp->meta) continue;
+            if (cls == 1 && !sp->meta) continue;
+            if (mode && sp->mode && sp->mode != mode) continue;
+            if (sp->stemlen >= 0) {
+                if (kstem != sp->stemlen) continue;
+                int diff = 0;
+                for (int j = 0; j < kstem; j++) if (path[j] != sp->pat[j]) { diff = 1; break; }
+                if (diff) continue;
+            }
+            if (!fc_match(sp->pat, path)) continue;
+            if (seq(sp->ctx, "<<none>>")) return 0;
+            return sp->ctx;
+        }
+    }
+    return 0;
+}
+static long secon_fc_answer(const char *gpath, u32 mode, void *buf, u64 size, int *fc) {
+    const char *v = fc_lookup(gpath, mode);
+    if (!v) return SECON_ENODATA;
+    *fc = 1;
+    u64 L = slen(v) + 1;
+    if (size == 0) return (long)L;
+    if (size < L) return SECON_ERANGE;
+    memcpy(buf, v, L);
+    return (long)L;
+}
+/* FC_END */
+
+
+
+
 // Path forms of the label. guest is the path as the guest wrote it, hp its translation, a the
 // call's arguments, scratch SECON_SCRATCH bytes of pool. The answer is exactly the guest's answer:
 // flag and size semantics are the kernel's, evaluated against the bookkeeping.
-static long secon_path(long nr, const char *guest, const char *hp, long *a, char *scratch) {
+static long secon_path(long nr, const char *guest, const char *hp, long *a, char *scratch, int *fc) {
     int isl = nr == NR_lsetxattr || nr == NR_lgetxattr || nr == NR_llistxattr || nr == NR_lremovexattr;
     // a label set through an l- form onto a link itself goes to the table: the translation of an
     // absolute guest path is the root plus the normalised guest path, which is the stable key;
@@ -847,18 +1202,35 @@ static long secon_path(long nr, const char *guest, const char *hp, long *a, char
     case NR_getxattr: case NR_lgetxattr: {
         if (tab) {
             u64 vo, vl;
-            if (!secon_tab_find(key, scratch, &vo, &vl)) return SECON_ENODATA;
-            if (!a[3]) return (long)vl;
-            if ((u64)a[3] < vl) return SECON_ERANGE;
-            char tp[600];
-            secon_tabpath(tp);
-            long fd = S4(NR_openat, AT_FDCWD, tp, 0, 0);
-            if (fd < 0) return SECON_EIO;
-            long r = S4(NR_pread64, fd, (void *)a[2], vl, vo);
-            S1(NR_close, fd);
-            return r == (long)vl ? (long)vl : SECON_EIO;
+            if (secon_tab_find(key, scratch, &vo, &vl)) {
+                if (!a[3]) return (long)vl;
+                if ((u64)a[3] < vl) return SECON_ERANGE;
+                char tp[600];
+                secon_tabpath(tp);
+                long fd = S4(NR_openat, AT_FDCWD, tp, 0, 0);
+                if (fd < 0) return SECON_EIO;
+                long r = S4(NR_pread64, fd, (void *)a[2], vl, vo);
+                S1(NR_close, fd);
+                return r == (long)vl ? (long)vl : SECON_EIO;
+            }
+            // no record of ours: the label the link shipped with, from the tree's own table
+            struct kstat lst;
+            u32 lmode = 0;
+            if (S4(NR_newfstatat, AT_FDCWD, hp, &lst, 0x100) == 0) lmode = lst.st_mode & 0170000;
+            return secon_fc_answer(key, lmode, (void *)a[2], (u64)a[3], fc);
         }
-        return S4(nr, hp, SECON_ATTR, a[2], a[3]);
+        long r = S4(nr, hp, SECON_ATTR, a[2], a[3]);
+        if (r == SECON_ENODATA) {
+            // no bookkeeping for this file: the label it shipped with, from the tree's own table
+            const char *gk = guest;
+            if (pre(hp, g_root) && hp[g_rootlen] == '/') gk = hp + g_rootlen;
+            else if (g_sdlen && pre(hp, g_sd) && hp[g_sdlen] == '/') gk = hp + g_sdlen;
+            struct kstat st;
+            u32 mode = 0;
+            if (S4(NR_newfstatat, AT_FDCWD, hp, &st, isl ? 0x100 : 0) == 0) mode = st.st_mode & 0170000;
+            return secon_fc_answer(gk, mode, (void *)a[2], (u64)a[3], fc);
+        }
+        return r;
     }
     case NR_removexattr: case NR_lremovexattr: {
         if (tab) {
@@ -887,7 +1259,7 @@ static long secon_path(long nr, const char *guest, const char *hp, long *a, char
 
 // Descriptor forms: the descriptor is the file (an open descriptor never names a link itself), so
 // the bookkeeping rides on it directly, with the same flag and size semantics.
-static long secon_fd(long nr, long *a, char *scratch) {
+static long secon_fd(long nr, long *a, char *scratch, const char *gpath, int *fc) {
     switch (nr) {
     case NR_fsetxattr: {
         long pr = S4(NR_fgetxattr, a[0], SECON_ATTR, 0, 0);
@@ -896,8 +1268,17 @@ static long secon_fd(long nr, long *a, char *scratch) {
         if ((a[4] & 2) && pr < 0) return SECON_ENODATA;
         return S5(NR_fsetxattr, a[0], SECON_ATTR, a[2], a[3], 0);
     }
-    case NR_fgetxattr:
-        return S4(NR_fgetxattr, a[0], SECON_ATTR, a[2], a[3]);
+    case NR_fgetxattr: {
+        long r = S4(NR_fgetxattr, a[0], SECON_ATTR, a[2], a[3]);
+        if (r == SECON_ENODATA && gpath) {
+            // no bookkeeping for this file: the label it shipped with, from the tree's own table
+            struct kstat st;
+            u32 mode = 0;
+            if (S2(NR_fstat, a[0], &st) == 0) mode = st.st_mode & 0170000;
+            return secon_fc_answer(gpath, mode, (void *)a[2], (u64)a[3], fc);
+        }
+        return r;
+    }
     case NR_fremovexattr:
         return S2(NR_fremovexattr, a[0], SECON_ATTR);
     case NR_flistxattr: {
@@ -1176,8 +1557,9 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         NEEDX(0);
         if (!islist && !(P(1) && seq(P(1), SECON_NAME))) return S5(nr, h0, a[1], a[2], a[3], a[4]);
         if (!h0) return -EFAULT;
-        long r = secon_path(nr, P(0), h0, a, PB(1));
-        secon_log(secon_opname(nr), P(0), r);
+        int fc = 0;
+        long r = secon_path(nr, P(0), h0, a, PB(1), &fc);
+        secon_log(secon_opname(nr), P(0), r, fc);
         return r;
     }
     case NR_fsetxattr: case NR_fgetxattr: case NR_flistxattr: case NR_fremovexattr: {
@@ -1198,8 +1580,9 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
               (g_sdlen && pre(tp, g_sd) && (tp[g_sdlen] == '/' || !tp[g_sdlen]))))
             return S5(nr, a[0], a[1], a[2], a[3], a[4]);
         unxl(tp);
-        long r = secon_fd(nr, a, PB(1));
-        secon_log(secon_opname(nr), tp, r);
+        int fc = 0;
+        long r = secon_fd(nr, a, PB(1), tp, &fc);
+        secon_log(secon_opname(nr), tp, r, fc);
         return r;
     }
     case NR_inotify_add_watch: {
