@@ -207,10 +207,11 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             RecoverySection(img)
 
             SuperuserSection(img, s.superuser) { s = s.copy(superuser = it) }
-            SubstituteSection(img, s.magiskSub) { s = s.copy(magiskSub = it) }
+            SubstituteSection(img, s.magiskSub) { s = if (it) s.copy(magiskSub = true, magiskPlan = false, bootSeat = false) else s.copy(magiskSub = false) }
+            MagiskPlanSection(img, s.magiskPlan) { s = if (it) s.copy(magiskPlan = true, magiskSub = false, bootSeat = false) else s.copy(magiskPlan = false) }
             ZygiskSpikeSection(img, s.zygiskSpike) { s = s.copy(zygiskSpike = it) }
             QemuZeroSection(img, s.qemuZero) { s = s.copy(qemuZero = it) }
-            BootSeatSection(img, s.bootSeat) { s = s.copy(bootSeat = it) }
+            BootSeatSection(img, s.bootSeat) { s = if (it) s.copy(bootSeat = true, magiskSub = false, magiskPlan = false) else s.copy(bootSeat = false) }
             AgentSection(img, s) { s = it }
             KmRootSection(img)
 
