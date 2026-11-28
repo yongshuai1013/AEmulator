@@ -241,7 +241,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         HostNative.limitStackSafe()
         TreeFixer(ctx, paths, img, ::log).fixup()   // framebuffer, input node
         val sd = Sdcard.setup(ctx, paths, img, ::log)
-        RecoveryImage.prepare(paths, sd, settings)
+        RecoveryImage.prepare(paths, sd, settings, ::log)
         log(if (is64) "recovery shims: preloaded (64-bit)" else "recovery shims: preloaded (32-bit)")
         input.rateHz = settings.touchHz
         input.mtMode = settings.mtMode
