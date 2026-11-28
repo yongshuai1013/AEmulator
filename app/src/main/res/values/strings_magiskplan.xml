@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AEmulator: self-built Magisk in plan guests (MagiskPlanSupport.kt). -->
+<resources>
+    <string name="vm_magiskplan_title">Root (self-built Magisk, plan mode)</string>
+    <string name="vm_magiskplan_sub">The genuine Magisk daemon (30.7), built from the unmodified upstream sources by this project and woken by the host at this guest\'s plan-boot milestones: su requests are decided by its magisk.db and asked through the Magisk app, its module mounts go through the supervisor\'s mount table, and its sepolicy loads are answered by the planted selinuxfs. Zygisk does not take effect in this mode, and the denylist has no per-app view. Mutually exclusive with the Magisk substitute and the partition seat. Applies at the next full boot. Native-engine Android 8.1 (arm64) guests. Experimental.</string>
+    <string name="vm_magiskplan_sub_unsupported">The genuine Magisk daemon (30.7, self-built) woken at the plan boot\'s milestones, its mounts and sepolicy loads answered by the supervisor.</string>
+    <string name="vm_magiskplan_unsupported">Not supported on this guest yet</string>
+</resources>
