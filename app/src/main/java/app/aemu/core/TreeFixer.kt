@@ -118,6 +118,7 @@ class TreeFixer(
         superuserFiles()
         substituteFiles()
         magiskPlanFiles()
+        magiskPlanRetreat()
         zygiskSpikeFiles()
         terminalFiles()
         gatekeeperFiles()
@@ -382,7 +383,13 @@ class TreeFixer(
             for (dir in listOf("system/bin", "system/xbin")) for (name in SubstituteSupport.SYSTEM_LINKS) {
                 val f = File(root, "$dir/$name")
                 runCatching {
-                    if (isLink(f) && Os.readlink(f.absolutePath) == "${SubstituteSupport.TMP}/magisk") {
+                    // the link as planted names the guest path, but on disk the supervisor's
+                    // symlink rewrite has already turned the target into the host absolute
+                    // path — compare against both forms, or the cleanup never matches (the
+                    // first magisk-plan field run's switch-off boot kept all three links).
+                    val target = runCatching { Os.readlink(f.absolutePath) }.getOrNull()
+                    if (isLink(f) && (target == "${SubstituteSupport.TMP}/magisk" ||
+                            target == File(root, "debug_ramdisk/magisk").absolutePath)) {
                         f.delete()
                         log("magisk-sub: link $dir/$name removed (switch off)")
                     }
@@ -518,6 +525,57 @@ class TreeFixer(
             zip.close()
             for (d in MagiskPlanSupport.DATA_DIRS) File(root, d).mkdirs()
         }.onFailure { log("magisk-plan deploy: ${it.message}") }
+    }
+
+    /**
+     * The magisk-plan seat's persistent residue, taken back while this VM's magisk-plan
+     * switch is off. The seat acts inside the guest at runtime, so what it leaves in the
+     * tree does not follow the switch — the other switch-off paths above only take back
+     * what the host itself planted, byte-compared, and never see these: the planted
+     * selinuxfs stays in the tree where a later boot's libselinux clients read it (the
+     * first field run's switch-off boot died in app_process32 with the plant still in
+     * place), the payload tmp tree stays, and the supervisor's secon ledger and mount
+     * table keep the seat's records. Removal here is by name, and only on guests that
+     * can run the plan mode at all. The selinuxfs set, the ledger and the mount table
+     * go whenever the plan switch is off — neither of the other root modes plants them,
+     * and the partition seat re-plants its own selinuxfs at its boot, after fixup; the
+     * payload tmp and the /data/adb stage dirs are shared with the substitute, so they
+     * only go when its switch is off too (the /system name links are the substitute
+     * cleanup's, above). One log line per kind removed, so a field run can see the
+     * retreat really happened.
+     */
+    private fun magiskPlanRetreat() {
+        if (!MagiskPlanSupport.supported(img) || MagiskPlanSupport.on(img)) return
+        runCatching {
+            val dir = File(root, "sys/fs/selinux")
+            var n = 0
+            for (name in listOf("null", "load", "enforce", "checkreqprot", "policyvers", "deny_unknown", "policy", "context"))
+                if (File(dir, name).delete()) n++
+            if (n > 0) {
+                dir.delete()   // only succeeds when nothing else is in it; the stock tree has no such directory
+                log("magisk-plan: selinuxfs removed (switch off, $n files)")
+            }
+        }.onFailure { log("magisk-plan retreat: ${it.message}") }
+        runCatching {
+            if (File(root, "dev/.aemu-secon").delete()) log("magisk-plan: secon ledger removed (switch off)")
+            if (File(root, "dev/.aemu-mounts").delete()) log("magisk-plan: mount table removed (switch off)")
+        }.onFailure { log("magisk-plan retreat: ${it.message}") }
+        if (SubstituteSupport.on(img)) return
+        runCatching {
+            val tmp = File(root, "debug_ramdisk")
+            if (tmp.exists()) {
+                val n = tmp.walkTopDown().count()
+                if (tmp.deleteRecursively()) log("magisk-plan: payload tmp removed (switch off, $n entries)")
+            }
+        }.onFailure { log("magisk-plan retreat: ${it.message}") }
+        runCatching {
+            var n = 0
+            for (d in MagiskPlanSupport.DATA_DIRS) {
+                val dir = File(root, d)
+                if (dir.isDirectory && dir.list()?.isEmpty() == true && dir.delete()) n++
+            }
+            if (n > 0) log("magisk-plan: /data/adb stage dirs removed (switch off, $n dirs)")
+        }.onFailure { log("magisk-plan retreat: ${it.message}") }
     }
 
     /**
