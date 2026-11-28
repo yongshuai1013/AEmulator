@@ -67,6 +67,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         { pkg, on -> agentDeny(pkg, on) }, ::log)
     @Volatile private var agentOn = false
     @Volatile private var substOn = false
+    @Volatile private var planOn = false
 
     @Volatile var state = State.STOPPED
         private set
@@ -890,6 +891,18 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         // this stage carries the magisk-sub: prefix, distinct from any real Magisk boot.
         substOn = SubstituteSupport.on(img) && !seatMode
         if (substOn) substPostFsData()
+        // the self-built Magisk gets its own boot seat here too — mutually exclusive with
+        // the substitute's seat and with the seat boot. The supervisor's mount table is
+        // armed and the selinuxfs planted BEFORE the first guest process of this boot:
+        // every supervisor instance reads the arm marker at process start, and the
+        // daemon's module mounts and sepolicy loads are answered by what is armed and
+        // planted here, not by anything in the daemon.
+        planOn = MagiskPlanSupport.on(img) && !seatMode && !substOn
+        if (planOn) {
+            PartitionSeat.arm(paths.root, ::log)
+            plantSelinuxfsPlan()
+            planPostFsData()
+        }
         // partition seat, layer 2: the ramdisk /init is the boot; the plan, the substitute
         // and the ctl proxy stand down (onCtl checks seatMode), the host keeps the session
         // furniture (the binder core above, screen, input, power via the watchdog)
@@ -989,6 +1002,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         if (!glDone) glUp()
         log("system started: ${alive().joinToString()}")
         if (substOn) substLateStart()
+        if (planOn) planLateStart()
         watchdog()
     }
 
@@ -1004,16 +1018,50 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
      */
     private fun plantSelinuxfs() {
         runCatching {
-            val dir = File(paths.root, "sys/fs/selinux")
-            dir.mkdirs()
-            File(dir, "null").writeText("")
-            File(dir, "load").writeText("")
-            File(dir, "enforce").writeText("0")
-            File(dir, "checkreqprot").writeText("0")
-            File(dir, "policyvers").writeText("30")
-            File(dir, "deny_unknown").writeText("1")
+            writeSelinuxfsNodes(File(paths.root, "sys/fs/selinux"))
             log("seat: planted selinuxfs shape (6 nodes)")
         }.onFailure { log("seat: selinuxfs plant failed: ${it.message}") }
+    }
+
+    /** The six selinuxfs nodes both plants share: null and load as empty sinks, the rest
+     *  carrying the values a permissive single-policy boot reports. */
+    private fun writeSelinuxfsNodes(dir: File) {
+        dir.mkdirs()
+        File(dir, "null").writeText("")
+        File(dir, "load").writeText("")
+        File(dir, "enforce").writeText("0")
+        File(dir, "checkreqprot").writeText("0")
+        File(dir, "policyvers").writeText("30")
+        File(dir, "deny_unknown").writeText("1")
+    }
+
+    /**
+     * The plan boot's selinuxfs (magisk-plan): the seat plant's six nodes, plus the two
+     * files the genuine daemon's own paths touch. policy carries a copy of this tree's
+     * stock /sepolicy: magiskpolicy loads the "live" policy from it before merging its
+     * rules, and in this guest the stock policy is the honest starting point — later
+     * --live writes land in load, they do not rewrite this node (the recorded deviation
+     * of the v1 answer; the daemon re-applies its full rule set on every --live, so
+     * nothing is lost by starting from stock). context is the landing file for the one
+     * write the daemon's restorecon pre-step makes (it writes the target context there
+     * and never reads an answer back — the seat plant leaves query nodes out because
+     * the seat's init does read canonicalized answers back; the plan daemon does not).
+     * The verdict nodes (access, status) stay unplanted: nothing in the daemon reads
+     * them, and a planted file would fabricate answers for whoever did.
+     */
+    private fun plantSelinuxfsPlan() {
+        runCatching {
+            val dir = File(paths.root, "sys/fs/selinux")
+            writeSelinuxfsNodes(dir)
+            File(dir, "context").writeText("")
+            val stock = File(paths.root, "sepolicy")
+            if (stock.isFile) {
+                stock.copyTo(File(dir, "policy"), overwrite = true)
+                log("magisk-plan: planted selinuxfs (6 nodes + context + the stock policy, ${stock.length()} bytes)")
+            } else {
+                log("magisk-plan: planted selinuxfs (6 nodes + context; this tree has no stock /sepolicy, the policy node stays absent and magiskpolicy will say so)")
+            }
+        }.onFailure { log("magisk-plan: selinuxfs plant failed: ${it.message}") }
     }
 
     /** The seat session's marker in the tree. Every supervisor instance of the session
@@ -1469,6 +1517,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             setState(State.RUNNING)
             Thread { agentBootComplete() }.start()
             Thread { substBootComplete() }.start()
+            Thread { planBootComplete() }.start()
             Thread { probeBootComplete() }.start()
             Thread { afterBoot() }.start()
             mirrorTombstones()
@@ -1840,6 +1889,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         mirrorTombstones(4_000)
         // the substitute daemon hears about the zygote restart like a real daemon would
         if (substOn) Thread { runCatching { substStage("--zygote-restart", 30_000) } }.start()
+        if (planOn) Thread { runCatching { planStage("--zygote-restart", 30_000) } }.start()
     }
 
     private fun guestLogHas(text: String): Boolean = runCatching {
@@ -2178,6 +2228,175 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             }
         } finally {
             staged.delete()
+        }
+    }
+
+    /**
+     * sys.boot_completed, the magisk-plan seat: finish the daemon's stage and make sure
+     * the manager app inside the guest is the delivered build (see [planInstallApp]).
+     * The substitute seat's denylist re-sync has no counterpart here: the genuine
+     * daemon's denylist execution face is a phase-2 item in this mode, and syncing the
+     * hide list into it would report an effect the mode does not have.
+     */
+    private fun planBootComplete() {
+        if (!planOn) return
+        runCatching {
+            planStage("--boot-complete")
+            log("magisk-plan: boot-complete seat done")
+            planInstallApp()
+            planLiveness("boot-complete")
+        }.onFailure { log("magisk-plan: boot-complete seat failed: ${it.message}") }
+    }
+
+    /**
+     * The manager app inside the guest, kept at the delivered build: the copy TreeFixer
+     * planted at [MagiskPlanSupport.APK_PATH], staged through data/local/tmp and
+     * installed with pm — the substitute seat's shape, versionCode gate and
+     * uninstall-on-refusal fallback included. The app is signed with the project's
+     * long-term key, so a replace install across builds is the normal path.
+     */
+    private fun planInstallApp() {
+        val apk = File(paths.root, MagiskPlanSupport.APK_PATH)
+        if (!apk.isFile) { log("magisk-plan: ${MagiskPlanSupport.APK_PATH} is not in the image, no manager app"); return }
+        val pkgPath = guestShell("pm path ${MagiskPlanSupport.PACKAGE}", 60_000).lines()
+            .firstOrNull { it.startsWith("package:") }?.removePrefix("package:")?.trim()
+        if (pkgPath != null) {
+            val installedCode = Regex("""versionCode=(\d+)""")
+                .find(guestShell("dumpsys package ${MagiskPlanSupport.PACKAGE}", 60_000))
+                ?.groupValues?.get(1)?.toIntOrNull()
+            val stagedCode = runCatching {
+                ctx.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)?.versionCode
+            }.getOrNull()
+            if (installedCode != null && stagedCode != null) {
+                if (installedCode == stagedCode) { log("magisk-plan: manager app already at versionCode $stagedCode"); return }
+                log("magisk-plan: manager app versionCode $installedCode, delivered $stagedCode: updating")
+            } else {
+                val guestLen = guestShell("wc -c < $pkgPath", 30_000).trim().toLongOrNull()
+                if (guestLen == apk.length()) return
+            }
+        }
+        val staged = File(paths.root, "data/local/tmp").apply { mkdirs() }.let { File(it, "aemu-magisk-plan.apk") }
+        java.nio.file.Files.copy(apk.toPath(), staged.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        staged.setReadable(true, false)
+        try {
+            var out = installApk("/data/local/tmp/aemu-magisk-plan.apk").trim()
+            if (out.contains("Success")) {
+                log("magisk-plan: manager app install -> ${out.take(300)}")
+            } else {
+                log("magisk-plan: manager app update refused (${out.take(200)}); reinstalling from scratch")
+                val un = guestShell("pm uninstall ${MagiskPlanSupport.PACKAGE}", 60_000).trim()
+                out = installApk("/data/local/tmp/aemu-magisk-plan.apk").trim()
+                log("magisk-plan: manager app install -> ${out.take(300)} (after uninstall: ${un.take(120)})")
+            }
+        } finally {
+            staged.delete()
+        }
+    }
+
+    /**
+     * The magisk-plan pre-services seat: prepare the payload tmp the way magiskinit's
+     * setup_tmp would have (the .magisk structure including preinit, the config file it
+     * carries over from the boot image — RECOVERYMODE=false is this guest's truth: no
+     * recovery boot exists here — the daemon binary, its applet links su/resetprop, and
+     * busybox with its applet links; sources are the /data/adb deployment TreeFixer
+     * planted), link the /system names into it, then run the post-fs-data stage. The
+     * stage call is the daemon's first root client of the boot, so it is also what wakes
+     * the daemon (its create=true); the host never execs --daemon.
+     */
+    private fun planPostFsData() {
+        runCatching {
+            val t = MagiskPlanSupport.TMP
+            guestShell(
+                "mkdir -p $t/.magisk/device $t/.magisk/worker $t/.magisk/mirror $t/.magisk/rootdir $t/.magisk/busybox $t/.magisk/preinit && " +
+                    "printf 'RECOVERYMODE=false\\n' > $t/.magisk/config && " +
+                    "cp ${MagiskPlanSupport.BIN}/magisk $t/magisk && chmod 755 $t/magisk && " +
+                    "ln -sf ./magisk $t/su && ln -sf ./magisk $t/resetprop && " +
+                    "cp ${MagiskPlanSupport.BIN}/busybox $t/.magisk/busybox/busybox && chmod 755 $t/.magisk/busybox/busybox && " +
+                    "$t/.magisk/busybox/busybox --install -s $t/.magisk/busybox",
+                60_000)
+            planLinkSystem()
+            planStage("--post-fs-data", 120_000)
+            log("magisk-plan: post-fs-data seat done")
+            planLiveness("post-fs-data")
+        }.onFailure { log("magisk-plan: post-fs-data seat failed: ${it.message}") }
+    }
+
+    /**
+     * The /system/bin and /system/xbin names (su, magisk, resetprop) as links into the
+     * payload tmp — the substitute seat's shape: a firmware file in the way is set aside
+     * as <name>.aemu-orig (only when that name is still free); TreeFixer's switch-off
+     * path removes the links and restores the originals.
+     */
+    private fun planLinkSystem() {
+        val t = MagiskPlanSupport.TMP
+        val cmds = StringBuilder()
+        for (dir in listOf("/system/bin", "/system/xbin")) for (name in MagiskPlanSupport.SYSTEM_LINKS) {
+            cmds.append(
+                "if [ -L $dir/$name ]; then rm -f $dir/$name; " +
+                    "elif [ -e $dir/$name ]; then if [ -e $dir/$name.aemu-orig ]; then rm -f $dir/$name; else mv $dir/$name $dir/$name.aemu-orig; fi; fi; " +
+                    "ln -s $t/magisk $dir/$name; ")
+        }
+        guestShell(cmds.toString(), 60_000)
+    }
+
+    /** The magisk-plan late_start seat, after the service plan is up. */
+    private fun planLateStart() {
+        runCatching {
+            planStage("--service")
+            log("magisk-plan: late_start seat done")
+            planLiveness("late_start")
+        }.onFailure { log("magisk-plan: late_start seat failed: ${it.message}") }
+    }
+
+    /** One magisk-plan CLI call through the payload tmp binary, output trimmed. */
+    private fun planExec(args: String, timeoutMs: Long = 60_000): String =
+        guestShell("${MagiskPlanSupport.TMP}/magisk $args </dev/null", timeoutMs).trim()
+
+    /**
+     * One magisk-plan stage call. The stage CLIs are silent on success, so anything they
+     * do print is diagnostic and goes to the host log instead of being dropped — the same
+     * lesson the substitute's seats learned in their first field run.
+     */
+    private fun planStage(args: String, timeoutMs: Long = 60_000) {
+        val out = runCatching { planExec(args, timeoutMs) }.getOrElse { "error: ${it.message}" }
+        if (out.isNotBlank()) log("magisk-plan: $args -> ${out.take(400)}")
+    }
+
+    /** Lines of the daemon's own log already mirrored into the host log by [planMirrorDaemonLog]. */
+    private var planDaemonLogSeen = 0
+
+    /**
+     * Mirror the daemon's own log (its /cache/magisk.log — the genuine daemon's log file,
+     * read straight from the guest tree) into the host log, only the lines not mirrored
+     * yet: its lifecycle — start, stage work, check_data's verdict, its own error lines —
+     * stays readable next to the seats that probed it. This mirror is the field record
+     * the magisk-plan verdicts are read from.
+     */
+    private fun planMirrorDaemonLog() {
+        val f = File(paths.root, "cache/magisk.log")
+        if (!f.isFile) return
+        val lines = runCatching { f.readLines() }.getOrNull() ?: return
+        if (lines.size < planDaemonLogSeen) planDaemonLogSeen = 0
+        for (i in planDaemonLogSeen until lines.size) log("magisk-plan: daemon log: ${lines[i].take(300)}")
+        planDaemonLogSeen = lines.size
+    }
+
+    /**
+     * The plan daemon's liveness, written for these seats (the substitute's shape): the
+     * daemon's socket file exists in the guest and the daemon answers `-v`. Both halves
+     * are logged either way. The genuine daemon keeps no pidfile of its own in the tmp
+     * (the substitute wrote one for its seats), so a dead verdict reports the socket
+     * probe's own words instead of a pid state.
+     */
+    private fun planLiveness(after: String) {
+        planMirrorDaemonLog()
+        val out = runCatching {
+            guestShell("if [ -S ${MagiskPlanSupport.TMP}/.magisk/device/socket ]; then ${MagiskPlanSupport.TMP}/magisk -v; else echo no-socket; fi", 30_000)
+        }.getOrElse { "error: ${it.message}" }.trim()
+        if (out.startsWith("30.7")) {
+            log("magisk-plan: daemon alive after $after (version $out)")
+        } else {
+            log("magisk-plan: daemon NOT answering after $after ($out)")
         }
     }
 
