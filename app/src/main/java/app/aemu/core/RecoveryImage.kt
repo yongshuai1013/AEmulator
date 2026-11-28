@@ -32,6 +32,18 @@ object RecoveryImage {
         ImageStore.wipe(out)
         out.mkdirs()
         val base = out.canonicalPath
+        // every path the image itself brings, ancestors included, so symlink targets can be
+        // told apart as in-tree vs outside before anything is written
+        val treePaths = HashSet<String>()
+        for (e in rd) {
+            var p = normalizeTreePath(e.name.trimStart('/')) ?: continue
+            while (true) {
+                treePaths.add(p)
+                val i = p.lastIndexOf('/')
+                if (i < 0) break
+                p = p.substring(0, i)
+            }
+        }
         for (e in rd) {
             val n = e.name.trimStart('/')
             if (n.isEmpty() || n == ".") continue
@@ -39,7 +51,7 @@ object RecoveryImage {
             if (!f.canonicalPath.startsWith(base)) continue
             when (e.mode and 0xF000) {
                 0x4000 -> f.mkdirs()
-                0xA000 -> { f.parentFile?.mkdirs(); runCatching { Os.symlink(String(e.data), f.path) } }
+                0xA000 -> { f.parentFile?.mkdirs(); runCatching { Os.symlink(symlinkTarget(n, String(e.data), treePaths), f.path) } }
                 0x8000 -> {
                     f.parentFile?.mkdirs(); f.writeBytes(e.data)
                     if (e.mode and 0x49 != 0) f.setExecutable(true, false)
@@ -51,6 +63,39 @@ object RecoveryImage {
             .let { Regex("twrp", RegexOption.IGNORE_CASE).containsMatchIn(it) }.let { if (it) "TWRP" else "" }
         log("recovery: installed ${rd.size} files ${name}".trim())
         return true
+    }
+
+    /** Tree-relative path with "." and ".." resolved; null when it escapes the tree root. */
+    private fun normalizeTreePath(p: String): String? {
+        val parts = ArrayDeque<String>()
+        for (seg in p.split('/')) {
+            when (seg) {
+                "", "." -> {}
+                ".." -> { if (parts.isEmpty()) return null; parts.removeLast() }
+                else -> parts.addLast(seg)
+            }
+        }
+        return parts.joinToString("/")
+    }
+
+    /**
+     * A symlink target spelled absolute ("/sbin/busybox") is resolved by the host kernel
+     * against the phone's real root whenever the guest execs through it — outside this tree
+     * it does not exist and the exec dies with ENOENT (the TWRP updater's #!/sbin/sh did).
+     * When the target lives inside this tree, respell it relative to the link's own
+     * directory so every resolver stays inside the tree; anything else is kept verbatim.
+     */
+    private fun symlinkTarget(linkName: String, target: String, treePaths: Set<String>): String {
+        if (!target.startsWith("/")) return target
+        val abs = normalizeTreePath(target) ?: return target
+        if (abs !in treePaths) return target
+        val dir = linkName.substringBeforeLast('/', "")
+        val from = if (dir.isEmpty()) emptyList() else dir.split('/')
+        val to = if (abs.isEmpty()) emptyList() else abs.split('/')
+        var common = 0
+        while (common < from.size && common < to.size && from[common] == to[common]) common++
+        val rel = (List(from.size - common) { ".." } + to.subList(common, to.size)).joinToString("/")
+        return rel.ifEmpty { "." }
     }
 
     /** Runtime pieces the ramdisk lacks: device nodes qemu emulates, mount points, the shared framebuffer. */
