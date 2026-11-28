@@ -97,6 +97,7 @@ static char g_qemu[512];        // qemu-arm for the firmware's 32-bit programs (
 static int g_crash;
 static int g_seat_pid1;         // AEMU64_PID1: the seat /init is told it is pid 1 (itself only)
 static long g_seat_pid;         // the host pid of the process that became the seat /init
+static int g_seat;              // a partition-seat session: /dev/__properties__ stays in the guest tree (seat_session)
 static u64 g_logdev, g_logino;      // the service log on descriptor 2 (a file or a pipe to the app)
 static int g_logpipe;
 static u64 g_inino;                 // ...and the pipe on descriptor 0
@@ -186,7 +187,7 @@ static const char *xl_x(const char *p, char *buf, int *err, int rw) {
     // translated code is slow: the 32-bit zygote starts without its minutes of class preloading
     if (g_is32 && seq(n, "/system/etc/preloaded-classes")) memcpy(n, "/proc/.task1/none", 18);
     if (pre(n, "/dev/") && host_dev(n + 5)) return p;
-    if (g_props[0] && seq(n, "/dev/__properties__")) return g_props;
+    if (!g_seat && g_props[0] && seq(n, "/dev/__properties__")) return g_props;
     if (pre(n, g_root) && (n[g_rootlen] == '/' || !n[g_rootlen])) return p;   // already a host path (our own argv)
     if (g_sdlen) {
         // the guest's card: plain directories for it, the shared folder of the phone underneath
@@ -814,6 +815,44 @@ static const char *secon_opname(long nr) {
     return "?";
 }
 
+/* ---- seat property-area prints (prop) ------------------------------------
+   In a partition-seat session the guest init builds /dev/__properties__ itself,
+   as a directory of per-context files in the tree; the supervisor's part is
+   only to watch it happen. mkdir/openat/ftruncate/mmap/fsetxattr on the area
+   path or anything under it are reported on the run log in the secon print's
+   shape (the first calls of a process in full, after that only what did not
+   plainly succeed), so a field run can read off which of property_init's steps
+   landed. The label write of step S3 is the fsetxattr of security.selinux and
+   is already printed by the secon machinery as an "fset" line; the prop print
+   covers the rest, including fsetxattr of any other name. Inert unless the
+   session is a seat session (g_seat). */
+static long g_prop_n;
+static int prop_path(const char *p) {
+    return p && (seq(p, "/dev/__properties__") || pre(p, "/dev/__properties__/"));
+}
+static void prop_log(const char *op, const char *path, long r) {
+    if (__atomic_add_fetch(&g_prop_n, 1, __ATOMIC_RELAXED) > 512 && r == 0) return;
+    char nb[24];
+    say("aemu64: prop "); say(op); say(" "); say(path); say(" -> ");
+    if (r < 0) { say("-"); say(utoa((u64)(-r), nb + sizeof nb)); } else say(utoa((u64)r, nb + sizeof nb));
+    say("\n");
+}
+// the guest path of an open descriptor, for the fd-based prints: 1 with tp set when it is in the area family
+static int prop_fd_path(int fd, char *lp, char *tp) {
+    memcpy(lp, "/proc/self/fd/", 14);
+    char nb[24];
+    char *ns = utoa((u64)(u32)fd, nb + sizeof nb);
+    memcpy(lp + 14, ns, slen(ns) + 1);
+    long tl = S4(NR_readlinkat, AT_FDCWD, lp, tp, 4031);
+    if (tl <= 0) return 0;
+    tp[tl] = 0;
+    if (tl > 10 && seq(tp + tl - 10, " (deleted)")) tp[tl - 10] = 0;
+    if (!((pre(tp, g_root) && (tp[g_rootlen] == '/' || !tp[g_rootlen])) ||
+          (g_sdlen && pre(tp, g_sd) && (tp[g_sdlen] == '/' || !tp[g_sdlen])))) return 0;
+    unxl(tp);
+    return prop_path(tp);
+}
+
 /* FC_BEGIN */
 /* ---- guest file_contexts lookup (fc) -----------------------------------
    When a security.selinux get finds no ledger entry, the answer comes from
@@ -1390,7 +1429,9 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             }
         }
         NEEDX(1);
-        return S4(nr, a[0], h1, a[2], a[3]);
+        long r = S4(nr, a[0], h1, a[2], a[3]);
+        if (g_seat && prop_path(P(1))) prop_log("open", P(1), r);
+        return r;
     }
     case NR_newfstatat: {
         // fstat as newer C libraries make it (qemu-arm's does): the same answers as for fstat
@@ -1482,7 +1523,9 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         char *b1 = PB(0);
         NEEDX(1);
         // Added for AEmulator Plus (2026-11-21): the emulated root keeps the owner bits (vmount.h, vm_mode_fix)
-        return S5(nr, a[0], h1, vm_mode_fix(nr, a[0], h1, a[2]), a[3], a[4]);
+        long r = S5(nr, a[0], h1, vm_mode_fix(nr, a[0], h1, a[2]), a[3], a[4]);
+        if (g_seat && nr == NR_mkdirat && prop_path(P(1))) prop_log("mkdir", P(1), r);
+        return r;
     }
     case NR_fchown: own_put(7 /*fsetxattr*/, a[0], a[1], a[2]); return 0;
     case NR_fchownat: {
@@ -1547,6 +1590,13 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         }
         return r;
     }
+    case NR_ftruncate: {
+        // trapped only in a seat session (install_filter), to watch property_init size the area files;
+        // the call itself passes through exactly as the untrapped one did
+        long r = S2(nr, a[0], a[1]);
+        if (g_seat) { char *lp = PB(0), *tp = PB(0) + 64; if (prop_fd_path((int)a[0], lp, tp)) prop_log("truncate", tp, r); }
+        return r;
+    }
     case NR_setxattr: case NR_lsetxattr: case NR_getxattr: case NR_lgetxattr: case NR_listxattr: case NR_llistxattr:
     case NR_removexattr: case NR_lremovexattr: {
         // the label is answered from our own bookkeeping (secon_path above); every other attribute
@@ -1564,7 +1614,13 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     }
     case NR_fsetxattr: case NR_fgetxattr: case NR_flistxattr: case NR_fremovexattr: {
         int islist = nr == NR_flistxattr;
-        if (!islist && !(P(1) && seq(P(1), SECON_NAME))) return S5(nr, a[0], a[1], a[2], a[3], a[4]);
+        if (!islist && !(P(1) && seq(P(1), SECON_NAME))) {
+            long r = S5(nr, a[0], a[1], a[2], a[3], a[4]);
+            // seat property prints: an area fd labelled with anything but the SELinux name (the SELinux
+            // one is the secon machinery's "fset" line just below)
+            if (g_seat && nr == NR_fsetxattr) { char *lp = PB(0), *tp = PB(0) + 64; if (prop_fd_path((int)a[0], lp, tp)) prop_log("fset", tp, r); }
+            return r;
+        }
         // whose file is this descriptor? Only a file of the guest's own tree is answered from the
         // bookkeeping; anything else (the phone's own files, pipes, sockets) keeps the host's answer.
         char *lp = PB(0), *tp = PB(0) + 64;
@@ -1669,7 +1725,9 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
                 return r;
             }
         }
-        return S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
+        long r = S6(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
+        if (g_seat && (int)a[4] >= 0) { char *lp = PB(0), *tp = PB(0) + 64; if (prop_fd_path((int)a[4], lp, tp)) prop_log("mmap", tp, r); }
+        return r;
     case NR_mount: case NR_umount2: case NR_chroot: case NR_capset: case NR_setgroups: case NR_unshare: case 268 /* setns */: return 0;
     case NR_prctl: return 0;                    // only PR_CAPBSET_DROP gets here
     case NR_timerfd_create: {                   // the *_ALARM clocks need CAP_WAKE_ALARM, vendor clocks (power-off alarm)
@@ -2010,6 +2068,9 @@ static void install_filter(void) {
     // filter is installed) are pid questions trapped at all; every other guest's filter
     // stays exactly as it was.
     if (g_seat_pid1) { f[n++] = JEQ(NR_getpid, L_TRAP, 0); f[n++] = JEQ(NR_gettid, L_TRAP, 0); }
+    // a seat session also traps ftruncate, only so the property prints can watch init size the area files;
+    // its trap case passes the call through untouched
+    if (g_seat) f[n++] = JEQ(NR_ftruncate, L_TRAP, 0);
     // Added for AEmulator Plus (2026-11-21): directory reads, to show a device node (a whiteout) as one (vmount.h)
     if (g_vm) f[n++] = JEQ(61 /* getdents64 */, L_TRAP, 0);
     f[n++] = JEQ(NR_rt_sigprocmask, L_SIG, 0);
@@ -2092,6 +2153,22 @@ static const char *env_get(char **envp, const char *k) {
     return 0;
 }
 
+// Is this supervisor instance part of a partition-seat session? The seat /init's own spawn
+// carries AEMU64_SEAT, but that flag provably cannot be the whole answer: do_exec rebuilds
+// the environment of every guest exec from its own list, which does not include it, and the
+// host's later spawns never had it — so an env-only test would go dark exactly one exec into
+// the session. The durable witness is the marker the host plants in the tree when it starts
+// the seat init (<root>/dev/.aemu-seat, the .aemu-vmount precedent): every instance of the
+// session, the init's children and everything they exec alike, roots at the same tree and
+// sees it. Either witness suffices.
+static int seat_session(char **envp) {
+    if (env_get(envp, "AEMU64_SEAT")) return 1;
+    if (g_rootlen > 440) return 0;
+    char p[512];
+    memcpy(p, g_root, g_rootlen); memcpy(p + g_rootlen, "/dev/.aemu-seat", 16);
+    return S4(NR_faccessat, AT_FDCWD, p, 0, 0) == 0;
+}
+
 void aemu_main(u64 *sp) {
     long argc = (long)sp[0];
     char **argv = (char **)(sp + 1), **envp = argv + argc + 1;
@@ -2103,6 +2180,10 @@ void aemu_main(u64 *sp) {
     memcpy(g_root, r, slen(r) + 1); g_rootlen = slen(g_root);
     vm_init();                                                   // (vmount.h)
     if ((r = env_get(envp, "AEMU64_PROPS")) && slen(r) < sizeof g_props) memcpy(g_props, r, slen(r) + 1);
+    // a seat session keeps the property area in the guest tree, built by the guest init itself:
+    // the host's single-file area is not adopted, so the exact-path redirect in xl_x stays off
+    // and do_exec does not hand the path down either (both key on g_props)
+    if (seat_session(envp)) { g_seat = 1; g_props[0] = 0; }
     if ((r = env_get(envp, "AEMU64_UTS_RELEASE")) && slen(r) < sizeof g_uts_rel) memcpy(g_uts_rel, r, slen(r) + 1);
     if ((r = env_get(envp, "AEMU64_UTS_VERSION")) && slen(r) < sizeof g_uts_ver) memcpy(g_uts_ver, r, slen(r) + 1);
     g_crash = env_get(envp, "AEMU64_CRASH") != 0;
