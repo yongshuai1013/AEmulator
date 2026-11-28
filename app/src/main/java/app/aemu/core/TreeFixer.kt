@@ -1121,6 +1121,17 @@ class TreeFixer(
                 apk.setReadable(true, false); copied++
             }
         }.onFailure { log("aemu-agent.apk: ${it.message}") }
+        // the TCP timing probe's delivered copy, planted next to the agent's: GuestVm installs it
+        // at boot complete behind the same content-hash gate, so the guest carries it by default
+        runCatching {
+            val apk = File(root, ProbeSupport.APK_COPY)
+            val bytes = EngineAssets.open(ctx, "engines/kk/aemu-tcp-probe.apk").use { it.readBytes() }
+            if (!apk.isFile || !apk.readBytes().contentEquals(bytes)) {
+                apk.parentFile?.mkdirs()
+                apk.writeBytes(bytes)
+                apk.setReadable(true, false); copied++
+            }
+        }.onFailure { log("aemu-tcp-probe.apk: ${it.message}") }
         // the per-generation Bluetooth bridge jars (guest-bt-n64): API 23, 24-25 and 26-27 guests each link
         // their own; GuestVm picks the one for the image when the Bluetooth setting is on, the rest stay unused
         for (name in listOf("aemu-bt23.jar", "aemu-bt24.jar", "aemu-bt26.jar")) runCatching {
@@ -1232,6 +1243,7 @@ class TreeFixer(
                 "aemu-bt.jar" to "system/framework/aemu-bt.jar",
                 "aemu-agent.jar" to "system/framework/aemu-agent.jar",
                 "aemu-agent.apk" to "data/adb/aemu-agent.apk",
+                "aemu-tcp-probe.apk" to "data/adb/aemu-tcp-probe.apk",
             )
             Engine.GB -> listOf(
                 "libashmemshim.so" to "system/lib/libashmemshim.so",
