@@ -212,6 +212,7 @@ fun SettingsSheet(img: GuestImage, onDismiss: () -> Unit, onSave: (VmSettings) -
             QemuZeroSection(img, s.qemuZero) { s = s.copy(qemuZero = it) }
             BootSeatSection(img, s.bootSeat) { s = s.copy(bootSeat = it) }
             AgentSection(img, s) { s = it }
+            KmRootSection(img)
 
             Spacer(Modifier.height(8.dp))
             Text(stringResource(R.string.vs_archive), style = MaterialTheme.typography.titleMedium)
