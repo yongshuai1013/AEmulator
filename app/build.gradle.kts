@@ -99,6 +99,12 @@ android {
     packaging {
         // исполняемые файлы движка лежат как lib*.so и должны распаковываться на диск
         jniLibs { useLegacyPackaging = true }
+        resources {
+            // The three BouncyCastle jars each carry this multi-release
+            // manifest; it collides at packaging time (seen first in the
+            // attest-play build). The app never reads it.
+            excludes += "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+        }
     }
 
     androidResources {
@@ -134,6 +140,10 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("org.tukaani:xz:1.10")
     implementation("org.apache.commons:commons-compress:1.28.0")
+    // Guest keymaster root replacement (KmRoot): certificate generation,
+    // PEM / PKCS#12 handling. bcutil arrives transitively with bcpkix.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
     implementation("org.brotli:dec:0.1.2")
     implementation("com.github.junrar:junrar:7.5.5")
     // UBIFS data decompression (UbiFsReader, from AEmulator-Plus): zstd frames and LZO1X blocks
