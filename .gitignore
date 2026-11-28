@@ -30,6 +30,8 @@ release-apks/
 /app/src/main/assets/engines/kk/aemu-su
 # built by CI from app/guest-terminal sources (see the workflow), never committed
 /app/src/main/assets/engines/kk/aemu-terminal.apk
+# built by CI from app/guest-probe sources (see the workflow), never committed
+/app/src/main/assets/engines/kk/aemu-tcp-probe.apk
 # built by CI from native/gatekeeperhal sources (see native/build_all.py), never committed
 /app/src/main/assets/engines/n64-27/aemu-gatekeeper.so
 /app/src/main/assets/engines/n64-27/aemu-gatekeeper32.so
