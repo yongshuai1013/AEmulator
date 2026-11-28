@@ -1079,6 +1079,12 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
     }
     case NR_rt_sigaction: {
         struct ksa { void *h; u64 flags; void *restorer; u64 mask; } t;
+        if (a[1]) {                     // measurement only: log each registration exactly as the guest submitted it, before any rewriting below
+            struct ksa g = *(struct ksa *)a[1];
+            char nb[24];
+            say("aemu64: sigact "); say(g_exe); say(" sig="); say(utoa((u64)a[0], nb + sizeof nb));
+            say(" h="); hex((u64)g.h); say(" flags="); hex(g.flags); say("\n");
+        }
         if (a[0] == SIGSYS) { if (a[2]) memset((void *)a[2], 0, sizeof t); return 0; }
         if (is_fatal(a[0])) {
             struct ksa old; void *prev = (void *)g_fatal[a[0]];
