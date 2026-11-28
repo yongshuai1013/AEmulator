@@ -70,4 +70,8 @@
     <string name="kmroot_part_rsa_attest">RSA 簽署件</string>
     <string name="kmroot_part_ec_root">EC 根</string>
     <string name="kmroot_part_ec_attest">EC 簽署件</string>
+    <string name="vm_magiskplan_title">Root（自編 Magisk，plan 模式）</string>
+    <string name="vm_magiskplan_sub">真 Magisk daemon（30.7），由本專案自未修改的上游源碼編譯、由宿主在這台客體的 plan 開機里程碑喚醒：su 請求由它的 magisk.db 決定、經 Magisk App 詢問；模組掛載走監督器的掛載表；sepolicy 載入由種入的 selinuxfs 回答。此模式下 Zygisk 不生效、denylist 沒有逐 App 視圖。與 Magisk 替身、分割區座位互斥。下次完整開機生效。原生引擎 Android 8.1（arm64）客體。實驗性。</string>
+    <string name="vm_magiskplan_sub_unsupported">真 Magisk daemon（30.7、自編），在 plan 開機的里程碑喚醒，掛載與 sepolicy 載入由監督器回答。</string>
+    <string name="vm_magiskplan_unsupported">此客體尚未支援</string>
 </resources>
