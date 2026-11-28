@@ -123,6 +123,20 @@ object DiagExport {
                         entry(zip, "guest/$rel") { o -> RandomAccessFile(f, "r").use { r -> copyRange(r, 0, f.length(), o) } }
                     else if (f.isFile) addFile(zip, "guest/$rel", f)
                 }
+                // the stock init points its stdio at /sys/fs/selinux/null while loading the policy, and that node is a
+                // plain file in this tree: everything printed after that point (the guest's own lines and the native
+                // runner's, which shares the descriptor table) landed in it, so its content is the second half of the
+                // boot log and the file list alone cannot answer for it. Capped at 4 MiB like the other big files,
+                // with the cut noted at the end of the entry; absent on images that never grew the node.
+                val selinuxNull = File(vm.paths.root, "sys/fs/selinux/null")
+                if (selinuxNull.isFile) entry(zip, "guest/sys-fs-selinux-null.log") { o ->
+                    val cap = 4L shl 20
+                    RandomAccessFile(selinuxNull, "r").use { r ->
+                        val len = r.length()
+                        copyRange(r, 0, minOf(len, cap), o)
+                        if (len > cap) o.write("\n\n[... truncated: ${len - cap} of $len bytes omitted ...]\n".toByteArray())
+                    }
+                }
                 // files the factory test program writes itself
                 listOf("cache/tki/tki.log", "data/mmi_ip.png", "data/local/tmp/mmi.log").forEach { rel ->
                     val f = File(vm.paths.root, rel)
