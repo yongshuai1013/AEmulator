@@ -6,14 +6,18 @@
 # before any wait for writability - so the numbers can be lined up against
 # the host hub's log. Built without Gradle, like app/guest-agent-app.
 #
-# Output: TcpTimingProbe.apk next to this script. It is NOT bundled into the
-# host app and NOT planted by TreeFixer: CI uploads it as a standalone
-# artifact and it is installed into the guest by hand, as a plain user app -
-# which is exactly what the measurement needs (a non-exempt guest process
-# whose connects take the detour). Signed with a self-generated keystore next
-# to this script (probe.keystore, gitignored like every keystore here); a
-# hand install accepts any signature, and a re-install of a differently
-# signed rebuild needs an uninstall first.
+# Output: TcpTimingProbe.apk next to this script, and a copy inside the host
+# app's engine assets (aemu-tcp-probe.apk). CI uploads the standalone file as
+# its own artifact; the bundled copy is planted into the guest tree by
+# TreeFixer and installed by GuestVm at boot complete, so a guest carries the
+# probe by default, as a plain user app - which is exactly what the
+# measurement needs (a non-exempt guest process whose connects take the
+# detour), and a guest has no file manager to install it by hand with.
+# Signed with a self-generated keystore next to this script (probe.keystore,
+# gitignored like every keystore here); a hand install accepts any signature,
+# and a re-install of a differently signed rebuild needs an uninstall first -
+# the boot-complete installer does that uninstall itself when a replace is
+# refused.
 #
 # Needs a JDK (javac, keytool) and the Android SDK (aapt2, d8, zipalign,
 # apksigner, android.jar; the android-23 platform is the one CI installs for
@@ -42,3 +46,9 @@ python3 -c "import zipfile;z=zipfile.ZipFile('$work/base.apk','a',zipfile.ZIP_DE
 out="$here/TcpTimingProbe.apk"
 "${BT}apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --out "$out" "$work/aligned.apk"
 echo "wrote $out"
+# the bundled copy the host app delivers into the guest by default: the same signed bytes
+# as the standalone artifact, under the name TreeFixer and GuestVm look for
+bundled="$here/../src/main/assets/engines/kk/aemu-tcp-probe.apk"
+mkdir -p "$(dirname "$bundled")"
+cp "$out" "$bundled"
+echo "wrote $bundled"
