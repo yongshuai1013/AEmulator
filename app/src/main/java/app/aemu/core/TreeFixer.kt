@@ -117,6 +117,7 @@ class TreeFixer(
         installEngineFiles()
         superuserFiles()
         substituteFiles()
+        magiskPlanFiles()
         zygiskSpikeFiles()
         terminalFiles()
         gatekeeperFiles()
@@ -324,9 +325,10 @@ class TreeFixer(
     private fun superuserFiles() {
         val su = File(root, SuperuserSupport.SU_PATH)
         val app = File(root, SuperuserSupport.APP_PATH)
-        // while the Magisk substitute's switch is on it owns the guest's su names, so the
-        // classic plant stays out and a previous plant is taken back by the removal path below
-        if (!(SuperuserSupport.supported(img) && img.settings.superuser) || SubstituteSupport.on(img)) {
+        // while a Magisk root mode's switch is on (substitute or self-built plan) it owns the
+        // guest's su names, so the classic plant stays out and a previous plant is taken back
+        // by the removal path below
+        if (!(SuperuserSupport.supported(img) && img.settings.superuser) || SubstituteSupport.on(img) || MagiskPlanSupport.on(img)) {
             runCatching {
                 val bytes = EngineAssets.open(ctx, SuperuserSupport.SU_ASSET).use { it.readBytes() }
                 if (su.isFile && su.readBytes().contentEquals(bytes)) { su.delete(); log("superuser: su removed (switch off)") }
@@ -438,6 +440,84 @@ class TreeFixer(
             zip.close()
             for (d in SubstituteSupport.DATA_DIRS) File(root, d).mkdirs()
         }.onFailure { log("magisk-sub deploy: ${it.message}") }
+    }
+
+    /**
+     * Self-built Magisk (MagiskPlanSupport): the substitute's deployment shape with the
+     * genuine daemon's bytes — while this VM's magisk-plan switch is on, deploy the payload
+     * into the guest's /data/adb out of the embedded repacked app (binaries and scripts
+     * under data/adb/magisk, the app copy beside them; GuestVm installs it inside the guest
+     * at boot-complete and wakes the daemon at the plan milestones). The magisk.db is NOT
+     * planted: the daemon creates it with the official schema on first start. The two root
+     * modes share their paths (the payload tmp, /data/adb/magisk, the /system name links)
+     * and are mutually exclusive: while the substitute's switch is on it owns the shared
+     * deployment and this deployment stands down (its own app copy is still taken back);
+     * the /system name links are the substitute deployment's cleanup above — it runs
+     * whenever the substitute is off — and the plan boot seat re-creates them at boot.
+     * While the plan switch is off, take this deployment back byte-compared against the
+     * asset, so a file that is not ours is never touched.
+     */
+    private fun magiskPlanFiles() {
+        val apkFile = File(root, MagiskPlanSupport.APK_PATH)
+        val binDir = File(root, "data/adb/magisk")
+        if (SubstituteSupport.on(img)) {
+            runCatching {
+                val assetBytes = EngineAssets.open(ctx, MagiskPlanSupport.APK_ASSET).use { it.readBytes() }
+                if (apkFile.isFile && apkFile.readBytes().contentEquals(assetBytes)) {
+                    apkFile.delete()
+                    log("magisk-plan: app copy removed (the substitute owns this boot)")
+                }
+            }.onFailure { log("magisk-plan cleanup: ${it.message}") }
+            return
+        }
+        if (!MagiskPlanSupport.on(img)) {
+            val assetBytes = runCatching { EngineAssets.open(ctx, MagiskPlanSupport.APK_ASSET).use { it.readBytes() } }.getOrNull()
+            if (assetBytes != null) runCatching {
+                val tmpApk = File.createTempFile("aemu-magisk-plan", ".apk", ctx.cacheDir)
+                tmpApk.writeBytes(assetBytes)
+                val zip = java.util.zip.ZipFile(tmpApk)
+                for ((entry, rel) in MagiskPlanSupport.PAYLOAD) {
+                    val f = File(binDir, rel)
+                    val bytes = zip.getEntry(entry)?.let { e -> zip.getInputStream(e).use { it.readBytes() } }
+                    if (bytes != null && f.isFile && f.readBytes().contentEquals(bytes)) {
+                        f.delete()
+                        log("magisk-plan: payload $rel removed (switch off)")
+                    }
+                }
+                zip.close()
+                tmpApk.delete()
+                if (apkFile.isFile && apkFile.readBytes().contentEquals(assetBytes)) {
+                    apkFile.delete()
+                    log("magisk-plan: app copy removed (switch off)")
+                }
+                binDir.takeIf { it.list()?.isEmpty() == true }?.delete()
+            }.onFailure { log("magisk-plan cleanup: ${it.message}") }
+            return
+        }
+        val apkBytes = runCatching { EngineAssets.open(ctx, MagiskPlanSupport.APK_ASSET).use { it.readBytes() } }
+            .getOrElse { log("magisk-plan: ${MagiskPlanSupport.APK_ASSET} is not installed (build guest-magisk-plan/build.sh), the payload is not deployed"); return }
+        runCatching {
+            if (!apkFile.isFile || !apkFile.readBytes().contentEquals(apkBytes)) {
+                apkFile.parentFile?.mkdirs()
+                apkFile.writeBytes(apkBytes)
+                apkFile.setReadable(true, false)
+                log("magisk-plan: app copy planted at ${MagiskPlanSupport.APK_PATH}")
+            }
+            val zip = java.util.zip.ZipFile(apkFile)
+            for ((entry, rel) in MagiskPlanSupport.PAYLOAD) {
+                val e = zip.getEntry(entry) ?: run { log("magisk-plan: $entry missing from the app copy, skipped"); continue }
+                val bytes = zip.getInputStream(e).use { it.readBytes() }
+                val f = File(binDir, rel)
+                if (!f.isFile || !f.readBytes().contentEquals(bytes)) {
+                    f.parentFile?.mkdirs()
+                    f.writeBytes(bytes)
+                    log("magisk-plan: payload $rel planted")
+                }
+                Os.chmod(f.absolutePath, 0x1ED)   // 0755: binaries and scripts alike
+            }
+            zip.close()
+            for (d in MagiskPlanSupport.DATA_DIRS) File(root, d).mkdirs()
+        }.onFailure { log("magisk-plan deploy: ${it.message}") }
     }
 
     /**
