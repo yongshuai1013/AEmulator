@@ -707,6 +707,15 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
                 }
                 if (seq(P(1), "/dev/binder") || seq(P(1), "/dev/hwbinder") || seq(P(1), "/dev/vndbinder")) return binder_open(a[2], P(1));
                 if (pre(P(1), "/dev/input/event")) return input_open(a[2]);
+                if (seq(P(1), "/dev/kmsg") && (a[2] & 3)) {
+                    // no host device answers for the kernel log (its marker's 1:11 is not in
+                    // vm_devpath, so the open used to end ENXIO and whatever was written to it
+                    // was lost): a write open is mirrored onto descriptor 2, the log the app
+                    // already collects for this process. Read opens keep the old answer, and a
+                    // failed dup falls through to it as well.
+                    long r = (a[2] & 02000000) ? S3(NR_fcntl, 2, 1030 /* F_DUPFD_CLOEXEC */, 0) : S1(NR_dup, 2);
+                    if (r >= 0) return r;
+                }
             }
             u64 pl = slen(P(1));
             if (pre(P(1), "/proc/") && ((pl >= 13 && seq(P(1) + pl - 13, "/attr/current")) || (pl >= 10 && seq(P(1) + pl - 10, "/attr/exec")))) {
@@ -968,7 +977,26 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         if (r < 0) r = S2(nr, a[0] == 9 ? 7 : 0, a[1]);
         return r;
     }
-    case NR_reboot: S1(NR_exit_group, 0); return 0;
+    case NR_reboot: {                   // measurement only: who asks for the reboot, and to where, before the session ends exactly as it always has
+        char nb[24];
+        say("aemu64: reboot "); say(g_exe);
+        say(" pid="); say(utoa((u64)S0(172 /* getpid */), nb + sizeof nb));
+        say(" magic="); hex((u64)a[0]);
+        say(" magic2="); hex((u64)a[1]);
+        say(" cmd="); hex((u64)a[2]);
+        if ((u32)a[2] == 0xA1B2C3D4u && a[3]) {          // RESTART2: the target is a guest string, read the way the crash report reads memory
+            char str[64];
+            struct { void *b; u64 n; } l = { str, sizeof str - 1 }, r = { (void *)a[3], sizeof str - 1 };
+            long sn = S6(270 /* process_vm_readv */, S0(172), &l, 1, &r, 1, 0);
+            if (sn > 0) {
+                str[sn] = 0;
+                for (long j = 0; j < sn && str[j]; j++) if ((unsigned char)str[j] < 32 || (unsigned char)str[j] > 126) str[j] = '?';
+                say(" arg=\""); say(str); say("\"");
+            } else say(" arg=?");
+        }
+        say("\n");
+        S1(NR_exit_group, 0); return 0;
+    }
     case NR_capget: {
         struct { u32 e, p, i; } *d = (void *)a[1];
         if (d) { d[0].e = d[0].p = 0xffffffff; d[0].i = 0; d[1].e = d[1].p = 0xffffffff; d[1].i = 0; }
