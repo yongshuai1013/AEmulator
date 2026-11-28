@@ -228,6 +228,30 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
      *  whole recovery session so minui can adopt those nodes, but never written to. */
     private val auxInputFds = mutableListOf<java.io.FileDescriptor>()
 
+    /**
+     * The recovery has no init to run load_all_props, so build its property
+     * area here, from the tree's own default.prop (+ prop.default if present),
+     * before /sbin/recovery starts: getprop then works from the first second
+     * of the session, the way it does on hardware. Fresh area every session;
+     * the format follows the recovery's own bionic generation (api from its
+     * own ro.build.version.sdk), never the system image's area.
+     */
+    private fun seedRecoveryProps(r: File, areaFile: File) {
+        runCatching {
+            val merged = LinkedHashMap<String, String>()
+            for (name in listOf("prop.default", "default.prop")) {
+                val f = File(r, name)
+                if (f.isFile) merged.putAll(PropArea.parseProps(f.readText()))
+            }
+            val api = merged["ro.build.version.sdk"]?.toIntOrNull() ?: 19
+            var n = 0
+            PropArea.create(areaFile, api).use { a ->
+                for ((k, v) in merged) if (a.put(k, v)) n++
+            }
+            log("recovery: seeded prop area with $n keys (api $api, ${if (api >= 26) "v2" else "v1"})")
+        }.onFailure { log("recovery: prop area seed failed: ${it.message}") }
+    }
+
     private fun doRecovery() {
         paths.bin.mkdirs()
         runCatching { logFile.writeText("") }
@@ -307,7 +331,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         // for a system boot. Give it the same set, with the paths pointed at the recovery tree.
         if (is64) {
             recEnv["AEMU64_ROOT"] = r.absolutePath
-            recEnv["AEMU64_PROPS"] = File(r, "dev/__properties__").absolutePath
+            val propsFile = File(r, "dev/__properties__")
+            recEnv["AEMU64_PROPS"] = propsFile.absolutePath
+            seedRecoveryProps(r, propsFile)
             val utsRelease = BootImage.bannerRelease(img.settings.kernelBanner)
             if (utsRelease.isNotEmpty()) {
                 recEnv["AEMU64_UTS_RELEASE"] = utsRelease
