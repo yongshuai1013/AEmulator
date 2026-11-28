@@ -98,9 +98,55 @@ object RecoveryImage {
         return rel.ifEmpty { "." }
     }
 
+    /**
+     * Self-healing for trees assembled before install() learned the respelling above:
+     * install() runs only at import or on a manual reinstall, so an older tree keeps its
+     * absolute "/sbin/sh" and the updater dies on it at every recovery boot. Walk the
+     * assembled tree once — never following links, since system/, data/ and sdcard/ in it
+     * point at the firmware's own partitions — and respell every absolute target that
+     * lives inside this tree exactly as install() would; outside targets (the by-name
+     * devices, the partition links) stay verbatim. Idempotent: a respelled target is
+     * relative and never matches again. Fully guarded: a failure here must not block
+     * the recovery boot.
+     */
+    private fun repairAbsoluteSymlinks(root: File, log: (String) -> Unit) {
+        runCatching {
+            if (!root.isDirectory) return
+            val treePaths = HashSet<String>()
+            val links = mutableListOf<Pair<File, String>>()
+            val stack = ArrayDeque<Pair<File, String>>()
+            stack.addLast(root to "")
+            while (stack.isNotEmpty()) {
+                val (d, rel) = stack.removeLast()
+                for (k in d.listFiles().orEmpty()) {
+                    val kr = if (rel.isEmpty()) k.name else "$rel/${k.name}"
+                    treePaths.add(kr)
+                    when {
+                        java.nio.file.Files.isSymbolicLink(k.toPath()) -> links.add(k to kr)
+                        k.isDirectory -> stack.addLast(k to kr)
+                    }
+                }
+            }
+            var n = 0
+            for ((f, kr) in links) {
+                runCatching {
+                    val target = Os.readlink(f.path)
+                    val fixed = symlinkTarget(kr, target, treePaths)
+                    if (fixed != target) {
+                        f.delete()
+                        Os.symlink(fixed, f.path)
+                        n++
+                    }
+                }
+            }
+            if (n > 0) log("recovery: respelled $n absolute symlink(s) in the existing tree")
+        }
+    }
+
     /** Runtime pieces the ramdisk lacks: device nodes qemu emulates, mount points, the shared framebuffer. */
-    fun prepare(paths: VmPaths, sdcard: File?, settings: VmSettings? = null) {
+    fun prepare(paths: VmPaths, sdcard: File?, settings: VmSettings? = null, log: (String) -> Unit = {}) {
         val r = dir(paths)
+        repairAbsoluteSymlinks(r, log)
         for (d in listOf("dev/graphics", "dev/input", "tmp", "cache", "data", "system", "sdcard", "proc", "sys", "etc")) File(r, d).mkdirs()
         // no tty0: minui gives up on graphics when it opens one but KDSETMODE fails; without it, it skips the step
         File(r, "dev/tty0").delete()
