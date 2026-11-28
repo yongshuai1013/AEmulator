@@ -667,6 +667,10 @@ static void own_put(long nr, long where, long uid, long gid) {        // nr: NR_
 // to the guest either (a pass-through get used to leak the phone's own sandbox label for the file).
 // Symlinks cannot carry a user.* attribute, so a label set on a link itself lives in a table of ours
 // instead (secon_tab_*), keyed by the guest path.
+// A regular file can refuse the attribute itself: bionic creates the property-area files 0444, and
+// the host checks MAY_WRITE on the inode for a user.* write — a bit nobody has on 0444 — so those
+// labels take the same table, keyed by the guest path, and every read consults it between the
+// on-file record and the shipped-with label.
 
 #define SECON_NAME "security.selinux"
 #define SECON_ATTR "user.aemu.secon"
@@ -674,6 +678,7 @@ static void own_put(long nr, long where, long uid, long gid) {        // nr: NR_
 #define SECON_EEXIST (-17L)
 #define SECON_ERANGE (-34L)
 #define SECON_EIO (-5L)
+#define SECON_EACCES (-13L)
 #define SECON_MAXVAL 1024                       // a context is a short string; the table stores at most this
 #define SECON_SCRATCH (2 * PATH_MAX)            // a host attribute list, filtered in a pool buffer
 
@@ -752,6 +757,30 @@ static long secon_tab_del(const char *key, char *scratch) {
     return r == (long)o ? 0 : SECON_EIO;
 }
 
+// The guest path a tree file is keyed by in the table: its host path minus the root (or the sd
+// prefix) — the same string the descriptor form recovers by un-translating its descriptor.
+static const char *secon_keyof(const char *guest, const char *hp) {
+    if (pre(hp, g_root) && hp[g_rootlen] == '/') return hp + g_rootlen;
+    if (g_sdlen && pre(hp, g_sd) && hp[g_sdlen] == '/') return hp + g_sdlen;
+    return guest;
+}
+
+// The table's current value for key, served with getxattr's size semantics; -1 when the table has
+// no record for key (a real failure of the table itself is returned as-is).
+static long secon_tab_read(const char *key, char *scratch, void *buf, u64 size) {
+    u64 vo, vl;
+    if (!secon_tab_find(key, scratch, &vo, &vl)) return -1;
+    if (!size) return (long)vl;
+    if (size < vl) return SECON_ERANGE;
+    char tp[600];
+    secon_tabpath(tp);
+    long fd = S4(NR_openat, AT_FDCWD, tp, 0, 0);
+    if (fd < 0) return SECON_EIO;
+    long r = S4(NR_pread64, fd, buf, vl, vo);
+    S1(NR_close, fd);
+    return r == (long)vl ? (long)vl : SECON_EIO;
+}
+
 // Drops the names that are ours to answer for (the label itself and both bookkeeping attributes)
 // from a host attribute list, in place; the caller re-adds the label when the bookkeeping has one.
 static u64 secon_filter(char *buf, u64 len) {
@@ -793,14 +822,17 @@ static long secon_biglist(long r, void *gbuf, u64 gsize, int have) {
 }
 
 static long g_secon_n;
-static void secon_log(const char *op, const char *path, long r, int fc) {
+// marks says where the answer came from: bit 0 the tree's own file_contexts (fc), bit 1 our
+// side table (tab) — a call can only ever be served by one of them, but the bits are independent
+static void secon_log(const char *op, const char *path, long r, int marks) {
     // the first calls of a process print in full; after that only what did not plainly succeed, so
     // a restorecon of a whole tree cannot flood the log it is being diagnosed from
     if (__atomic_add_fetch(&g_secon_n, 1, __ATOMIC_RELAXED) > 512 && r == 0) return;
     char nb[24];
     say("aemu64: secon "); say(op); say(" "); say(path); say(" -> ");
     if (r < 0) { say("-"); say(utoa((u64)(-r), nb + sizeof nb)); } else say(utoa((u64)r, nb + sizeof nb));
-    if (fc) say(" (fc)");
+    if (marks & 1) say(" (fc)");
+    if (marks & 2) say(" (tab)");
     say("\n");
 }
 static const char *secon_opname(long nr) {
@@ -1195,7 +1227,7 @@ static const char *fc_lookup(const char *path, u32 mode) {
 static long secon_fc_answer(const char *gpath, u32 mode, void *buf, u64 size, int *fc) {
     const char *v = fc_lookup(gpath, mode);
     if (!v) return SECON_ENODATA;
-    *fc = 1;
+    *fc |= 1;
     u64 L = slen(v) + 1;
     if (size == 0) return (long)L;
     if (size < L) return SECON_ERANGE;
@@ -1232,11 +1264,23 @@ static long secon_path(long nr, const char *guest, const char *hp, long *a, char
             long pr = S4(nr == NR_setxattr ? NR_getxattr : NR_lgetxattr, hp, SECON_ATTR, 0, 0);
             if (pr < 0 && pr != SECON_ENODATA) return pr;         // the file itself is not there, etc.
             have = pr >= 0;
+            // a label the file itself could not carry lives in the table: it counts as held
+            if (!have) { u64 vo, vl; have = secon_tab_find(secon_keyof(guest, hp), scratch, &vo, &vl); }
         }
         if ((a[4] & 1) && have) return SECON_EEXIST;              // XATTR_CREATE
         if ((a[4] & 2) && !have) return SECON_ENODATA;            // XATTR_REPLACE
         if (tab) return secon_tab_put(key, (const char *)a[2], (u64)a[3], scratch);
-        return S5(nr, hp, SECON_ATTR, a[2], a[3], 0);
+        long r = S5(nr, hp, SECON_ATTR, a[2], a[3], 0);
+        if (r == SECON_EACCES) {
+            // the file itself refuses the bookkeeping attribute (an 0444 property-area file:
+            // the host checks MAY_WRITE on the inode, and the mode has no write bit for anyone):
+            // the label goes to the table instead, keyed by the guest path, and the get form
+            // consults the table before the shipped-with label, exactly as if it rode on the file
+            long tr = secon_tab_put(secon_keyof(guest, hp), (const char *)a[2], (u64)a[3], scratch);
+            if (tr == 0) *fc |= 2;
+            return tr;
+        }
+        return r;
     }
     case NR_getxattr: case NR_lgetxattr: {
         if (tab) {
@@ -1260,10 +1304,13 @@ static long secon_path(long nr, const char *guest, const char *hp, long *a, char
         }
         long r = S4(nr, hp, SECON_ATTR, a[2], a[3]);
         if (r == SECON_ENODATA) {
+            const char *gk = secon_keyof(guest, hp);
+            // a label the file itself could not carry lives in the table (see the set form):
+            // the guest's own record outranks the shipped-with label below
+            long tr = secon_tab_read(gk, scratch, (void *)a[2], (u64)a[3]);
+            if (tr >= 0) { *fc |= 2; return tr; }
+            if (tr != -1) return tr;
             // no bookkeeping for this file: the label it shipped with, from the tree's own table
-            const char *gk = guest;
-            if (pre(hp, g_root) && hp[g_rootlen] == '/') gk = hp + g_rootlen;
-            else if (g_sdlen && pre(hp, g_sd) && hp[g_sdlen] == '/') gk = hp + g_sdlen;
             struct kstat st;
             u32 mode = 0;
             if (S4(NR_newfstatat, AT_FDCWD, hp, &st, isl ? 0x100 : 0) == 0) mode = st.st_mode & 0170000;
@@ -1277,12 +1324,27 @@ static long secon_path(long nr, const char *guest, const char *hp, long *a, char
             if (!secon_tab_find(key, scratch, &vo, &vl)) return SECON_ENODATA;
             return secon_tab_del(key, scratch);
         }
-        return S2(nr, hp, SECON_ATTR);
+        long r = S2(nr, hp, SECON_ATTR);
+        if (r < 0 && r != SECON_ENODATA) return r;               // the file itself is not there, etc.
+        int had = r == 0;
+        // the label may live in the table instead (see the set form): it goes too
+        const char *gk = secon_keyof(guest, hp);
+        u64 vo, vl;
+        if (secon_tab_find(gk, scratch, &vo, &vl)) {
+            long tr = secon_tab_del(gk, scratch);
+            if (tr < 0) return tr;
+            *fc |= 2;
+            had = 1;
+        }
+        return had ? 0 : SECON_ENODATA;
     }
     case NR_listxattr: case NR_llistxattr: {
         int have;
         if (tab) { u64 vo, vl; have = secon_tab_find(key, scratch, &vo, &vl); }
-        else have = S4(nr == NR_listxattr ? NR_getxattr : NR_lgetxattr, hp, SECON_ATTR, 0, 0) >= 0;
+        else {
+            have = S4(nr == NR_listxattr ? NR_getxattr : NR_lgetxattr, hp, SECON_ATTR, 0, 0) >= 0;
+            if (!have) { u64 vo, vl; have = secon_tab_find(secon_keyof(guest, hp), scratch, &vo, &vl); if (have) *fc |= 2; }
+        }
         long hl = S3(nr, hp, scratch, SECON_SCRATCH);
         if (hl < 0) {
             if (tab) hl = 0;                        // a link with no host list still has its table
@@ -1297,19 +1359,39 @@ static long secon_path(long nr, const char *guest, const char *hp, long *a, char
 }
 
 // Descriptor forms: the descriptor is the file (an open descriptor never names a link itself), so
-// the bookkeeping rides on it directly, with the same flag and size semantics.
+// the bookkeeping rides on it directly, with the same flag and size semantics — except when the
+// file itself refuses the bookkeeping attribute (an 0444 property-area file), where the label
+// takes the side table under the guest path the caller recovered from the descriptor.
 static long secon_fd(long nr, long *a, char *scratch, const char *gpath, int *fc) {
     switch (nr) {
     case NR_fsetxattr: {
         long pr = S4(NR_fgetxattr, a[0], SECON_ATTR, 0, 0);
         if (pr < 0 && pr != SECON_ENODATA) return pr;
-        if ((a[4] & 1) && pr >= 0) return SECON_EEXIST;
-        if ((a[4] & 2) && pr < 0) return SECON_ENODATA;
-        return S5(NR_fsetxattr, a[0], SECON_ATTR, a[2], a[3], 0);
+        int have = pr >= 0;
+        // a label the file itself could not carry lives in the table: it counts as held
+        if (!have && gpath) { u64 vo, vl; have = secon_tab_find(gpath, scratch, &vo, &vl); }
+        if ((a[4] & 1) && have) return SECON_EEXIST;
+        if ((a[4] & 2) && !have) return SECON_ENODATA;
+        long r = S5(NR_fsetxattr, a[0], SECON_ATTR, a[2], a[3], 0);
+        if (r == SECON_EACCES && gpath) {
+            // the file itself refuses the bookkeeping attribute (an 0444 property-area file:
+            // the host checks MAY_WRITE on the inode, and the mode has no write bit for anyone):
+            // the label goes to the table instead, keyed by the guest path, and the get form
+            // consults the table before the shipped-with label, exactly as if it rode on the file
+            long tr = secon_tab_put(gpath, (const char *)a[2], (u64)a[3], scratch);
+            if (tr == 0) *fc |= 2;
+            return tr;
+        }
+        return r;
     }
     case NR_fgetxattr: {
         long r = S4(NR_fgetxattr, a[0], SECON_ATTR, a[2], a[3]);
         if (r == SECON_ENODATA && gpath) {
+            // a label the file itself could not carry lives in the table (see the set form):
+            // the guest's own record outranks the shipped-with label below
+            long tr = secon_tab_read(gpath, scratch, (void *)a[2], (u64)a[3]);
+            if (tr >= 0) { *fc |= 2; return tr; }
+            if (tr != -1) return tr;
             // no bookkeeping for this file: the label it shipped with, from the tree's own table
             struct kstat st;
             u32 mode = 0;
@@ -1318,10 +1400,25 @@ static long secon_fd(long nr, long *a, char *scratch, const char *gpath, int *fc
         }
         return r;
     }
-    case NR_fremovexattr:
-        return S2(NR_fremovexattr, a[0], SECON_ATTR);
+    case NR_fremovexattr: {
+        long r = S2(NR_fremovexattr, a[0], SECON_ATTR);
+        if (r < 0 && r != SECON_ENODATA) return r;
+        int had = r == 0;
+        // the label may live in the table instead (see the set form): it goes too
+        if (gpath) {
+            u64 vo, vl;
+            if (secon_tab_find(gpath, scratch, &vo, &vl)) {
+                long tr = secon_tab_del(gpath, scratch);
+                if (tr < 0) return tr;
+                *fc |= 2;
+                had = 1;
+            }
+        }
+        return had ? 0 : SECON_ENODATA;
+    }
     case NR_flistxattr: {
         int have = S4(NR_fgetxattr, a[0], SECON_ATTR, 0, 0) >= 0;
+        if (!have && gpath) { u64 vo, vl; if (secon_tab_find(gpath, scratch, &vo, &vl)) { have = 1; *fc |= 2; } }
         long hl = S3(NR_flistxattr, a[0], scratch, SECON_SCRATCH);
         if (hl < 0) {
             if (hl == SECON_ERANGE && a[2]) return secon_biglist(S3(NR_flistxattr, a[0], (void *)a[1], a[2]), (void *)a[1], (u64)a[2], have);
