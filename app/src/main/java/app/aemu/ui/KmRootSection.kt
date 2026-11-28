@@ -103,6 +103,7 @@ internal fun KmRootSection(img: GuestImage) {
         if (uri == null) return@rememberLauncherForActivityResult
         runOp {
             val pem = KmRoot.exportPem(paths)
+                ?: throw KmRoot.KmException(KmRoot.KmException.Kind.NO_MATERIAL)
             ctx.contentResolver.openOutputStream(uri)!!.use { it.write(pem) }
             R.string.kmroot_done_export
         }
@@ -126,17 +127,19 @@ internal fun KmRootSection(img: GuestImage) {
             )
         } else {
             val m = st.meta!!
+            val createdText = java.text.DateFormat.getDateTimeInstance()
+                .format(java.util.Date(m.createdAt))
             Text(
-                stringResource(R.string.kmroot_subject, m.subjectDisplay),
+                stringResource(R.string.kmroot_subject, m.rootSubject),
                 style = MaterialTheme.typography.bodyMedium,
             )
             Text(
-                stringResource(R.string.kmroot_fp_rsa, m.rsaRootSha256),
+                stringResource(R.string.kmroot_fp_rsa, m.rsaRootFp),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
-                stringResource(R.string.kmroot_fp_ec, m.ecRootSha256),
+                stringResource(R.string.kmroot_fp_ec, m.ecRootFp),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -147,7 +150,7 @@ internal fun KmRootSection(img: GuestImage) {
                         if (m.source == "imported") R.string.kmroot_source_imported
                         else R.string.kmroot_source_generated,
                     ),
-                    m.createdDisplay,
+                    createdText,
                 ),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -295,7 +298,7 @@ internal fun KmRootSection(img: GuestImage) {
             },
             dismissButton = {
                 TextButton(onClick = { confirmImplant = false }) {
-                    Text(stringResource(R.string.vm_delete_cancel))
+                    Text(stringResource(R.string.cancel))
                 }
             },
         )
@@ -316,7 +319,7 @@ internal fun KmRootSection(img: GuestImage) {
             },
             dismissButton = {
                 TextButton(onClick = { confirmRestore = false }) {
-                    Text(stringResource(R.string.vm_delete_cancel))
+                    Text(stringResource(R.string.cancel))
                 }
             },
         )
