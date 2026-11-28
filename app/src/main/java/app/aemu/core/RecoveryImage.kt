@@ -232,6 +232,7 @@ $byName/recovery /recovery emmc rw,relatime 0 0
                 ImageStore.wipe(link); runCatching { Os.symlink(target.absolutePath, link.path) }
             }
         }
+        plantSystemBuildProp(r, paths, log)
         if (sdcard != null) {
             val link = File(r, "sdcard")
             if (link.isDirectory && link.list().isNullOrEmpty()) { link.delete(); runCatching { Os.symlink(sdcard.absolutePath, link.path) } }
@@ -242,6 +243,37 @@ $byName/recovery /recovery emmc rw,relatime 0 0
         if (settings?.bootSeat == true && PartitionSeat.bootImage(paths).isFile) {
             PartitionSeat.plantByName(r, paths)
             PartitionSeat.arm(r)
+        }
+    }
+
+    /**
+     * Scripts running in a recovery read the SYSTEM's build.prop at /system/build.prop
+     * before anything else — Magisk's installer asks that file for the system's sdk and
+     * abi and only falls back to getprop when the cat fails. On hardware the recovery has
+     * the real system mounted there; here /system is the ramdisk's own mount-point
+     * directory (it holds the ramdisk's tzdata, so the link loop above leaves it a real
+     * directory) and the file simply never exists. The fallback then answers with the
+     * recovery's own generation — api 23 from its default.prop, the value the seeded
+     * property area carries — and the installer judges the system by it: Magisk v31.1
+     * refuses anything below api 24 while this guest's system is 27. Plant just that one
+     * file out of the guest's system tree, refreshed every session so a re-imported
+     * firmware is picked up; nothing else under /system is touched, and when /system is
+     * the partition link the path already resolves to the tree's own copy, so there is
+     * nothing to plant. Fully guarded: a failure here must not block the recovery boot.
+     */
+    private fun plantSystemBuildProp(r: File, paths: VmPaths, log: (String) -> Unit) {
+        runCatching {
+            val sysDir = File(r, "system")
+            if (java.nio.file.Files.isSymbolicLink(sysDir.toPath())) return
+            val src = File(paths.root, "system/build.prop")
+            if (!src.isFile) { log("recovery: no system build.prop to plant"); return }
+            val dst = File(sysDir, "build.prop")
+            if (java.nio.file.Files.isSymbolicLink(dst.toPath())) dst.delete()
+            src.copyTo(dst, overwrite = true)
+            dst.setReadable(true, false)
+            val sdk = Regex("""(?m)^ro\.build\.version\.sdk=(.+)$""").find(dst.readText())
+                ?.groupValues?.get(1)?.trim().orEmpty().ifEmpty { "?" }
+            log("recovery: planted system build.prop (sdk $sdk)")
         }
     }
 
