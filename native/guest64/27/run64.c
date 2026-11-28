@@ -27,8 +27,9 @@ void enter_guest(void *entry, void *sp) __attribute__((noreturn));
 #define S6(n, a, b, c, d, e, f) sc(n, (long)(a), (long)(b), (long)(c), (long)(d), (long)(e), (long)(f))
 
 enum {
-    NR_setxattr = 5, NR_lsetxattr = 6, NR_getxattr = 8, NR_lgetxattr = 9, NR_listxattr = 11, NR_llistxattr = 12,
-    NR_removexattr = 14, NR_lremovexattr = 15, NR_getcwd = 17, NR_dup = 23, NR_dup3 = 24, NR_fcntl = 25,
+    NR_setxattr = 5, NR_lsetxattr = 6, NR_fsetxattr = 7, NR_getxattr = 8, NR_lgetxattr = 9, NR_fgetxattr = 10,
+    NR_listxattr = 11, NR_llistxattr = 12, NR_flistxattr = 13, NR_removexattr = 14, NR_lremovexattr = 15,
+    NR_fremovexattr = 16, NR_getcwd = 17, NR_dup = 23, NR_dup3 = 24, NR_fcntl = 25,
     NR_inotify_add_watch = 27, NR_ioctl = 29,
     NR_mknodat = 33, NR_mkdirat = 34, NR_unlinkat = 35, NR_symlinkat = 36, NR_linkat = 37, NR_renameat = 38,
     NR_umount2 = 39, NR_mount = 40, NR_statfs = 43, NR_truncate = 45, NR_ftruncate = 46, NR_faccessat = 48,
@@ -652,6 +653,267 @@ static void own_put(long nr, long where, long uid, long gid) {        // nr: NR_
     S5(nr, where, OWN_ATTR, v, sizeof v, 0);
 }
 
+// ---------------------------------------------------------------------------------------------------- labels
+
+// The guest's SELinux labels. A guest that labels its files (the stock init restorecons itself first
+// and then the whole tree) writes the attribute security.selinux; on the phone that write is the host
+// kernel's to refuse — this process is an app, and an app may not relabel — so the call used to pass
+// straight through and come back EACCES, which the stock init reads as a security failure and answers
+// by rebooting to the bootloader. The label is therefore kept beside the host file in an attribute of
+// our own namespace (user.aemu.secon: the OWN_ATTR trick above — written by us, under our own identity,
+// on a file we own), and every read of the label is answered from that bookkeeping, so what the guest
+// wrote is what it reads back. The host file's real security.selinux is never written, and never shown
+// to the guest either (a pass-through get used to leak the phone's own sandbox label for the file).
+// Symlinks cannot carry a user.* attribute, so a label set on a link itself lives in a table of ours
+// instead (secon_tab_*), keyed by the guest path.
+
+#define SECON_NAME "security.selinux"
+#define SECON_ATTR "user.aemu.secon"
+#define SECON_ENODATA (-61L)
+#define SECON_EEXIST (-17L)
+#define SECON_ERANGE (-34L)
+#define SECON_EIO (-5L)
+#define SECON_MAXVAL 1024                       // a context is a short string; the table stores at most this
+#define SECON_SCRATCH (2 * PATH_MAX)            // a host attribute list, filtered in a pool buffer
+
+static void secon_tabpath(char *out) { memcpy(out, g_root, g_rootlen); memcpy(out + g_rootlen, "/dev/.aemu-secon", 17); }
+
+// The symlink table is an append-only file under the tree root: "=path<TAB>value" sets, "-path"
+// removes, the last record for a path wins. Every guest process is its own supervisor instance, so
+// records are single whole-line appends (readers tolerate a torn line by ignoring it) and a lookup
+// scans the whole file. Finds key's current record: returns 1 with the value's file offset and
+// length, or 0. scratch holds one line at a time and must be SECON_SCRATCH bytes.
+static int secon_tab_find(const char *key, char *scratch, u64 *voff, u64 *vlen) {
+    char tp[600];
+    secon_tabpath(tp);
+    long fd = S4(NR_openat, AT_FDCWD, tp, 0, 0);
+    if (fd < 0) return 0;
+    int found = 0;
+    u64 klen = slen(key), ll = 0, lstart = 0, pos = 0;
+    int over = 0;
+    char chunk[512];
+    long n;
+    while ((n = S3(NR_read, fd, chunk, sizeof chunk)) > 0) {
+        for (long i = 0; i < n; i++, pos++) {
+            char c = chunk[i];
+            if (c != '\n') {
+                if (!ll && !over) lstart = pos;
+                if (ll < SECON_SCRATCH - 1) scratch[ll++] = c; else over = 1;
+                continue;
+            }
+            scratch[ll] = 0;
+            if (!over && ll > 1) {
+                if (scratch[0] == '=') {
+                    u64 t = 1;
+                    while (scratch[t] && scratch[t] != '\t') t++;
+                    if (scratch[t] == '\t' && t - 1 == klen) {
+                        scratch[t] = 0;
+                        if (seq(scratch + 1, key)) { found = 1; *voff = lstart + t + 1; *vlen = ll - t - 1; }
+                    }
+                } else if (scratch[0] == '-' && seq(scratch + 1, key)) found = 0;
+            }
+            ll = 0; over = 0;
+        }
+    }
+    S1(NR_close, fd);
+    return found;
+}
+
+static long secon_tab_put(const char *key, const char *val, u64 vlen, char *scratch) {
+    if (vlen > SECON_MAXVAL) return -7;                       // E2BIG: the table stores short strings
+    for (u64 i = 0; i < vlen; i++) if (val[i] == '\t' || val[i] == '\n') return -EINVAL;
+    u64 o = 0;
+    scratch[o++] = '=';
+    memcpy(scratch + o, key, slen(key)); o += slen(key);
+    scratch[o++] = '\t';
+    memcpy(scratch + o, val, vlen); o += vlen;
+    scratch[o++] = '\n';
+    char tp[600];
+    secon_tabpath(tp);
+    long fd = S4(NR_openat, AT_FDCWD, tp, 02101 /*O_WRONLY|O_CREAT|O_APPEND*/, 0600);
+    if (fd < 0) return fd;
+    long r = S3(NR_write, fd, scratch, o);
+    S1(NR_close, fd);
+    return r == (long)o ? 0 : SECON_EIO;
+}
+
+static long secon_tab_del(const char *key, char *scratch) {
+    u64 o = 0;
+    scratch[o++] = '-';
+    memcpy(scratch + o, key, slen(key)); o += slen(key);
+    scratch[o++] = '\n';
+    char tp[600];
+    secon_tabpath(tp);
+    long fd = S4(NR_openat, AT_FDCWD, tp, 02101 /*O_WRONLY|O_CREAT|O_APPEND*/, 0600);
+    if (fd < 0) return fd;
+    long r = S3(NR_write, fd, scratch, o);
+    S1(NR_close, fd);
+    return r == (long)o ? 0 : SECON_EIO;
+}
+
+// Drops the names that are ours to answer for (the label itself and both bookkeeping attributes)
+// from a host attribute list, in place; the caller re-adds the label when the bookkeeping has one.
+static u64 secon_filter(char *buf, u64 len) {
+    u64 r = 0, w = 0;
+    while (r < len) {
+        u64 nl = slen(buf + r) + 1;
+        if (nl > len - r) break;                    // a torn tail: nothing past it is kept
+        if (!seq(buf + r, SECON_NAME) && !seq(buf + r, SECON_ATTR) && !seq(buf + r, OWN_ATTR)) {
+            if (w != r) memmove(buf + w, buf + r, nl);
+            w += nl;
+        }
+        r += nl;
+    }
+    return w;
+}
+
+// The guest's list: the filtered host list, plus the label's name when the bookkeeping has one.
+static long secon_list_out(long hostlen, char *scratch, int have, void *gbuf, u64 gsize) {
+    u64 fl = secon_filter(scratch, (u64)hostlen);
+    u64 need = fl + (have ? slen(SECON_NAME) + 1 : 0);
+    if (!gsize) return (long)need;
+    if (need > gsize) return SECON_ERANGE;
+    memcpy(gbuf, scratch, fl);
+    if (have) memcpy((char *)gbuf + fl, SECON_NAME, slen(SECON_NAME) + 1);
+    return (long)need;
+}
+
+// A host list longer than the scratch (not expected: a file's attribute names are a handful): the
+// host has filled the guest's own buffer, and the names are filtered where they lie.
+static long secon_biglist(long r, void *gbuf, u64 gsize, int have) {
+    if (r < 0) return r;
+    u64 fl = secon_filter((char *)gbuf, (u64)r);
+    if (have) {
+        if (fl + slen(SECON_NAME) + 1 > gsize) return SECON_ERANGE;
+        memcpy((char *)gbuf + fl, SECON_NAME, slen(SECON_NAME) + 1);
+        fl += slen(SECON_NAME) + 1;
+    }
+    return (long)fl;
+}
+
+static long g_secon_n;
+static void secon_log(const char *op, const char *path, long r) {
+    // the first calls of a process print in full; after that only what did not plainly succeed, so
+    // a restorecon of a whole tree cannot flood the log it is being diagnosed from
+    if (__atomic_add_fetch(&g_secon_n, 1, __ATOMIC_RELAXED) > 512 && r == 0) return;
+    char nb[24];
+    say("aemu64: secon "); say(op); say(" "); say(path); say(" -> ");
+    if (r < 0) { say("-"); say(utoa((u64)(-r), nb + sizeof nb)); } else say(utoa((u64)r, nb + sizeof nb));
+    say("\n");
+}
+static const char *secon_opname(long nr) {
+    switch (nr) {
+    case NR_setxattr: return "set"; case NR_lsetxattr: return "lset";
+    case NR_getxattr: return "get"; case NR_lgetxattr: return "lget";
+    case NR_listxattr: return "list"; case NR_llistxattr: return "llist";
+    case NR_removexattr: return "remove"; case NR_lremovexattr: return "lremove";
+    case NR_fsetxattr: return "fset"; case NR_fgetxattr: return "fget";
+    case NR_flistxattr: return "flist"; case NR_fremovexattr: return "fremove";
+    }
+    return "?";
+}
+
+// Path forms of the label. guest is the path as the guest wrote it, hp its translation, a the
+// call's arguments, scratch SECON_SCRATCH bytes of pool. The answer is exactly the guest's answer:
+// flag and size semantics are the kernel's, evaluated against the bookkeeping.
+static long secon_path(long nr, const char *guest, const char *hp, long *a, char *scratch) {
+    int isl = nr == NR_lsetxattr || nr == NR_lgetxattr || nr == NR_llistxattr || nr == NR_lremovexattr;
+    // a label set through an l- form onto a link itself goes to the table: the translation of an
+    // absolute guest path is the root plus the normalised guest path, which is the stable key;
+    // anything else keys as written
+    int tab = 0;
+    const char *key = guest;
+    if (isl) {
+        struct kstat st;
+        if (S4(NR_newfstatat, AT_FDCWD, hp, &st, 0x100 /*AT_SYMLINK_NOFOLLOW*/) == 0 && (st.st_mode & 0170000) == 0120000) {
+            tab = 1;
+            if (pre(hp, g_root) && hp[g_rootlen] == '/') key = hp + g_rootlen;
+        }
+    }
+    switch (nr) {
+    case NR_setxattr: case NR_lsetxattr: {
+        int have;
+        if (tab) { u64 vo, vl; have = secon_tab_find(key, scratch, &vo, &vl); }
+        else {
+            long pr = S4(nr == NR_setxattr ? NR_getxattr : NR_lgetxattr, hp, SECON_ATTR, 0, 0);
+            if (pr < 0 && pr != SECON_ENODATA) return pr;         // the file itself is not there, etc.
+            have = pr >= 0;
+        }
+        if ((a[4] & 1) && have) return SECON_EEXIST;              // XATTR_CREATE
+        if ((a[4] & 2) && !have) return SECON_ENODATA;            // XATTR_REPLACE
+        if (tab) return secon_tab_put(key, (const char *)a[2], (u64)a[3], scratch);
+        return S5(nr, hp, SECON_ATTR, a[2], a[3], 0);
+    }
+    case NR_getxattr: case NR_lgetxattr: {
+        if (tab) {
+            u64 vo, vl;
+            if (!secon_tab_find(key, scratch, &vo, &vl)) return SECON_ENODATA;
+            if (!a[3]) return (long)vl;
+            if ((u64)a[3] < vl) return SECON_ERANGE;
+            char tp[600];
+            secon_tabpath(tp);
+            long fd = S4(NR_openat, AT_FDCWD, tp, 0, 0);
+            if (fd < 0) return SECON_EIO;
+            long r = S4(NR_pread64, fd, (void *)a[2], vl, vo);
+            S1(NR_close, fd);
+            return r == (long)vl ? (long)vl : SECON_EIO;
+        }
+        return S4(nr, hp, SECON_ATTR, a[2], a[3]);
+    }
+    case NR_removexattr: case NR_lremovexattr: {
+        if (tab) {
+            u64 vo, vl;
+            if (!secon_tab_find(key, scratch, &vo, &vl)) return SECON_ENODATA;
+            return secon_tab_del(key, scratch);
+        }
+        return S2(nr, hp, SECON_ATTR);
+    }
+    case NR_listxattr: case NR_llistxattr: {
+        int have;
+        if (tab) { u64 vo, vl; have = secon_tab_find(key, scratch, &vo, &vl); }
+        else have = S4(nr == NR_listxattr ? NR_getxattr : NR_lgetxattr, hp, SECON_ATTR, 0, 0) >= 0;
+        long hl = S3(nr, hp, scratch, SECON_SCRATCH);
+        if (hl < 0) {
+            if (tab) hl = 0;                        // a link with no host list still has its table
+            else if (hl == SECON_ERANGE && a[2]) return secon_biglist(S3(nr, hp, (void *)a[1], a[2]), (void *)a[1], (u64)a[2], have);
+            else if (hl == SECON_ERANGE) return S3(nr, hp, 0, 0);   // the host's own size for its own list
+            else return hl;
+        }
+        return secon_list_out(hl, scratch, have, (void *)a[1], (u64)a[2]);
+    }
+    }
+    return -ENOSYS;
+}
+
+// Descriptor forms: the descriptor is the file (an open descriptor never names a link itself), so
+// the bookkeeping rides on it directly, with the same flag and size semantics.
+static long secon_fd(long nr, long *a, char *scratch) {
+    switch (nr) {
+    case NR_fsetxattr: {
+        long pr = S4(NR_fgetxattr, a[0], SECON_ATTR, 0, 0);
+        if (pr < 0 && pr != SECON_ENODATA) return pr;
+        if ((a[4] & 1) && pr >= 0) return SECON_EEXIST;
+        if ((a[4] & 2) && pr < 0) return SECON_ENODATA;
+        return S5(NR_fsetxattr, a[0], SECON_ATTR, a[2], a[3], 0);
+    }
+    case NR_fgetxattr:
+        return S4(NR_fgetxattr, a[0], SECON_ATTR, a[2], a[3]);
+    case NR_fremovexattr:
+        return S2(NR_fremovexattr, a[0], SECON_ATTR);
+    case NR_flistxattr: {
+        int have = S4(NR_fgetxattr, a[0], SECON_ATTR, 0, 0) >= 0;
+        long hl = S3(NR_flistxattr, a[0], scratch, SECON_SCRATCH);
+        if (hl < 0) {
+            if (hl == SECON_ERANGE && a[2]) return secon_biglist(S3(NR_flistxattr, a[0], (void *)a[1], a[2]), (void *)a[1], (u64)a[2], have);
+            if (hl == SECON_ERANGE) return S3(NR_flistxattr, a[0], 0, 0);
+            return hl;
+        }
+        return secon_list_out(hl, scratch, have, (void *)a[1], (u64)a[2]);
+    }
+    }
+    return -ENOSYS;
+}
+
 // The ids a fresh image starts with: the caller's own, unless the file it runs carries the
 // setuid/setgid bits — the classic su mechanism, which the host kernel cannot apply for us (on the
 // phone the file belongs to the app, so its bits would elevate to the app itself). Only files
@@ -892,9 +1154,7 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
         NEEDX(1); NEEDX(3);
         return S5(nr, a[0], h1, a[2], h3, a[4]);
     }
-    case NR_statfs: case NR_truncate: case NR_chdir:
-    case NR_setxattr: case NR_lsetxattr: case NR_getxattr: case NR_lgetxattr: case NR_listxattr: case NR_llistxattr:
-    case NR_removexattr: case NR_lremovexattr: {
+    case NR_statfs: case NR_truncate: case NR_chdir: {
         char *b0 = PB(0);
         NEEDX(0);
         long r = S5(nr, h0, a[1], a[2], a[3], a[4]);
@@ -904,6 +1164,42 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
             u64 *s = (u64 *)a[1];               /* type, bsize, blocks, bfree, bavail */
             if (s[4] && s[2] > 2 * s[4]) { s[2] = 2 * s[4]; if (s[3] > s[2]) s[3] = s[2]; }
         }
+        return r;
+    }
+    case NR_setxattr: case NR_lsetxattr: case NR_getxattr: case NR_lgetxattr: case NR_listxattr: case NR_llistxattr:
+    case NR_removexattr: case NR_lremovexattr: {
+        // the label is answered from our own bookkeeping (secon_path above); every other attribute
+        // passes through exactly as before. The list forms have no name argument — their second
+        // argument is the guest's buffer — so they always take the bookkeeping path, which filters.
+        int islist = nr == NR_listxattr || nr == NR_llistxattr;
+        char *b0 = PB(0);
+        NEEDX(0);
+        if (!islist && !(P(1) && seq(P(1), SECON_NAME))) return S5(nr, h0, a[1], a[2], a[3], a[4]);
+        if (!h0) return -EFAULT;
+        long r = secon_path(nr, P(0), h0, a, PB(1));
+        secon_log(secon_opname(nr), P(0), r);
+        return r;
+    }
+    case NR_fsetxattr: case NR_fgetxattr: case NR_flistxattr: case NR_fremovexattr: {
+        int islist = nr == NR_flistxattr;
+        if (!islist && !(P(1) && seq(P(1), SECON_NAME))) return S5(nr, a[0], a[1], a[2], a[3], a[4]);
+        // whose file is this descriptor? Only a file of the guest's own tree is answered from the
+        // bookkeeping; anything else (the phone's own files, pipes, sockets) keeps the host's answer.
+        char *lp = PB(0), *tp = PB(0) + 64;
+        memcpy(lp, "/proc/self/fd/", 14);
+        char nb[24];
+        char *ns = utoa((u64)(u32)a[0], nb + sizeof nb);
+        memcpy(lp + 14, ns, slen(ns) + 1);
+        long tl = S4(NR_readlinkat, AT_FDCWD, lp, tp, 4031);
+        if (tl <= 0) return S5(nr, a[0], a[1], a[2], a[3], a[4]);
+        tp[tl] = 0;
+        if (tl > 10 && seq(tp + tl - 10, " (deleted)")) tp[tl - 10] = 0;
+        if (!((pre(tp, g_root) && (tp[g_rootlen] == '/' || !tp[g_rootlen])) ||
+              (g_sdlen && pre(tp, g_sd) && (tp[g_sdlen] == '/' || !tp[g_sdlen]))))
+            return S5(nr, a[0], a[1], a[2], a[3], a[4]);
+        unxl(tp);
+        long r = secon_fd(nr, a, PB(1));
+        secon_log(secon_opname(nr), tp, r);
         return r;
     }
     case NR_inotify_add_watch: {
@@ -1301,7 +1597,8 @@ struct bpf { u16 code; u8 jt, jf; u32 k; };
 #define TRAP 0x00030000u
 
 static const u8 trapped[] = {
-    NR_setxattr, NR_lsetxattr, NR_getxattr, NR_lgetxattr, NR_listxattr, NR_llistxattr, NR_removexattr, NR_lremovexattr,
+    NR_setxattr, NR_lsetxattr, NR_fsetxattr, NR_getxattr, NR_lgetxattr, NR_fgetxattr, NR_listxattr, NR_llistxattr,
+    NR_flistxattr, NR_removexattr, NR_lremovexattr, NR_fremovexattr,
     NR_getcwd, NR_inotify_add_watch, NR_ioctl, NR_mknodat, NR_mkdirat, NR_unlinkat, NR_symlinkat, NR_linkat,
     NR_renameat, NR_umount2, NR_mount, NR_statfs, NR_truncate, NR_faccessat, NR_chdir, NR_chroot, NR_fchmodat,
     NR_fchownat, NR_fchown, NR_openat, NR_readlinkat, NR_newfstatat, NR_fstat, NR_utimensat, NR_capget, NR_capset,
