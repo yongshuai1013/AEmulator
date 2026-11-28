@@ -126,6 +126,8 @@ data class VmSettings(
     val superuser: Boolean = false,
     /** Magisk substitute (arm64 Android 6.0 guests on the native engine): our daemon in the official Magisk app's clothes, deployed into /data/adb and given its own boot seats, see SubstituteSupport; while it is on it owns the guest's su names, so the classic Superuser plant stays out; applies at the next full VM boot */
     val magiskSub: Boolean = false,
+    /** Self-built Magisk (the genuine v30.7 daemon from this project's own build of the unmodified sources) in plan guests: deployed into /data/adb and woken by the host at the plan boot's milestones, its mounts answered by the supervisor's mount table and its sepolicy loads by the planted selinuxfs, see MagiskPlanSupport; mutually exclusive with the substitute and the partition seat; applies at the next full VM boot */
+    val magiskPlan: Boolean = false,
     /** Zygisk spike (arm64 Android 6.0 guests on the native engine): our own bridge library is planted into /system/lib64 and ro.dalvik.vm.native.bridge is pointed at it, so ART loads it inside zygote and it drives modules through the Zygisk API v4 table, see ZygiskSpikeSupport; spike scope only — no companion, no module management; applies at the next full VM boot */
     val zygiskSpike: Boolean = false,
     /**
@@ -180,7 +182,7 @@ data class VmSettings(
         .put("wifiMirrorHost", wifiMirrorHost)
         .put("bluetooth", bluetooth)
         .put("superuser", superuser)
-        .put("magiskSub", magiskSub).put("zygiskSpike", zygiskSpike)
+        .put("magiskSub", magiskSub).put("magiskPlan", magiskPlan).put("zygiskSpike", zygiskSpike)
         .put("qemuZero", qemuZero)
         .put("agent", agent)
         .put("bootSeat", bootSeat)
@@ -279,6 +281,7 @@ data class VmSettings(
                 bluetooth = o.optBoolean("bluetooth", d.bluetooth),
                 superuser = o.optBoolean("superuser", d.superuser),
                 magiskSub = o.optBoolean("magiskSub", d.magiskSub),
+                magiskPlan = o.optBoolean("magiskPlan", d.magiskPlan),
                 zygiskSpike = o.optBoolean("zygiskSpike", d.zygiskSpike),
                 qemuZero = o.optBoolean("qemuZero", d.qemuZero),
                 agent = o.optBoolean("agent", d.agent),
