@@ -67,7 +67,13 @@ void *memmove(void *d, const void *s, u64 n) {
     return d;
 }
 static int g_sayfd = -1;          // crash reports also go to <root>/dev/aemu_crash.log
-static void say(const char *s) { S3(NR_write, 2, s, slen(s)); if (g_sayfd >= 0) S3(NR_write, g_sayfd, s, slen(s)); }
+static int g_keepfd = -1;         // our own dup of the log descriptor, saved at startup before any guest code runs:
+// the guest shares this descriptor table, and a guest that redirects its stdio takes descriptor 2 with it (the
+// stock init points it at /sys/fs/selinux/null while loading the policy, and that node is a plain file here, so
+// the descriptor-3 guard below does not see the swap). The saved dup keeps say() - and everything that prints
+// through it - on the log the app collects. It is not close-on-exec: do_exec hands its number and identity to
+// the re-exec'd launcher in AEMU64_LOGFD, which adopts it only if the descriptor still names that very file.
+static void say(const char *s) { int fd = g_keepfd >= 0 ? g_keepfd : 2; S3(NR_write, fd, s, slen(s)); if (g_sayfd >= 0) S3(NR_write, g_sayfd, s, slen(s)); }
 static void hex(u64 v) { char b[19] = "0x"; for (int i = 0; i < 16; i++) b[2 + i] = "0123456789abcdef"[(v >> (60 - 4 * i)) & 15]; b[18] = 0; say(b); }
 struct sigctx { u64 fault; u64 regs[31]; u64 sp, pc, pstate; };
 static void where(u64 addr);
@@ -583,6 +589,17 @@ static long do_exec(const char *path, char *const argv[], char *const envp[]) {
     if (g_qemu[0]) { memcpy(e_qemu, "AEMU64_QEMU=", 12); memcpy(e_qemu + 12, g_qemu, slen(g_qemu) + 1); *a++ = e_qemu; }
     static char e_sd[540];
     if (g_sdlen) { memcpy(e_sd, "AEMU64_SDCARD=", 14); memcpy(e_sd + 14, g_sd, g_sdlen + 1); *a++ = e_sd; }
+    static char e_logfd[96];
+    if (g_keepfd >= 0) { struct kstat st; if (S2(NR_fstat, g_keepfd, &st) == 0) {
+        // the saved log descriptor is not close-on-exec, so it is still open under the same number in the
+        // new launcher; its number and the file's identity go over so the new launcher can adopt it (its
+        // descriptor 2 may already have been redirected by the guest that is exec'ing)
+        char t[24], *s; u64 o = 13;
+        memcpy(e_logfd, "AEMU64_LOGFD=", 13);
+        s = utoa((u64)g_keepfd, t + sizeof t); memcpy(e_logfd + o, s, slen(s)); o += slen(s); e_logfd[o++] = ',';
+        s = utoa(st.st_dev, t + sizeof t); memcpy(e_logfd + o, s, slen(s)); o += slen(s); e_logfd[o++] = ',';
+        s = utoa(st.st_ino, t + sizeof t); memcpy(e_logfd + o, s, slen(s) + 1);
+        *a++ = e_logfd; } }
     *a++ = 0;
     r = S3(NR_execve, g_self, v, e);
     S2(NR_munmap, v, need);
@@ -710,10 +727,14 @@ static long trap2_base(long nr, long *a, void *uc, char **pbp) {
                 if (seq(P(1), "/dev/kmsg") && (a[2] & 3)) {
                     // no host device answers for the kernel log (its marker's 1:11 is not in
                     // vm_devpath, so the open used to end ENXIO and whatever was written to it
-                    // was lost): a write open is mirrored onto descriptor 2, the log the app
-                    // already collects for this process. Read opens keep the old answer, and a
-                    // failed dup falls through to it as well.
-                    long r = (a[2] & 02000000) ? S3(NR_fcntl, 2, 1030 /* F_DUPFD_CLOEXEC */, 0) : S1(NR_dup, 2);
+                    // was lost): a write open is mirrored onto the saved dup of the log
+                    // descriptor (g_keepfd), the log the app already collects for this process.
+                    // Descriptor 2 itself is not the source: by the time the kernel log is
+                    // opened the guest may have redirected it (the stock init does, while
+                    // loading its policy). Read opens keep the old answer, and a failed dup
+                    // falls through to it as well.
+                    int src = g_keepfd >= 0 ? g_keepfd : 2;
+                    long r = (a[2] & 02000000) ? S3(NR_fcntl, src, 1030 /* F_DUPFD_CLOEXEC */, 0) : S1(NR_dup, src);
                     if (r >= 0) return r;
                 }
             }
@@ -1424,6 +1445,18 @@ void aemu_main(u64 *sp) {
     { struct kstat st; if (S2(NR_fstat, 2, &st) == 0 && ((st.st_mode & 0170000) == 0100000 || (st.st_mode & 0170000) == 0010000)) {
         g_logdev = st.st_dev; g_logino = st.st_ino; g_logpipe = (st.st_mode & 0170000) == 0010000; }
       if (g_logpipe && S2(NR_fstat, 0, &st) == 0 && (st.st_mode & 0170000) == 0010000 && st.st_dev == g_logdev) g_inino = st.st_ino; }
+    // the log channel, saved before any guest code runs (see g_keepfd): adopt the dup a previous launcher
+    // handed over in AEMU64_LOGFD if the descriptor still names that very file, else save a fresh dup of
+    // descriptor 2 as it is now - now being the last moment it is certainly the log the app gave us.
+    if ((r = env_get(envp, "AEMU64_LOGFD"))) {
+        long f = (long)atou(r); u64 dv = 0, ino = 0;
+        while (*r >= '0' && *r <= '9') r++;
+        if (*r == ',') { const char *q = r + 1; dv = atou(q); while (*q >= '0' && *q <= '9') q++; if (*q == ',') ino = atou(q + 1); }
+        struct kstat st;
+        if (f >= 3 && dv && ino && S2(NR_fstat, f, &st) == 0 && st.st_dev == dv && st.st_ino == ino &&
+            ((st.st_mode & 0170000) == 0100000 || (st.st_mode & 0170000) == 0010000)) g_keepfd = (int)f;
+    }
+    if (g_keepfd < 0 && g_logino) { long d = S3(NR_fcntl, 2, 0 /* F_DUPFD */, 64); if (d >= 0) g_keepfd = (int)d; }
 
     // the program: a host path under the root (from our own exec) or a guest path
     char pbuf[PATH_MAX]; int err = 0;
