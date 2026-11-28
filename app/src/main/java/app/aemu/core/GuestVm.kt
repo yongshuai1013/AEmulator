@@ -263,6 +263,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         if (!is64 && !(img.settings.native32 && CpuInfo.hasAArch32) && !qemu.canExecute()) error("translator ${Engine.KK.qemu} is not executable")
         killLeftovers()
         HostNative.limitStackSafe()
+        runCatching { seatMarker().delete() }   // a recovery session is not a seat session, whatever the last boot was
         TreeFixer(ctx, paths, img, ::log).fixup()   // framebuffer, input node
         val sd = Sdcard.setup(ctx, paths, img, ::log)
         RecoveryImage.prepare(paths, sd, settings, ::log)
@@ -498,6 +499,9 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             if (settings.bootSeat) log("seat: on, but unusable for this image (the native arm64 engine and a boot image kept at import are required), booting the service plan")
             PartitionSeat.disarm(paths.root)
         }
+        // a non-seat boot must not inherit a seat session's marker (a crashed seat boot may
+        // have left one): the supervisors of this session would take the session for a seat
+        if (!seatMode) runCatching { seatMarker().delete() }
         // политика звука уже подменялась раньше — обновить её файлы (обёртка/AOSP) до текущей версии
         if (File(paths.root, "system/.aemu-parked/system#lib#hw#audio_policy.default.so").isFile) swapAudioPolicy()
         GuestLog.clear(paths.root)
@@ -744,7 +748,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 overrides["ro.vendor.build.fingerprint"] = fp; overrides["ro.bootimage.build.fingerprint"] = fp
             }
         }
-        if (!props.prepare(overrides, later, if (engine == Engine.N64) kernel.propAreaSize else PropArea.SIZE)) error("property area not ready")
+        if (!props.prepare(overrides, later, if (engine == Engine.N64) kernel.propAreaSize else PropArea.SIZE, seatMode)) error("property area not ready")
         fixer.skipPreBoot(props)
         fixer.noScreenSleep()
         fixer.seedDefaultIme()
@@ -1012,6 +1016,13 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
         }.onFailure { log("seat: selinuxfs plant failed: ${it.message}") }
     }
 
+    /** The seat session's marker in the tree. Every supervisor instance of the session
+     *  checks for it at startup: the AEMU64_SEAT flag in the /init spawn's environment
+     *  does not survive the guest's own exec chain (the supervisor rebuilds the
+     *  environment of every exec from its own list) and the host's later spawns never
+     *  carry it, so the marker is the witness that reaches them all. */
+    private fun seatMarker() = File(paths.root, "dev/.aemu-seat")
+
     /**
      * The seat boot: start the one process the host starts in this mode — the boot image
      * ramdisk's /init, under the supervisor, with the seat flag in its environment. It
@@ -1022,6 +1033,10 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     private fun startSeatInit(r: GuestRunner) {
         log("seat: plan suppressed, starting the ramdisk /init as the first guest process")
         plantSelinuxfs()
+        runCatching {
+            seatMarker().apply { parentFile?.mkdirs() }.writeText("seat\n")
+            log("seat: session marker planted for the supervisors")
+        }.onFailure { log("seat: session marker not planted: ${it.message}") }
         glUp()   // the plan loop calls this before SurfaceFlinger/zygote; the seat's init starts them itself, so it is due now
         spawn("init", r.cmdline(listOf("/init")), r.env(mapOf("AEMU64_SEAT" to "1")))
         val p = synchronized(procs) { procs["init"] }
