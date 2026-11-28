@@ -1454,6 +1454,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
             setState(State.RUNNING)
             Thread { agentBootComplete() }.start()
             Thread { substBootComplete() }.start()
+            Thread { probeBootComplete() }.start()
             Thread { afterBoot() }.start()
             mirrorTombstones()
         }
@@ -2245,6 +2246,69 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
                 staged.delete()
             }
         }.onFailure { log("agent: boot-complete stage failed: ${it.message}") }
+    }
+
+    /**
+     * sys.boot_completed: the TCP timing probe app (ProbeSupport). The same delivery as the
+     * agent's inbox app above — staged through data/local/tmp, installed when it is missing or
+     * its bytes differ from the delivered copy (the same content-hash gate, for the same reason:
+     * the probe's build generates its signing key on the spot, so a replace the package manager
+     * refuses across signatures falls back to an uninstall and a fresh install; the app holds no
+     * state, so the fresh install loses nothing). Unlike the inbox app it is behind no setting:
+     * the host delivers it by default, because a guest has no file manager to install it by hand.
+     * Below the probe's API floor it is skipped without a word, and a failure here only ever
+     * costs one log line — never the boot.
+     */
+    private fun probeBootComplete() {
+        if (img.api < ProbeSupport.MIN_API) return
+        runCatching {
+            val apk = File(paths.root, ProbeSupport.APK_COPY)
+            if (!apk.isFile) { log("probe: aemu-tcp-probe.apk is not in the image (build guest-probe/build.sh), no probe app"); return }
+            val pkgPath = guestShell("pm path ${ProbeSupport.PACKAGE}", 60_000).lines()
+                .firstOrNull { it.startsWith("package:") }?.removePrefix("package:")?.trim()
+            if (pkgPath != null) {
+                val stagedHash = sha256Hex(apk)
+                val installedFile = File(paths.root, pkgPath.removePrefix("/"))
+                val installedHash = if (installedFile.isFile) sha256Hex(installedFile) else null
+                if (stagedHash != null && installedHash != null) {
+                    if (stagedHash == installedHash) {
+                        log("probe: app already at the delivered bytes (sha256 ${stagedHash.take(12)}…)")
+                        return
+                    }
+                    log("probe: app bytes differ (installed ${installedHash.take(12)}…, delivered ${stagedHash.take(12)}…): updating")
+                } else {
+                    val installedCode = Regex("""versionCode=(\d+)""")
+                        .find(guestShell("dumpsys package ${ProbeSupport.PACKAGE}", 60_000))
+                        ?.groupValues?.get(1)?.toIntOrNull()
+                    val stagedCode = runCatching {
+                        ctx.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)?.versionCode
+                    }.getOrNull()
+                    if (installedCode != null && stagedCode != null) {
+                        if (installedCode == stagedCode) return
+                        log("probe: app versionCode $installedCode, delivered $stagedCode: updating")
+                    } else {
+                        val guestLen = guestShell("wc -c < $pkgPath", 30_000).trim().toLongOrNull()
+                        if (guestLen == apk.length()) return
+                    }
+                }
+            }
+            val staged = File(paths.root, "data/local/tmp").apply { mkdirs() }.let { File(it, "aemu-tcp-probe.apk") }
+            java.nio.file.Files.copy(apk.toPath(), staged.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            staged.setReadable(true, false)
+            try {
+                var out = installApk("/data/local/tmp/aemu-tcp-probe.apk").trim()
+                if (out.contains("Success")) {
+                    log("probe: app install -> ${out.take(300)}")
+                } else {
+                    log("probe: app update refused (${out.take(200)}); reinstalling from scratch")
+                    val un = guestShell("pm uninstall ${ProbeSupport.PACKAGE}", 60_000).trim()
+                    out = installApk("/data/local/tmp/aemu-tcp-probe.apk").trim()
+                    log("probe: app install -> ${out.take(300)} (after uninstall: ${un.take(120)})")
+                }
+            } finally {
+                staged.delete()
+            }
+        }.onFailure { log("probe: boot-complete stage failed: ${it.message}") }
     }
 
     private fun pidOf(p: Process): Int? {
