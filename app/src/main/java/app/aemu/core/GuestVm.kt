@@ -989,6 +989,30 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
     }
 
     /**
+     * The seat boot hands the guest to its own init, and init's SELinux stage
+     * expects the kernel's selinuxfs at /sys/fs/selinux — the guest's /sys is a
+     * static tree with no such directory, and init aborts when it cannot open
+     * selinux/null for its stdio. Plant the shape the load path touches, as
+     * plain files in the tree (the supervisor rewrites /sys/fs/selinux paths
+     * into the tree): null and load are empty sinks, the rest carry the values
+     * a permissive single-policy boot reports. Rebuilt fresh every seat boot;
+     * query nodes (access/context/create) are deliberately not faked.
+     */
+    private fun plantSelinuxfs() {
+        runCatching {
+            val dir = File(paths.root, "sys/fs/selinux")
+            dir.mkdirs()
+            File(dir, "null").writeText("")
+            File(dir, "load").writeText("")
+            File(dir, "enforce").writeText("0")
+            File(dir, "checkreqprot").writeText("0")
+            File(dir, "policyvers").writeText("30")
+            File(dir, "deny_unknown").writeText("1")
+            log("seat: planted selinuxfs shape (6 nodes)")
+        }.onFailure { log("seat: selinuxfs plant failed: ${it.message}") }
+    }
+
+    /**
      * The seat boot: start the one process the host starts in this mode — the boot image
      * ramdisk's /init, under the supervisor, with the seat flag in its environment. It
      * mounts, sets up and hands over itself; the boot is reported through the same
@@ -997,6 +1021,7 @@ class GuestVm(val ctx: Context, val img: GuestImage) {
      */
     private fun startSeatInit(r: GuestRunner) {
         log("seat: plan suppressed, starting the ramdisk /init as the first guest process")
+        plantSelinuxfs()
         glUp()   // the plan loop calls this before SurfaceFlinger/zygote; the seat's init starts them itself, so it is due now
         spawn("init", r.cmdline(listOf("/init")), r.env(mapOf("AEMU64_SEAT" to "1")))
         val p = synchronized(procs) { procs["init"] }
