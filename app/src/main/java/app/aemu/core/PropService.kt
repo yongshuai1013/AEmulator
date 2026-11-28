@@ -13,6 +13,10 @@ import java.nio.ByteOrder
 class PropService(private val paths: VmPaths, private val log: (String) -> Unit) {
     @Volatile var area: PropArea? = null
         private set
+    /** The file the current area was opened on: the tree path in a plan or recovery
+     *  session, the seat scratch outside the tree in a seat session. */
+    @Volatile var areaFile: File? = null
+        private set
     @Volatile var writes = 0L
         private set
     @Volatile var rejects = 0L
@@ -48,27 +52,44 @@ class PropService(private val paths: VmPaths, private val log: (String) -> Unit)
         if (cmd == 1) apply(name, value) else log("props: unknown command $cmd")
     }
 
-    /** Разворачивает область из шаблона образа и подмешивает сохранённые persist.*. */
+    /**
+     * Разворачивает область из шаблона образа и подмешивает сохранённые persist.*.
+     * In a seat session the guest init builds the area itself, in the tree, as a
+     * directory of per-context files — a host file at the tree path is exactly what
+     * it cannot use (its creates under it answer ENOTDIR and property_init gives
+     * up). The host's own area then lives on a scratch file outside the tree (the
+     * host still reads it itself: skipPreBoot, the private copies), and the tree
+     * path is cleared, file or directory, so the guest init finds it absent, as on
+     * a device booting on a fresh tmpfs /dev.
+     */
     @Synchronized
-    fun prepare(overrides: Map<String, String>, defaults: Map<String, String> = emptyMap(), size: Int = PropArea.SIZE): Boolean {
+    fun prepare(overrides: Map<String, String>, defaults: Map<String, String> = emptyMap(), size: Int = PropArea.SIZE, seat: Boolean = false): Boolean {
         close()
         val tpl = paths.propsTemplate
-        val f = paths.props
         if (!tpl.isFile) {
             log("props: no template ${tpl.name}")
             return false
         }
+        val f = if (seat) File(paths.bin, "props.seat") else paths.props
+        if (seat) runCatching {
+            val t = paths.props
+            if (t.isDirectory) t.deleteRecursively() else if (t.exists()) t.delete()
+        }
+        // a seat boot leaves a directory at the tree path; a plan boot's copy must not meet it
+        if (!seat && paths.props.isDirectory) runCatching { paths.props.deleteRecursively() }
         f.parentFile?.mkdirs()
         tpl.copyTo(f, overwrite = true)
         // (a larger area for a kernel that asks for one: the C library maps the file whole, whatever its length)
         if (f.length() < size) runCatching { java.io.RandomAccessFile(f, "rw").use { it.setLength(size.toLong()) } }
-        rootOwned(f)
+        // the seat scratch never enters the guest, so it needs no owners-table row
+        if (!seat) rootOwned(f)
         val a = PropArea.open(f)
         if (a == null) {
             log("props: area not recognized")
             return false
         }
         area = a
+        areaFile = f
         val pd = File(paths.root, "data/property").apply { mkdirs() }
         var n = 0
         pd.listFiles()?.forEach { p ->
@@ -120,6 +141,7 @@ class PropService(private val paths: VmPaths, private val log: (String) -> Unit)
     fun close() {
         area?.close()
         area = null
+        areaFile = null
     }
 
     fun stop() {
@@ -129,7 +151,7 @@ class PropService(private val paths: VmPaths, private val log: (String) -> Unit)
 
     /** Отдельная копия области для mediaserver с ro.kernel.qemu=1 (эмуляторный звук). */
     fun privateCopy(name: String, extra: Map<String, String>): File? {
-        val src = paths.props
+        val src = areaFile ?: paths.props
         val dst = File(paths.bin, "props.$name")
         return runCatching {
             src.copyTo(dst, overwrite = true)
