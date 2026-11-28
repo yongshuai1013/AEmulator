@@ -818,7 +818,14 @@ EXPORT int sigsuspend(const unsigned long *mask) {
  */
 #define SA_SIGINFO_ 4
 #define SA_RESTORER_ 0x04000000
+/* bionic's userland struct sigaction is ABI-dependent (libc/include/bits/signal_types.h):
+ * LP64 is flags-first, ILP32 keeps the historical handler-first layout. The conversion
+ * below must read the struct exactly the way the caller's bionic filled it. */
+#if defined(__LP64__)
+struct bionic_sigaction { int flags; void *handler; unsigned long mask; void (*restorer)(void); };
+#else
 struct bionic_sigaction { void *handler; unsigned long mask; int flags; void (*restorer)(void); };
+#endif
 struct kernel_sigaction { void *handler; unsigned long flags; void (*restorer)(void); unsigned long mask[2]; };
 static struct bionic_sigaction guest_act[32];
 
