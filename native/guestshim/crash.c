@@ -168,7 +168,14 @@ static void put_sym(ureg a) {
 
 /* ---- обработчик ---- */
 
-struct bsigaction { void *handler; unsigned long mask; u32 flags; void *restorer; }; /* struct sigaction bionic; the mask is word-sized on both ABIs */
+/* struct sigaction as bionic defines it (libc/include/bits/signal_types.h): LP64 is
+ * flags-first, ILP32 handler-first; the mask is word-sized on both ABIs. Must match
+ * aemushim.c's struct bionic_sigaction — the two are the write/read sides of one conversion. */
+#if defined(__LP64__)
+struct bsigaction { u32 flags; void *handler; unsigned long mask; void *restorer; };
+#else
+struct bsigaction { void *handler; unsigned long mask; u32 flags; void *restorer; };
+#endif
 
 static const int g_sigs[] = { 4, 6, 7, 8, 11, 16 };
 #define SIGUSR2 12
@@ -323,7 +330,7 @@ __attribute__((constructor)) static void crash_init(void) {
     sa.flags = 4 | 0x10000000; /* SA_SIGINFO | SA_RESTART */
     sa.restorer = 0;
     for (int i = 0; i < 6; i++) sigaction(g_sigs[i], &sa, 0);
-    struct bsigaction su = { (void *)usr2_handler, 0, 4 | 0x10000000, 0 };
+    struct bsigaction su = { .handler = (void *)usr2_handler, .mask = 0, .flags = 4 | 0x10000000, .restorer = 0 };
     /* SIGUSR2 занимаем, только если процесс его ещё не использует */
     struct bsigaction old = { 0, 0, 0, 0 };
     if (sigaction(SIGUSR2, 0, &old) == 0 && old.handler == 0) sigaction(SIGUSR2, &su, 0);
